@@ -459,7 +459,7 @@ test full_queue_gets_503 {
     http::Server $app = http::Server();
 
     $app->workers(1);
-    $app->maxQueue(1);
+    $app->maxQueueWait(.millis(50));
     $app->get('/slow', function(http::Request $req) : http::Response {
         thread::sleep(400);
         return http::Response(text: 'done');
@@ -493,6 +493,135 @@ test full_queue_gets_503 {
 
     assert($got->starts('HTTP/1.1 503 Service Unavailable'), 'refused');
     assert($got->contains('Retry-After: 1'), 'retry hint');
+}
+
+#[group: "net"]
+test deep_but_young_queue_is_served {
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->maxQueueWait(.millis(500));
+    $app->get('/slow', function(http::Request $req) : http::Response {
+        thread::sleep(20);
+        return http::Response(text: 'done');
+    });
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    array<Client> $clients = array<Client>();
+    int32 $i = 0;
+
+    // ten requests queue behind one worker at once: deep, but none has waited long
+    while ($i < 10) {
+        Client $c = Client($port);
+
+        $c->send("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+        $clients[] = $c;
+        $i = $i + 1;
+    }
+
+    Client $late = Client($port);
+    bool $sent = $late->send("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+    int32 $served = 0;
+
+    $i = 0;
+
+    while ($i < 10) {
+        if ($clients[$i as usize]->response()->starts('HTTP/1.1 200 OK')) {
+            $served = $served + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    string $lateGot = $late->response();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent, 'sent');
+    assert($served == 10, 'the queued ten');
+    assert($lateGot->starts('HTTP/1.1 200 OK'), 'a young queue refuses nobody');
+}
+
+#[group: "unit"]
+test reactors_follow_workers {
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    assert($app->reactors() == 1, 'one worker, one reactor');
+
+    $app->workers(4);
+    assert($app->reactors() == 1, 'four workers per reactor');
+
+    $app->workers(5);
+    assert($app->reactors() == 2, 'the fifth needs a second');
+
+    $app->workers(12);
+    assert($app->reactors() == 3, 'twelve, three');
+
+    $app->reactors(2);
+    assert($app->reactors() == 2, 'set');
+
+    $app->reactors(8);
+    $app->workers(3);
+    assert($app->reactors() == 3, 'never more than the workers');
+
+    $app->reactors(0);
+    assert($app->reactors() == 1, 'zero is the default again');
+}
+
+#[group: "net"]
+test reactors_share_the_load {
+    http::Server $app = http::Server();
+
+    $app->workers(3);
+    $app->reactors(3);
+    $app->get('/n/{i}', function(http::Request $req) : http::Response {
+        return http::Response(text: $req->param('i') ?? '?');
+    });
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    array<Client> $clients = array<Client>();
+    int32 $i = 0;
+
+    while ($i < 30) {
+        $clients[] = Client($port);
+        $i = $i + 1;
+    }
+
+    // every connection kept for five rounds: each goes back to its own reactor between them
+    int32 $good = 0;
+    int32 $round = 0;
+
+    while ($round < 5) {
+        $i = 0;
+
+        while ($i < 30) {
+            $clients[$i as usize]->send("GET /n/{$i} HTTP/1.1\r\nHost: x\r\n\r\n");
+            $i = $i + 1;
+        }
+
+        $i = 0;
+
+        while ($i < 30) {
+            string $got = $clients[$i as usize]->response();
+
+            if ($got->starts('HTTP/1.1 200 OK') && $got->ends("\r\n\r\n{$i}")) {
+                $good = $good + 1;
+            }
+
+            $i = $i + 1;
+        }
+
+        $round = $round + 1;
+    }
+
+    $app->stop();
+    $srv->join();
+
+    assert($good == 150, 'every answer on its own connection, all 150');
 }
 
 #[group: "net"]

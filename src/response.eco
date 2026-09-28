@@ -23,25 +23,27 @@ public struct Response
 
     // a stream's declared length, or -1 when the stream decides as it goes
     internal int64 $length = -1;
-    internal function<void(Writer)>? $stream;
+    internal function<void(Writer)>? $stream = null;
+
+    // a websocket upgrade's hooks and subprotocol, and the request as routed,
+    // params filled, which the Socket keeps
+    internal Upgrade? $upgrade = null;
+    internal Request? $origin = null;
 
     public constructor(int32 $status, const string& $body)
     {
-        $this->stream = null;
         $this->status = $status;
         $this->body = $body;
     }
 
     public constructor(ok: const string& $body)
     {
-        $this->stream = null;
         $this->status = 200;
         $this->body = $body;
     }
 
     public constructor(text: const string& $body)
     {
-        $this->stream = null;
         $this->status = 200;
         $this->headers->set('Content-Type', 'text/plain; charset=utf-8');
         $this->body = $body;
@@ -49,7 +51,6 @@ public struct Response
 
     public constructor(json: const string& $body)
     {
-        $this->stream = null;
         $this->status = 200;
         $this->headers->set('Content-Type', 'application/json');
         $this->body = $body;
@@ -57,7 +58,6 @@ public struct Response
 
     public constructor(html: const string& $body)
     {
-        $this->stream = null;
         $this->status = 200;
         $this->headers->set('Content-Type', 'text/html; charset=utf-8');
         $this->body = $body;
@@ -90,6 +90,23 @@ public struct Response
     }
 
     /**
+     * Upgrades the connection to a websocket whose hooks are `$channel`. The
+     * server answers the handshake itself: a request that is not a valid
+     * websocket upgrade gets a 426 or 400 instead, and the hooks never run.
+     * Headers set on this response (a cookie, say) go out with the 101.
+     *
+     * A `protocol` names the subprotocol to agree on. It is sent back only if
+     * the client offered it in `Sec-WebSocket-Protocol`; otherwise the
+     * handshake goes ahead with none, which is the client's to accept.
+     */
+    public constructor(websocket: Channel $channel, protocol: string $name = '')
+    {
+        $this->upgrade = Upgrade($channel, $name);
+        $this->status = 101;
+        $this->body = '';
+    }
+
+    /**
      * The file at `$path`, streamed from disk. Missing is 404, unreadable
      * is 403, decided here. The path is used as given: keeping `..` out
      * is the handler's job.
@@ -117,7 +134,6 @@ public struct Response
             };
         }
 
-        // every field once: a constructor may not build one twice
         $this->status = $code;
         $this->body = $text;
         $this->streaming = $size >= 0;
@@ -174,12 +190,29 @@ public struct Response
     }
 
     /**
+     * Whether this response upgrades the connection to a websocket.
+     */
+    public const function upgrades() : bool
+    {
+        return $this->upgrade != null;
+    }
+
+    /**
      * 5xx.
      */
     public const function serverError() : bool
     {
         return $this->status >= 500 && $this->status <= 599;
     }
+}
+
+/**
+ * What a websocket response upgrades to.
+ */
+internal struct Upgrade
+{
+    public Channel $channel;
+    public string $protocol;
 }
 
 /**

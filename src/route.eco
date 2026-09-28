@@ -66,20 +66,18 @@ internal struct Part
     internal Check $check;
     internal array<string> $choices;
 }
-// the fields are public only because echoc 0.4.1 checks the element copy
-// behind `array<Route>` from inside the stdlib, where an internal field is
-// out of reach. the struct itself is still internal
+
 internal struct Route
 {
-    public Method $method;
-    public int32 $verb;
-    public string $pattern;
-    public array<Part> $parts;
-    public usize $fixed;
-    public bool $optional;
-    public bool $rest;
-    public bool $captures;
-    public function<Response(Request)> $handler;
+    internal Method $method;
+    internal int32 $verb;
+    internal string $pattern;
+    internal array<Part> $parts;
+    internal usize $fixed;
+    internal bool $optional;
+    internal bool $rest;
+    internal bool $captures;
+    internal function<Response(Request)> $handler;
 
     /**
      * Compiles `$pattern`. A pattern that cannot mean anything stops the

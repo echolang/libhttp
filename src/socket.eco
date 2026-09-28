@@ -1,0 +1,513 @@
+/**
+ * Websockets as a handler sees them: a `Channel` of hooks, a `Socket` per
+ * connection, and the `Message` and `Close` values the hooks are handed.
+ *
+ * An open socket lives on the reactor, the same as an idle keep-alive
+ * connection, so it costs a file descriptor and not a worker. When a whole
+ * message arrives, `onMessage` runs on a worker, and the socket goes back to
+ * the reactor once it returns. One socket's messages are handled in order,
+ * one at a time; different sockets run in parallel.
+ *
+ * A `Socket` is safe to hold and use from any thread, which is what a chat
+ * room's broadcast needs. Its fd sits behind a lock, and only the connection's
+ * owner closes it, so a send from elsewhere never lands on a descriptor that
+ * was closed and handed to someone new. A send blocks under the socket's 10
+ * second send timeout, the same as a streamed response.
+ *
+ * `onClose` runs exactly once for every socket whose `onOpen` ran, whether
+ * the client closed, the server did, the client vanished, or the server is
+ * stopping.
+ */
+
+use std::thread;
+use std::time;
+
+namespace http;
+
+/**
+ * One whole message from the client, fragments already put together. RFC 6455
+ * has exactly these two kinds. Text is checked UTF-8 before a handler sees it.
+ */
+public enum Message
+{
+    case text(string $data);
+    case binary(string $data);
+}
+
+/**
+ * How a socket ended. `$code` is what the close frame said: 1005 when the
+ * client sent one with no code, 1006 when there was no close frame at all,
+ * and the server's own code when it closed first or the client broke the
+ * protocol. `$clean` is whether the client sent a close frame.
+ */
+public struct Close
+{
+    public int32 $code;
+    public string $reason;
+    public bool $clean;
+}
+
+/**
+ * The hooks one kind of websocket runs. Set them before `listen`, the same
+ * as routes. A hook left unset is skipped.
+ *
+ * `#[atomic]` because every worker reads it.
+ */
+#[atomic]
+public class Channel
+{
+    private function<void(Socket)>? $openHook;
+    private function<void(Socket, Message)>? $messageHook;
+    private function<void(Socket, Close)>? $closeHook;
+
+    public constructor()
+    {
+        $this->openHook = null;
+        $this->messageHook = null;
+        $this->closeHook = null;
+    }
+
+    /**
+     * Runs once the handshake is done, before the first message.
+     */
+    public function onOpen(function<void(Socket)> $fn) : void
+    {
+        $this->openHook = $fn;
+    }
+
+    /**
+     * Runs for every whole message, in order.
+     */
+    public function onMessage(function<void(Socket, Message)> $fn) : void
+    {
+        $this->messageHook = $fn;
+    }
+
+    /**
+     * Runs once, after the connection is closed.
+     */
+    public function onClose(function<void(Socket, Close)> $fn) : void
+    {
+        $this->closeHook = $fn;
+    }
+
+    internal function runOpen(Socket $s) : void
+    {
+        function<void(Socket)> $fn = guard $this->openHook else {
+            return;
+        }
+
+        $fn($s);
+    }
+
+    internal function runMessage(Socket $s, Message $m) : void
+    {
+        function<void(Socket, Message)> $fn = guard $this->messageHook else {
+            return;
+        }
+
+        $fn($s, $m);
+    }
+
+    internal function runClose(Socket $s, Close $c) : void
+    {
+        function<void(Socket, Close)> $fn = guard $this->closeHook else {
+            return;
+        }
+
+        $fn($s, $c);
+    }
+}
+
+/**
+ * One open websocket.
+ *
+ * `$request` is the request that was upgraded, route params included, so a
+ * hook can tell `/chat/{room}` rooms apart. `$protocol` is the subprotocol
+ * the handshake agreed on, or empty.
+ */
+#[atomic]
+public class Socket
+{
+    public const Request $request;
+    public const string $protocol;
+    private int64 $serial;
+    private thread::mutex<int32> $fd;
+
+    // a close frame has gone out: no more data frames may follow it
+    private atomic<bool> $closing;
+
+    // a send failed. The client is gone or stopped reading
+    private atomic<bool> $broken;
+    private Shared $shared;
+
+    internal constructor(int32 $fd, const Request& $request, const string& $protocol, Shared $shared)
+    {
+        $this->request = $request;
+        $this->protocol = $protocol;
+        $this->serial = $shared->sockets->add(1) + 1;
+        $this->fd = thread::mutex<int32>($fd);
+        $this->closing = atomic<bool>(false);
+        $this->broken = atomic<bool>(false);
+        $this->shared = $shared;
+    }
+
+    /**
+     * A number no other socket of this `listen` has. What a registry keys
+     * sockets by.
+     */
+    public const function id() : int64
+    {
+        return $this->serial;
+    }
+
+    /**
+     * Sends a text message. False when it will not reach the client: the
+     * socket is closing or closed, or the send failed.
+     */
+    public function send(text: const string& $data) : bool
+    {
+        return $this->deliver(encode(OP_TEXT, $data));
+    }
+
+    /**
+     * Sends a binary message. False the same way as a text one.
+     */
+    public function send(binary: const string& $data) : bool
+    {
+        return $this->deliver(encode(OP_BINARY, $data));
+    }
+
+    /**
+     * Sends a ping. The server already pings a socket that goes quiet, so
+     * this is for a hook that wants its own. At most 125 bytes of payload.
+     */
+    public function ping(const string& $payload = '') : bool
+    {
+        return $payload->size() <= CONTROL_CAP && $this->deliver(encode(OP_PING, $payload));
+    }
+
+    /**
+     * Starts the closing handshake. Nothing more can be sent after it; the
+     * connection closes once the client answers, or after 5 seconds. A code
+     * a peer may not send (1005, 1006, anything outside 1000 to 4999) goes
+     * out as 1000. The reason is cut to fit a control frame.
+     */
+    public function close(int32 $code = 1000, const string& $reason = '') : void
+    {
+        int32 $sent = $code;
+
+        if (!closeCodeOk($sent)) {
+            $sent = CLOSE_NORMAL;
+        }
+
+        $this->shut($sent, $reason);
+    }
+
+    /**
+     * Whether sending still reaches anyone: not closing, not broken, and the
+     * server is not stopping. A loop pushing to the socket from its own thread
+     * should run on this.
+     */
+    public const function open() : bool
+    {
+        return !$this->closing->load() && !$this->broken->load() && !$this->shared->stopping->load();
+    }
+
+    /**
+     * Sends a close frame, once. The client's 1005, a close that carried no
+     * code, is echoed as a close with no payload.
+     */
+    internal function shut(int32 $code, const string& $reason) : void
+    {
+        if ($this->closing->exchange(true)) {
+            return;
+        }
+
+        if ($code == CLOSE_NO_STATUS) {
+            $this->frame(OP_CLOSE, '');
+            return;
+        }
+
+        $this->frame(OP_CLOSE, closePayload($code, $reason));
+    }
+
+    internal const function closing() : bool
+    {
+        return $this->closing->load();
+    }
+
+    internal const function broken() : bool
+    {
+        return $this->broken->load();
+    }
+
+    /**
+     * One frame onto the wire, closing or not: a pong, a keepalive, the close
+     * itself.
+     */
+    internal function frame(uint8 $op, const string& $payload) : bool
+    {
+        return $this->write(encode($op, $payload));
+    }
+
+    /**
+     * An encoded data frame onto the wire, unless a close already went out.
+     */
+    internal function deliver(const string& $bytes) : bool
+    {
+        return !$this->closing->load() && $this->write($bytes);
+    }
+
+    /**
+     * Encoded frames onto the wire, under the lock so frames from two threads
+     * never interleave.
+     */
+    private function write(const string& $bytes) : bool
+    {
+        thread::locked<int32> $held = $this->fd->lock();
+
+        if ($held->value < 0) {
+            return false;
+        }
+
+        if (!sendAll($held->value, $bytes)) {
+            $this->broken->store(true);
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Closes the connection with a lingering close. Only the connection's
+     * owner calls this, once; every send after it answers false.
+     */
+    internal function release() : void
+    {
+        int32 $fd = -1;
+
+        // the lingering close can wait seconds: take the descriptor out and
+        // close it outside the lock, so a broadcast never waits on it
+        {
+            thread::locked<int32> $held = $this->fd->lock();
+
+            $fd = $held->value;
+            $held->value = -1;
+        }
+
+        if ($fd >= 0) {
+            http_finish($fd);
+        }
+    }
+}
+
+/**
+ * A set of open sockets to send to at once: a chat room, the viewers of one
+ * document. Safe from any thread.
+ *
+ * A broadcast sends to a snapshot, outside the lock, so a socket joining or
+ * leaving never waits on a slow one. The sends still go one after another,
+ * each under its socket's send timeout. A socket that closed is skipped and
+ * dropped from the group; `remove` it in `onClose` all the same, so the group
+ * never holds one longer than it has to.
+ */
+#[atomic]
+public class Group
+{
+    private thread::mutex<array<Socket>> $members;
+
+    public constructor()
+    {
+        $this->members = thread::mutex<array<Socket>>(array<Socket>());
+    }
+
+    public function add(Socket $s) : void
+    {
+        thread::locked<array<Socket>> $held = $this->members->lock();
+
+        $held->value->push($s);
+    }
+
+    /**
+     * Takes `$s` out, found by `id()`. Nothing when it was not in.
+     */
+    public function remove(Socket $s) : void
+    {
+        thread::locked<array<Socket>> $held = $this->members->lock();
+        usize $n = $held->value->count();
+        usize $i = 0;
+
+        while ($i < $n) {
+            if ($held->value[$i]->id() == $s->id()) {
+                $held->value->remove($i);
+                return;
+            }
+
+            $i = $i + 1;
+        }
+    }
+
+    /**
+     * How many sockets the group holds.
+     */
+    public function count() : usize
+    {
+        thread::locked<array<Socket>> $held = $this->members->lock();
+
+        return $held->value->count();
+    }
+
+    /**
+     * The sockets in the group now, a copy to iterate without holding the
+     * lock.
+     */
+    public function members() : array<Socket>
+    {
+        thread::locked<array<Socket>> $held = $this->members->lock();
+
+        return $held->value->clone();
+    }
+
+    /**
+     * Sends a text message to every open socket. Answers how many it reached.
+     */
+    public function broadcast(text: const string& $data) : int32
+    {
+        return $this->each(OP_TEXT, $data);
+    }
+
+    /**
+     * Sends a binary message to every open socket. Answers how many it
+     * reached.
+     */
+    public function broadcast(binary: const string& $data) : int32
+    {
+        return $this->each(OP_BINARY, $data);
+    }
+
+    private function each(uint8 $op, const string& $data) : int32
+    {
+        array<Socket> $now = $this->members();
+        string $bytes = encode($op, $data);
+        usize $n = $now->count();
+        usize $i = 0;
+        int32 $reached = 0;
+
+        while ($i < $n) {
+            Socket $s = $now[$i];
+
+            $i = $i + 1;
+
+            if ($s->deliver($bytes)) {
+                $reached = $reached + 1;
+            } else {
+                $this->remove($s);
+            }
+        }
+
+        return $reached;
+    }
+}
+
+/**
+ * An open websocket as the reactor and workers pass it between them. `$fd`
+ * is the number the reactor keys it by; the Socket owns the descriptor.
+ */
+internal struct WsConn
+{
+    public int32 $fd;
+
+    // which reactor holds it between messages
+    public int32 $home;
+    public Socket $socket;
+    public Channel $channel;
+    public Reader $reader;
+
+    // the last time any byte came from the client
+    public time::instant $heard;
+
+    // a keepalive ping went out and nothing has come back since
+    public bool $pinged;
+
+    // when the reactor first saw a server-sent close still waiting on its
+    // answer. Nothing until then
+    public time::instant? $closeSince;
+
+    /**
+     * Bytes came from the client: it is not quiet, and any ping is answered.
+     */
+    public function hear() : void
+    {
+        $this->heard = time::instant::now();
+        $this->pinged = false;
+    }
+
+    /**
+     * What its clocks say is due, if anything, with pings every `$every`.
+     * Starts the close wait the first time it is asked during a close, and
+     * counts the ping as sent when it answers `keepalive`.
+     */
+    public function due(time::duration $every) : WsEvent?
+    {
+        if ($this->socket->broken()) {
+            return WsEvent::gone;
+        }
+
+        if ($this->socket->closing()) {
+            time::instant $since = guard $this->closeSince else {
+                $this->closeSince = time::instant::now();
+                return null;
+            }
+
+            if ($since->elapsed() >= time::duration::secs(CLOSE_WAIT_SECS)) {
+                return WsEvent::gone;
+            }
+
+            return null;
+        }
+
+        if ($every <= time::duration::zero()) {
+            return null;
+        }
+
+        time::duration $quiet = $this->heard->elapsed();
+
+        if ($this->pinged) {
+            if ($quiet >= $every * 2) {
+                return WsEvent::gone;
+            }
+
+            return null;
+        }
+
+        if ($quiet >= $every) {
+            $this->pinged = true;
+            return WsEvent::keepalive;
+        }
+
+        return null;
+    }
+}
+
+/**
+ * What a worker is asked to do with a socket.
+ */
+internal enum WsEvent
+{
+    case message(Message $m);
+    case ping(string $payload);
+    case close(int32 $code, string $reason);
+
+    // the client broke the protocol: close with this code
+    case fail(int32 $code);
+
+    // quiet for a ping interval
+    case keepalive;
+
+    // the client vanished, stopped reading, or never answered a close
+    case gone;
+
+    // the server is stopping
+    case goingAway;
+}

@@ -22,6 +22,15 @@ internal struct Limits
     public time::duration $bodyTimeout = time::duration::secs(BODY_TIMEOUT_SECS);
     public time::duration $idleTimeout = time::duration::secs(IDLE_TIMEOUT_SECS);
     public int32 $maxRequests = DEFAULT_MAX_REQUESTS;
+
+    // how long the oldest whole request may wait for a worker before new
+    // connections are refused
+    public time::duration $queueWait = time::duration::millis(QUEUE_WAIT_MS);
+
+    // websockets: the largest message put together, and how long a socket
+    // may be quiet before it is pinged. A zero interval never pings
+    public usize $maxMessage = DEFAULT_MESSAGE_CAP;
+    public time::duration $pingInterval = time::duration::secs(PING_INTERVAL_SECS);
 }
 
 internal struct HeadEnd
@@ -356,9 +365,10 @@ internal function persistent(const Request& $req) : bool
 
 /**
  * Whether any header of this name lists `$token` among its comma-separated
- * values. Case-insensitive, both the name and the token.
+ * values. Case-insensitive, both the name and the token, unless `exact`
+ * asks for the token to match byte for byte, as a subprotocol name does.
  */
-internal function hasToken(const Headers& $headers, const string& $name, const string& $token) : bool
+internal function hasToken(const Headers& $headers, const string& $name, const string& $token, exact: bool $exact = false) : bool
 {
     array<string> $all = $headers->all($name);
     usize $n = $all->count();
@@ -370,7 +380,11 @@ internal function hasToken(const Headers& $headers, const string& $name, const s
         usize $pi = 0;
 
         while ($pi < $pn) {
-            if (str::iequals(str::trim($parts->at($pi)), $token->view())) {
+            if ($exact) {
+                if (str::trim($parts->at($pi))->equals($token->view())) {
+                    return true;
+                }
+            } else if (str::iequals(str::trim($parts->at($pi)), $token->view())) {
                 return true;
             }
 
@@ -399,7 +413,9 @@ internal enum Step
 {
     case needMore;
     case sendContinue;
-    case ready(Request $req);
+
+    // the request is whole; `Framer::request()` has it
+    case ready;
     case fail(WireError $e);
 }
 
@@ -422,7 +438,11 @@ internal struct Framer
 {
     public string $buffer;
     private Phase $phase = Phase::idle;
+
+    // the head parsed so far, and once `ready`, the finished request's. Kept
+    // here rather than handed out, so the reactor never copies a request
     private Request? $pending = null;
+    private string $body = '';
     private usize $bodyAt = 0;
     private usize $need = 0;
     private Dechunk $chunks = Dechunk(0);
@@ -451,6 +471,20 @@ internal struct Framer
             Phase::body => $this->body(),
             Phase::chunked => $this->chunkedBody($limits),
         };
+    }
+
+    /**
+     * The request the last `ready` finished, body included. Nothing before
+     * the first one.
+     */
+    public const function request() : Request?
+    {
+        Request $req = guard $this->pending else {
+            return null;
+        }
+
+        $req->body = $this->body;
+        return $req;
     }
 
     /**
@@ -571,16 +605,15 @@ internal struct Framer
             return .needMore;
         }
 
-        Request $req = guard $this->pending else {
+        if ($this->pending == null) {
             return .fail(.badRequest);
         }
 
-        $req->body = $this->buffer->sub($this->bodyAt, $this->need);
+        $this->body = $this->buffer->sub($this->bodyAt, $this->need);
         $this->buffer = $this->buffer->sub($want, $this->buffer->size() - $want);
-        $this->pending = null;
         $this->phase = Phase::idle;
         $this->since = time::instant::now();
-        return .ready($req);
+        return .ready;
     }
 
     private function chunkedBody(const Limits& $limits) : Step
@@ -598,16 +631,15 @@ internal struct Framer
             },
         }
 
-        Request $req = guard $this->pending else {
+        if ($this->pending == null) {
             return .fail(.badRequest);
         }
 
-        $req->body = $this->chunks->body;
+        $this->body = $this->chunks->body;
         $this->chunks = Dechunk(0);
-        $this->pending = null;
         $this->phase = Phase::idle;
         $this->since = time::instant::now();
-        return .ready($req);
+        return .ready;
     }
 }
 
@@ -629,7 +661,11 @@ internal function parse(const string& $raw) : result<Request, WireError>
     }
 
     match ($s) {
-        Step::ready($req) => {
+        Step::ready => {
+            Request $req = guard $f->request() else {
+                return .error(.badRequest);
+            }
+
             return .ok($req);
         },
         Step::fail($e) => {

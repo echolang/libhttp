@@ -54,6 +54,16 @@ public struct Request
     }
 
     /**
+     * Whether this is a well-formed websocket upgrade, the kind
+     * `Response(websocket:)` would accept. Lets one route answer both a page
+     * and its socket.
+     */
+    public const function websocket() : bool
+    {
+        return !upgradeKey($this)->failed();
+    }
+
+    /**
      * A param captured from the matched route, or nothing. A `{name?}` the
      * path left out is nothing; a `{name*}` is always there, `''` when the
      * path ended at it.

@@ -1,0 +1,238 @@
+/**
+ * Websocket frames, against the RFC 6455 section 5.7 examples and every
+ * refusal. No network.
+ */
+
+internal const uint32 KEY = 0x37FA213D;
+internal const usize BIG = 1048576;
+
+internal function textOf(const http::WsStep& $s) : string?
+{
+    return match ($s) {
+        http::WsStep::message($m) => match ($m) {
+            http::Message::text($t) => $t,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+internal function binaryOf(const http::WsStep& $s) : string?
+{
+    return match ($s) {
+        http::WsStep::message($m) => match ($m) {
+            http::Message::binary($b) => $b,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+internal function failCode(const http::WsStep& $s) : int32
+{
+    return match ($s) {
+        http::WsStep::fail($code) => $code,
+        else => -1,
+    };
+}
+
+internal function needsMore(const http::WsStep& $s) : bool
+{
+    return match ($s) {
+        http::WsStep::needMore => true,
+        else => false,
+    };
+}
+
+internal function server(const string& $bytes) : http::Reader
+{
+    return http::Reader(true, $bytes);
+}
+
+internal function client(const string& $bytes) : http::Reader
+{
+    return http::Reader(false, $bytes);
+}
+
+internal function filled(usize $n, int32 $b) : string
+{
+    return str::lpad('', $n, $b as uint8);
+}
+
+#[group: "unit"]
+test unmasked_hello_from_the_rfc {
+    http::Reader $r = client(bytes([0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f]));
+
+    assert((textOf($r->advance(BIG)) ?? '') == 'Hello', 'one text frame');
+    assert($r->buffer->empty(), 'nothing left over');
+}
+
+#[group: "unit"]
+test masked_hello_from_the_rfc {
+    string $wire = bytes([0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58]);
+    http::Reader $r = server($wire);
+
+    assert((textOf($r->advance(BIG)) ?? '') == 'Hello', 'unmasked on the way in');
+    assert(http::encode(http::OP_TEXT, 'Hello', mask: KEY) == $wire, 'encode masks the same way');
+}
+
+#[group: "unit"]
+test fragments_are_put_together {
+    http::Reader $r = client(bytes([0x01, 0x03, 0x48, 0x65, 0x6c, 0x80, 0x02, 0x6c, 0x6f]));
+
+    assert((textOf($r->advance(BIG)) ?? '') == 'Hello', 'Hel then lo');
+}
+
+#[group: "unit"]
+test ping_between_fragments_comes_out_first {
+    string $wire = http::encode(http::OP_TEXT, 'Hel', mask: KEY, $fin: false);
+
+    $wire->append(http::encode(http::OP_PING, 'are you there', mask: KEY));
+    $wire->append(http::encode(http::OP_CONTINUATION, 'lo', mask: KEY));
+
+    http::Reader $r = server($wire);
+    http::WsStep $first = $r->advance(BIG);
+    string $ping = match ($first) {
+        http::WsStep::ping($p) => $p,
+        else => '(not a ping)',
+    };
+
+    assert($ping == 'are you there', 'the ping, with its payload');
+    assert((textOf($r->advance(BIG)) ?? '') == 'Hello', 'then the message');
+}
+
+#[group: "unit"]
+test extended_lengths {
+    string $small = filled(256, 7);
+    string $wire = http::encode(http::OP_BINARY, $small);
+
+    assert($wire->byte(1) == 126, '16-bit length marker');
+    assert($wire->byte(2) == 1 && $wire->byte(3) == 0, '256 big-endian');
+    assert((binaryOf(client($wire)->advance(BIG)) ?? '') == $small, '256 bytes back');
+
+    string $large = filled(65536, 9);
+    string $wide = http::encode(http::OP_BINARY, $large, mask: KEY);
+
+    assert($wide->byte(1) == 255, '64-bit length marker, masked');
+    assert($wide->byte(7) == 1 && $wide->byte(8) == 0 && $wide->byte(9) == 0, '65536 big-endian');
+    assert((binaryOf(server($wide)->advance(BIG)) ?? '') == $large, '64 KiB back');
+}
+
+#[group: "unit"]
+test a_byte_at_a_time {
+    string $wire = http::encode(http::OP_TEXT, filled(300, 65), mask: KEY);
+    http::Reader $r = server('');
+    usize $i = 0;
+
+    while ($i + 1 < $wire->size()) {
+        $r->buffer->push($wire->byte($i));
+        assert(needsMore($r->advance(BIG)), 'not whole yet');
+        $i = $i + 1;
+    }
+
+    $r->buffer->push($wire->byte($i));
+    assert((textOf($r->advance(BIG)) ?? '') == filled(300, 65), 'whole at the last byte');
+}
+
+#[group: "unit"]
+test two_frames_in_one_read {
+    string $wire = http::encode(http::OP_TEXT, 'one', mask: KEY);
+
+    $wire->append(http::encode(http::OP_TEXT, 'two', mask: KEY));
+
+    http::Reader $r = server($wire);
+
+    assert((textOf($r->advance(BIG)) ?? '') == 'one', 'first');
+    assert((textOf($r->advance(BIG)) ?? '') == 'two', 'second');
+    assert(needsMore($r->advance(BIG)), 'then nothing');
+}
+
+#[group: "unit"]
+test close_codes_and_reasons {
+    http::WsStep $s = server(http::encode(http::OP_CLOSE, http::closePayload(1000, 'bye'), mask: KEY))->advance(BIG);
+    bool $ok = match ($s) {
+        http::WsStep::close($code, $reason) => $code == 1000 && $reason == 'bye',
+        else => false,
+    };
+
+    assert($ok, 'code and reason');
+
+    http::WsStep $bare = server(http::encode(http::OP_CLOSE, '', mask: KEY))->advance(BIG);
+    bool $none = match ($bare) {
+        http::WsStep::close($code, $reason) => $code == 1005,
+        else => false,
+    };
+
+    assert($none, 'no payload reads as 1005');
+    assert(failCode(server(http::encode(http::OP_CLOSE, bytes([3]), mask: KEY))->advance(BIG)) == 1002, 'one byte');
+    assert(failCode(server(http::encode(http::OP_CLOSE, http::closePayload(1005, ''), mask: KEY))->advance(BIG)) == 1002, '1005 is never sent');
+    assert(failCode(server(http::encode(http::OP_CLOSE, http::closePayload(999, ''), mask: KEY))->advance(BIG)) == 1002, 'below 1000');
+    assert(failCode(server(http::encode(http::OP_CLOSE, http::closePayload(5000, ''), mask: KEY))->advance(BIG)) == 1002, 'past 4999');
+
+    string $badReason = http::closePayload(1000, '');
+
+    $badReason->push(0xC0 as uint8);
+    assert(failCode(server(http::encode(http::OP_CLOSE, $badReason, mask: KEY))->advance(BIG)) == 1007, 'reason not UTF-8');
+}
+
+#[group: "unit"]
+test close_reason_is_cut_on_a_character {
+    string $long = '';
+    usize $i = 0;
+
+    while ($i < 100) {
+        $long->append(bytes([0xC3, 0xA9]));
+        $i = $i + 1;
+    }
+
+    string $payload = http::closePayload(1000, $long);
+
+    assert($payload->size() <= 125, 'fits a control frame');
+    assert(http::utf8Valid($payload->sub(2, $payload->size() - 2)), 'still UTF-8');
+}
+
+#[group: "unit"]
+test protocol_errors_are_1002 {
+    assert(failCode(server(http::encode(http::OP_TEXT, 'hi'))->advance(BIG)) == 1002, 'a client frame must be masked');
+    assert(failCode(client(http::encode(http::OP_TEXT, 'hi', mask: KEY))->advance(BIG)) == 1002, 'a server frame must not be');
+    assert(failCode(server(bytes([0xC1, 0x80, 0, 0, 0, 0]))->advance(BIG)) == 1002, 'RSV1 with no extension');
+    assert(failCode(server(bytes([0x83, 0x80, 0, 0, 0, 0]))->advance(BIG)) == 1002, 'reserved data opcode');
+    assert(failCode(server(bytes([0x8B, 0x80, 0, 0, 0, 0]))->advance(BIG)) == 1002, 'reserved control opcode');
+    assert(failCode(server(http::encode(http::OP_PING, 'x', mask: KEY, $fin: false))->advance(BIG)) == 1002, 'fragmented control');
+    assert(failCode(server(http::encode(http::OP_PING, filled(126, 1), mask: KEY))->advance(BIG)) == 1002, 'control past 125');
+    assert(failCode(server(http::encode(http::OP_CONTINUATION, 'x', mask: KEY))->advance(BIG)) == 1002, 'nothing to continue');
+    assert(failCode(server(bytes([0x82, 0xFF, 0x80, 0, 0, 0, 0, 0, 0, 0]))->advance(BIG)) == 1002, '64-bit length top bit');
+
+    string $interleaved = http::encode(http::OP_TEXT, 'a', mask: KEY, $fin: false);
+
+    $interleaved->append(http::encode(http::OP_TEXT, 'b', mask: KEY));
+    assert(failCode(server($interleaved)->advance(BIG)) == 1002, 'a new message inside a fragmented one');
+}
+
+#[group: "unit"]
+test bad_text_is_1007 {
+    assert(failCode(server(http::encode(http::OP_TEXT, bytes([0xED, 0xA0, 0x80]), mask: KEY))->advance(BIG)) == 1007, 'a surrogate');
+
+    string $split = http::encode(http::OP_TEXT, bytes([0xE2, 0x82]), mask: KEY, $fin: false);
+
+    $split->append(http::encode(http::OP_CONTINUATION, bytes([0xAC]), mask: KEY));
+    assert((textOf(server($split)->advance(BIG)) ?? '') == bytes([0xE2, 0x82, 0xAC]), 'a character split across fragments is fine');
+
+    string $binary = http::encode(http::OP_BINARY, bytes([0xFF]), mask: KEY);
+
+    assert((binaryOf(server($binary)->advance(BIG)) ?? '') == bytes([0xFF]), 'binary is not checked');
+}
+
+#[group: "unit"]
+test too_big_is_1009_from_the_header {
+    // only the header: the payload never has to arrive for the answer
+    string $head = http::encode(http::OP_BINARY, filled(2000, 0), mask: KEY)->sub(0, 8);
+
+    assert(failCode(server($head)->advance(1000)) == 1009, 'one frame over');
+
+    string $parts = http::encode(http::OP_BINARY, filled(600, 0), mask: KEY, $fin: false);
+
+    $parts->append(http::encode(http::OP_CONTINUATION, filled(600, 0), mask: KEY));
+    assert(failCode(server($parts)->advance(1000)) == 1009, 'fragments over together');
+    assert((binaryOf(server(http::encode(http::OP_BINARY, filled(1000, 0), mask: KEY))->advance(1000)) ?? '') == filled(1000, 0), 'exactly the cap is fine');
+}

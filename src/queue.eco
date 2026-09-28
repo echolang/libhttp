@@ -1,0 +1,138 @@
+/**
+ * The line of jobs between the reactors and the workers.
+ *
+ * Not `thread::channel`: a channel signals its one condition on every take
+ * as well as every put, and with a dozen idle workers that wakes one just
+ * to find nothing, on the lock the reactor needs next. This one signals
+ * only when a worker is actually asleep on it, and never from `recv`.
+ *
+ * It also knows how long its oldest job has waited, which is how a reactor
+ * tells a server that is behind from one that just read a burst.
+ */
+
+use std::thread;
+use std::time;
+
+namespace http;
+
+internal struct Pending
+{
+    // newly queued jobs, newest last
+    internal array<Job> $jobs;
+
+    // when each job in `$jobs` was queued, index for index
+    internal array<time::instant> $since;
+
+    // jobs `recv` takes from, oldest last, so a take is a pop and not a shift.
+    // Refilled from `$jobs` in reverse once it runs dry
+    internal array<Job> $ready;
+    internal array<time::instant> $readySince;
+
+    // workers asleep in `recv`
+    internal int32 $waiting;
+    internal bool $closed;
+}
+
+#[atomic]
+internal class JobQueue
+{
+    private thread::mutex<Pending> $lock;
+    private thread::condition $cv;
+
+    internal constructor()
+    {
+        $this->lock = thread::mutex<Pending>(Pending(array<Job>(), array<time::instant>(), array<Job>(), array<time::instant>(), 0, false));
+        $this->cv = thread::condition();
+    }
+
+    /**
+     * Queues `$job`. The server closes the queue only once every reactor has
+     * stopped sending, so nothing is ever refused.
+     */
+    internal function send(mv Job $job) : void
+    {
+        bool $wake = false;
+
+        // read the clock before the lock, which every reactor and worker contends for
+        time::instant $now = time::instant::now();
+
+        {
+            thread::locked<Pending> $g = $this->lock->lock();
+
+            $g->value->jobs[] = mv $job;
+            $g->value->since[] = $now;
+            $wake = $g->value->waiting > 0;
+        }
+
+        // outside the lock, so the woken worker does not block on it at once
+        if ($wake) {
+            $this->cv->notify();
+        }
+    }
+
+    /**
+     * The next job, waiting for one. Nothing once the queue is closed and
+     * empty.
+     */
+    internal function recv() : Job?
+    {
+        thread::locked<Pending> $g = $this->lock->lock();
+
+        while (true) {
+            if ($g->value->ready->empty()) {
+                while (!$g->value->jobs->empty()) {
+                    $g->value->ready[] = $g->value->jobs->pop();
+                    $g->value->readySince[] = $g->value->since->pop();
+                }
+            }
+
+            if (!$g->value->ready->empty()) {
+                $g->value->readySince->pop();
+                return $g->value->ready->pop();
+            }
+
+            if ($g->value->closed) {
+                return null;
+            }
+
+            $g->value->waiting = $g->value->waiting + 1;
+            $this->cv->wait($g);
+            $g->value->waiting = $g->value->waiting - 1;
+        }
+    }
+
+    /**
+     * How long the oldest queued job has waited. Zero when none is.
+     */
+    internal function oldestWait() : time::duration
+    {
+        thread::locked<Pending> $g = $this->lock->lock();
+
+        usize $ready = $g->value->readySince->count();
+
+        if ($ready > 0) {
+            return $g->value->readySince[$ready - 1]->elapsed();
+        }
+
+        if ($g->value->since->empty()) {
+            return time::duration::zero();
+        }
+
+        return $g->value->since[0]->elapsed();
+    }
+
+    /**
+     * No more jobs. Workers drain what is queued, then `recv` answers
+     * nothing.
+     */
+    internal function close() : void
+    {
+        {
+            thread::locked<Pending> $g = $this->lock->lock();
+
+            $g->value->closed = true;
+        }
+
+        $this->cv->notify_all();
+    }
+}

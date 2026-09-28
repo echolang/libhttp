@@ -1,8 +1,8 @@
 # libhttp
 
-Echo's standard library has files, streams, and threads. It does not have sockets. Sometimes your program still needs to *be* the HTTP server. This module is that missing piece: a listen socket, a reactor, a worker pool, and a route table, with `Request` and `Response` as ordinary values.
+Echo's standard library has files, streams, and threads. It does not have sockets. Sometimes your program still needs to *be* the HTTP server. This module is that missing piece: a listen socket, reactors, a worker pool, and a route table, with `Request` and `Response` as ordinary values.
 
-The C is a small POSIX shim (`bind` / `listen` / `accept` / `recv` / `send`, and kqueue or epoll). Parsing, routing, the reactor, and the threads are Echo. There is no libcurl in here, and there is no TLS. libcurl is the client. This is the other direction.
+The C is a small POSIX shim (`bind` / `listen` / `accept` / `recv` / `send`, and kqueue or epoll). Parsing, routing, the reactors, and the threads are Echo. There is no libcurl in here, and there is no TLS. libcurl is the client. This is the other direction.
 
 ## A complete pass
 
@@ -118,19 +118,21 @@ No route matches the path: 404. The path matches a different method: 405 with `A
 Logging, auth, CORS, request IDs: things every request needs, and no handler should have to remember. `wrap` runs a function around all of them:
 
 ```echo
-$app->wrap(function(Request $req, http::Next $next) : Response {
+$app->wrap(function(Request $req, Next $next) : Response {
     time::instant $start = time::instant::now();
     Response $res = $next->run($req);
 
-    echo "{$req->method} {$req->path} {$res->status} {$start->elapsed()}";
+    std::io::print("{$req->method} {$req->path} {$res->status} {$start->elapsed()}\n");
     return $res;
 });
 ```
 
+The log line is one `print` with its `\n` inside, not an `echo`. Middleware runs on every worker at once, and `echo` writes a line and its newline as two separate writes, so two requests finishing together can come out as one joined line and a blank one. A single `print` is a single write, and lines stay whole.
+
 `$next->run($req)` is the rest of the chain: the middleware registered after this one, then routing, then the handler. What it answers is the response, and you can change it on the way out. Not calling it is how a middleware answers on its own:
 
 ```echo
-$app->wrap(function(Request $req, http::Next $next) : Response {
+$app->wrap(function(Request $req, Next $next) : Response {
     if ($req->header('Authorization') == null) {
         return Response(401, 'Unauthorized');
     }
@@ -241,7 +243,7 @@ An idle connection costs a file descriptor, not a worker. See [Threads](#threads
 
 ```echo
 $app->get('/numbers', function(Request $req) : Response {
-    return Response(stream: function(http::Writer $w) : void {
+    return Response(stream: function(Writer $w) : void {
         int32 $i = 0;
 
         while ($i < 1000 && $w->open()) {
@@ -262,7 +264,7 @@ return Response(stream: $fn, length: 1048576);
 
 ```echo
 $app->get('/events', function(Request $req) : Response {
-    Response $res = Response(stream: function(http::Writer $w) : void {
+    Response $res = Response(stream: function(Writer $w) : void {
         int32 $tick = 0;
 
         while ($w->open()) {
@@ -291,7 +293,114 @@ That opens the file, sets `Content-Length` from its size and `Content-Type` from
 
 A HEAD, or a status that never has a body, sends the head and never runs the callback. A HEAD keeps the length when there is one.
 
-A stream runs on the worker that answered the request, and holds it until the callback returns. So `workers` is also how many streams can run at once. It runs after the handler and every middleware have returned, so a middleware that times `$next->run` measures the handler, not the transfer. A stream's `$body` is ignored, and `$res->streamed()` says which kind a response is. The `Writer` only works during the callback. Keep no copy of it past the callback's return.
+A stream runs on the worker that answered the request, and holds it until the callback returns. A websocket does not; see [WebSockets](#websockets). So `workers` is also how many streams can run at once. It runs after the handler and every middleware have returned, so a middleware that times `$next->run` measures the handler, not the transfer. A stream's `$body` is ignored, and `$res->streamed()` says which kind a response is. The `Writer` only works during the callback. Keep no copy of it past the callback's return.
+
+## WebSockets
+
+A stream talks one way. A chat, a live cursor, or a game needs the client to talk back on the same connection, without a new request each time. That is a websocket (RFC 6455): one HTTP request that asks to become something else, and then messages both ways until one side closes.
+
+The hooks live on a `Channel`, and a route hands it out:
+
+```echo
+use http::{Channel, Message, Close, Socket};
+
+Channel $echo = Channel();
+
+$echo->onMessage(function(Socket $ws, Message $m) : void {
+    match ($m) {
+        Message::text($t) => {
+            $ws->send(text: $t);
+        },
+        Message::binary($b) => {
+            $ws->send(binary: $b);
+        },
+    }
+});
+
+$app->ws('/echo', $echo);
+```
+
+`ws` registers a GET route whose answer is the upgrade. The server does the handshake itself: a plain GET on that path gets `426 Upgrade Required`, a malformed attempt gets 400, and a `Sec-WebSocket-Version` other than 13 gets 426 with the version to retry with. The hooks only ever see a socket that opened.
+
+There are three, and any of them may be left out. `onOpen` runs once the handshake is done. `onMessage` runs for every whole message, fragments already put together and text already checked as UTF-8. `onClose` runs once the connection is closed, however that happened: the client said goodbye, the server did, the client vanished, or the server is stopping. It runs exactly once for every socket whose `onOpen` ran, which is what lets a room keep an honest member list.
+
+`Message` is `text` or `binary`, the only two kinds the protocol has. `Close` carries a `$code`, a `$reason`, and whether it was `$clean`, meaning the client sent a close frame. A client that vanished is 1006. One that closed with no code is 1005.
+
+### Deciding per request
+
+Because the upgrade is a response, everything a response can do before it goes out still works. Middleware runs first, so an auth layer that answers 401 refuses the socket too. A handler can look at the request and decline:
+
+```echo
+$app->get('/live', function(Request $req) : Response {
+    if ($req->header('Authorization') == null) {
+        return Response(401, 'Unauthorized');
+    }
+
+    return Response(websocket: $live, protocol: 'graphql-ws');
+});
+```
+
+`protocol:` agrees on a subprotocol, and it goes back only if the client offered it in `Sec-WebSocket-Protocol`. Headers set on the response, a cookie say, go out with the 101. The handshake headers themselves are the server's. `$req->websocket()` says whether a request is a valid upgrade, so one route can serve a page and its socket.
+
+### The Socket
+
+`Socket` is one open connection, and it is safe to use from any thread. Keep it, hand it to a registry, send to it from a timer thread:
+
+```echo
+$ws->send(text: 'hi');           // false once it will not arrive
+$ws->send(binary: $bytes);
+$ws->ping();
+$ws->close(4000, 'done');        // the closing handshake; nothing more goes out
+$ws->open();                     // not closing, not broken, server not stopping
+$ws->id();                       // unique per listen
+$ws->request->param('room');     // the upgrade request, route params included
+$ws->protocol;                   // the agreed subprotocol, or empty
+```
+
+### Rooms
+
+Sending to many sockets is common enough to be here. A `Group` is a set of sockets that any thread can add to, remove from, and broadcast to:
+
+```echo
+Group $room = Group();
+
+$chat->onOpen(function(Socket $ws) : void {
+    $room->add($ws);
+});
+
+$chat->onMessage(function(Socket $ws, Message $m) : void {
+    match ($m) {
+        Message::text($t) => {
+            $room->broadcast(text: $t);
+        },
+        else => {
+        },
+    }
+});
+
+$chat->onClose(function(Socket $ws, Close $c) : void {
+    $room->remove($ws);
+});
+```
+
+A broadcast sends to a snapshot, outside the group's lock, so a socket joining never waits on a slow one. It answers how many it reached, and drops a socket whose send failed. `examples/chat.eco` is the whole thing with a page to try it in two tabs.
+
+### Where a socket lives
+
+An open socket sits on the reactor, the same as an idle keep-alive connection. It costs a file descriptor, not a worker. When a whole message has arrived, `onMessage` runs on a worker, and the socket goes back to the reactor when it returns. So a thousand quiet sockets and four workers is fine. `workers` bounds how many hooks run at once, not how many sockets are open.
+
+One socket's messages are handled in order, one at a time. Different sockets run in parallel. While a hook runs, that socket is not read, and TCP holds the rest back. A hook is borrowing a worker, so it should return. A socket that pushes on its own, a ticker say, pushes from its own thread through the `Socket` handle and loops on `open()`. Looping inside `onOpen` would keep a worker forever.
+
+Sends block, under the same 10 second send timeout as everything else, and they are serialized per socket so two threads never interleave frames. A client that stops reading holds up whoever is sending to it, for that long and no longer. A broadcast to a room with one stalled member is only as fast as that member.
+
+```echo
+$app->maxMessage(1024 * 1024);             // default 1 MiB, then 1009
+$app->pingInterval(.secs(30));             // default 30 seconds, .secs(0) never pings
+```
+
+A message past `maxMessage` is refused from its frame header, before the payload is read, and the socket closes with 1009. A socket that is quiet for `pingInterval` gets a ping. One that stays quiet for another interval is closed, and `onClose` sees 1006. After the server sends a close, it waits up to 5 seconds for the client's before closing anyway. `stop()` sends every open socket a 1001 and runs its `onClose` before `listen` returns. Every open socket counts toward `maxConnections`.
+
+The protocol is read strictly, the way RFC 6455 says a server must. An unmasked frame from a client, a reserved bit with no extension to claim it, an unknown opcode, a fragmented or oversized control frame, a continuation with nothing to continue: those close with 1002. Text that is not UTF-8 closes with 1007. No extensions are offered, so there is no `permessage-deflate` yet.
 
 ## Headers and query
 
@@ -308,30 +417,33 @@ array<string> $cookies = $req->headers->all('cookie');
 
 ## Threads
 
-`listen` runs two kinds of thread. The calling thread becomes the reactor: it owns the listen socket and every connection that is idle or still sending its request, and waits on all of them at once (kqueue on darwin, epoll on linux). Once a request is complete, it goes to a worker. The pool's default size is `thread::concurrency()`, at least one.
+`listen` runs two kinds of thread. Reactors own every connection that is idle or still sending its request, and wait on all of them at once (kqueue on darwin, epoll on linux). The calling thread becomes the first reactor, and the rest get threads of their own. They all accept from the one listen socket, and a connection stays on the reactor that accepted it. Once a request is complete, it goes into one queue that every worker takes from, so any free worker answers any reactor's request. The pool's default size is `thread::concurrency()`, at least one. There is one reactor per four workers by default, never more reactors than workers.
 
 ```echo
 $app->workers(4);
+$app->reactors(2);                         // default one per four workers
 $app->maxBody(1024 * 1024);                // default 1 MiB
 $app->headerTimeout(.secs(10));            // default 10 seconds
 $app->bodyTimeout(.secs(60));              // default 60 seconds
 $app->idleTimeout(.secs(5));               // default 5 seconds
 $app->maxRequests(100);                    // default 100 per connection
 $app->maxConnections(1024);                // default 1024
-$app->maxQueue(256);                       // default 256
+$app->maxQueueWait(.secs(1));              // default 1 second
+$app->maxMessage(1024 * 1024);             // websockets, default 1 MiB
+$app->pingInterval(.secs(30));             // websockets, default 30 seconds
 ```
 
-That split is the point. A worker only ever sees a whole request, and gives the connection back the moment its response is written. A browser tab holding a kept connection, or a client sending its headers a byte at a time, costs the reactor a slot and costs no worker anything. So `workers` bounds how many handlers run at once, not how many clients can be connected. The two things that do hold a worker are a handler running and a stream writing.
+That split is the point. A worker only ever sees a whole request, and gives the connection back the moment its response is written. A browser tab holding a kept connection, or a client sending its headers a byte at a time, costs the reactor a slot and costs no worker anything. So `workers` bounds how many handlers run at once, not how many clients can be connected. The things that do hold a worker are a handler running, a stream writing, and a websocket hook running. An open websocket between messages holds nothing but its slot.
 
 A `Content-Length` above `maxBody` is 413 without reading the rest.
 
 Each timeout is one deadline for the whole phase, not a per-read allowance. A client that sends one byte every few seconds still runs out at 10 seconds and gets a 408. The header clock starts at the first byte. Before that the connection is idle, and `idleTimeout` closes it without an answer, the same as a kept connection between requests. Deadlines are checked every 100 ms, so one can fire up to that much late. Each send to a slow reader is capped at 10 seconds too.
 
-Complete requests wait in a queue until a worker is free. A new connection is answered `503 Service Unavailable` with `Retry-After: 1`, straight from the reactor, once `maxQueue` requests are waiting or `maxConnections` connections are open. A flood costs a refusal instead of a longer and longer line. Every connection is a file descriptor, so keep `maxConnections` under the process's `ulimit -n`. If the process runs out anyway, the server stops accepting for a moment instead of spinning on it.
+Complete requests wait in a queue until a worker is free. A new connection is answered `503 Service Unavailable` with `Retry-After: 1`, straight from the reactor, once the oldest waiting request has waited `maxQueueWait`, or `maxConnections` connections are open. It is the wait that counts, not the length: one read of a busy reactor can queue hundreds of requests that workers take within microseconds, and that is not a server falling behind. A flood costs a refusal instead of a longer and longer line. Every connection is a file descriptor, so keep `maxConnections` under the process's `ulimit -n`. If the process runs out anyway, the server stops accepting for a moment instead of spinning on it.
 
 A connection the server closes after answering gets a lingering close: the server shuts its side, drains what the client is still sending for up to two seconds, then closes. That is what lets a client mid-upload read its 413 instead of a reset. The 503 is the exception. It is a plain close, because draining on the reactor would stall everyone else.
 
-`stop()` is safe from another thread. The reactor wakes, closes every idle connection, and stops accepting. Requests already on a worker finish, and their connections close after the response. Then `listen` returns the bound port. `workers(0)` fails with `Error::tooFewWorkers` before bind.
+`stop()` is safe from another thread. Every reactor wakes, closes its idle connections, and stops accepting. Requests already on a worker finish, and their connections close after the response. Then `listen` returns the bound port. `workers(0)` fails with `Error::tooFewWorkers` before bind.
 
 A handler that `die`s ends the process, not just its worker. So does a failed `assert`, a `guard` with no `else`, or an index past the end of an array. Echo has no catch, and a `crash::` hook can report but not recover. There is no half-alive pool to repair. When a request is bad, return an error `Response` instead of stopping, and run a production server under something that restarts it: systemd's `Restart=`, launchd's `KeepAlive`, or your container runtime.
 
@@ -381,33 +493,16 @@ Measure with `--optimize whole`. Under the default, `module`, the stdlib does no
 echoc run -m . examples/hello.eco     # GET / on 127.0.0.1:8080
 echoc run -m . examples/rest.eco      # /users/{id:number}, /posts/{page?}, POST /echo, a catch-all
 echoc run -m . examples/stream.eco    # a request log, /events, /count, /readme
+echoc run -m . examples/chat.eco      # a websocket chat room, open / in two tabs
 ```
 
 ## What is not here yet
 
 - **TLS.** Plain HTTP. Terminate TLS in front, or wait.
-- **HTTP/2, websockets.** HTTP/1.1 only. Keep-alive and chunked are in, `Upgrade` is not.
+- **HTTP/2.** HTTP/1.1 and websockets. `Upgrade: h2c` is not answered.
+- **Websocket extensions.** No `permessage-deflate`, and a message arrives whole, never as a stream of fragments.
 - **Transfer codings other than chunked.** A `gzip` upload is 501, and responses are never compressed.
 - **IPv6 and Windows.** IPv4, POSIX. Echo's prebuilts are darwin arm64 and linux x86_64.
 - **A static file server, cookies, multipart.** `Response(file:)` serves one file you named. Mapping a URL onto a directory, safely, is not in here. A JSON body is a string. libjson is how it becomes a value.
 - **Ranges.** No `Range`, no 206. A download that breaks starts over.
 - **A body cap the server enforces on the response.** Requests have `maxBody`. What you write back is yours.
-
-## Source layout
-
-| File | What it holds |
-|---|---|
-| `c/posix.c` | sockets, kqueue / epoll, the wake pipe. The only C |
-| `src/sys.eco` | the one `extern` block |
-| `src/error.eco` `from.eco` | `Error`, `WireError`, and `"{$e}"` |
-| `src/method.eco` | `Method` |
-| `src/headers.eco` `query.eco` | `Headers`, `Query`, percent-decoding |
-| `src/request.eco` `response.eco` | the two values, and `Response(file:)` |
-| `src/parse.eco` `chunked.eco` | the `Framer`: request bytes in, a piece at a time |
-| `src/render.eco` `writer.eco` | response bytes out, and the `Writer` a stream writes through |
-| `src/route.eco` `middleware.eco` | pattern compiling, matching, 405 `Allow`, and `wrap` |
-| `src/conn.eco` | owned socket |
-| `src/reactor.eco` | the thread that holds idle and half-read connections |
-| `src/worker.eco` | a whole request in, a response out |
-| `src/server.eco` | `Server`, its settings, `listen` / `stop` |
-| `src/text.eco` | the ASCII bytes and defaults this module compares against |

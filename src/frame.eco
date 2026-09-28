@@ -1,0 +1,476 @@
+/**
+ * Websocket frames (RFC 6455 section 5): bytes in, messages out, and back.
+ *
+ * `Reader` is the one decoder. It holds a connection's unread bytes and is
+ * advanced each time more arrive, the same shape as the request `Framer`, so
+ * the reactor can read a socket in pieces without a thread waiting on it.
+ * Nothing here touches a socket.
+ *
+ * A server reads masked frames and writes unmasked ones. The decoder takes
+ * which side it is, and `encode` can mask, so a test (or a client, one day)
+ * speaks the other half with the same code.
+ *
+ * What is refused, and with which close code: an unmasked frame from a
+ * client, a reserved bit no extension claimed, an unknown opcode, a control
+ * frame that is fragmented or longer than 125 bytes, a continuation with
+ * nothing to continue, a new message in the middle of a fragmented one, or a
+ * 64-bit length with its top bit set are all 1002. Text that is not UTF-8 is
+ * 1007. A message past `maxMessage` is 1009, found from the frame header
+ * before its payload is read.
+ */
+
+namespace http;
+
+internal const uint8 OP_CONTINUATION = 0;
+internal const uint8 OP_TEXT = 1;
+internal const uint8 OP_BINARY = 2;
+internal const uint8 OP_CLOSE = 8;
+internal const uint8 OP_PING = 9;
+internal const uint8 OP_PONG = 10;
+
+internal const int32 CLOSE_NORMAL = 1000;
+internal const int32 CLOSE_GOING_AWAY = 1001;
+internal const int32 CLOSE_PROTOCOL = 1002;
+internal const int32 CLOSE_NO_STATUS = 1005;
+internal const int32 CLOSE_ABNORMAL = 1006;
+internal const int32 CLOSE_BAD_DATA = 1007;
+internal const int32 CLOSE_TOO_BIG = 1009;
+
+// a control frame's payload, and so a close reason with its code
+internal const usize CONTROL_CAP = 125;
+
+/**
+ * One frame off the wire, payload unmasked.
+ */
+internal struct Frame
+{
+    public bool $fin;
+    public uint8 $opcode;
+    public string $payload;
+}
+
+internal enum FrameStep
+{
+    case needMore;
+    case frame(Frame $f);
+    case fail(int32 $code);
+}
+
+/**
+ * What one `Reader::advance` found. A ping's payload is what the pong has to
+ * carry back.
+ */
+internal enum WsStep
+{
+    case needMore;
+    case message(Message $m);
+    case ping(string $payload);
+    case pong;
+    case close(int32 $code, string $reason);
+    case fail(int32 $code);
+}
+
+private function isControl(uint8 $op) : bool
+{
+    return $op >= OP_CLOSE;
+}
+
+private function knownOpcode(uint8 $op) : bool
+{
+    return $op == OP_CONTINUATION
+        || $op == OP_TEXT
+        || $op == OP_BINARY
+        || $op == OP_CLOSE
+        || $op == OP_PING
+        || $op == OP_PONG;
+}
+
+/**
+ * Whether a peer may send this close code: the ones RFC 6455 defines for the
+ * wire, and the 3000 to 4999 range left to libraries and applications. 1005
+ * and 1006 are for reporting and never sent.
+ */
+internal function closeCodeOk(int32 $code) : bool
+{
+    if ($code >= 1000 && $code <= 1003) {
+        return true;
+    }
+
+    if ($code >= 1007 && $code <= 1011) {
+        return true;
+    }
+
+    return $code >= 3000 && $code <= 4999;
+}
+
+/**
+ * A connection's frames in progress. The caller appends to `$buffer` and
+ * calls `advance`.
+ */
+internal struct Reader
+{
+    public string $buffer;
+
+    // whether frames must arrive masked: true for a server reading a client
+    private bool $masked;
+
+    // the fragmented message being put together, and its opcode. 0 is none
+    private uint8 $partialOp = 0;
+    private string $partial = '';
+
+    public constructor(bool $masked, const string& $rest)
+    {
+        $this->masked = $masked;
+        $this->buffer = $rest;
+    }
+
+    /**
+     * Whether a fragmented message has started and not finished.
+     */
+    public const function midMessage() : bool
+    {
+        return $this->partialOp != OP_CONTINUATION;
+    }
+
+    /**
+     * Decodes frames until one means something to the caller: a whole
+     * message, a control frame, or a failure. `needMore` when the bytes run
+     * out first.
+     */
+    public function advance(usize $maxMessage) : WsStep
+    {
+        while (true) {
+            FrameStep $step = $this->next($maxMessage - $this->partial->size());
+
+            match ($step) {
+                FrameStep::needMore => {
+                    return .needMore;
+                },
+                FrameStep::fail($code) => {
+                    return .fail($code);
+                },
+                FrameStep::frame($f) => {
+                    WsStep $out = guard $this->take($f) else {
+                        continue;
+                    }
+
+                    return $out;
+                },
+            }
+        }
+    }
+
+    /**
+     * Acts on one frame. Nothing when it was a fragment that leaves the
+     * message still open.
+     */
+    private function take(Frame $f) : WsStep?
+    {
+        uint8 $op = $f->opcode;
+
+        if ($op == OP_PING) {
+            return WsStep::ping($f->payload);
+        }
+
+        if ($op == OP_PONG) {
+            return WsStep::pong;
+        }
+
+        if ($op == OP_CLOSE) {
+            return closeStep($f->payload);
+        }
+
+        if ($op == OP_CONTINUATION) {
+            if (!$this->midMessage()) {
+                return WsStep::fail(CLOSE_PROTOCOL);
+            }
+
+            $this->partial->append($f->payload);
+
+            if (!$f->fin) {
+                return null;
+            }
+
+            uint8 $started = $this->partialOp;
+            string $whole = $this->partial;
+
+            $this->partialOp = OP_CONTINUATION;
+            $this->partial = '';
+            return finished($started, $whole);
+        }
+
+        // text or binary: a new message may not start inside another
+        if ($this->midMessage()) {
+            return WsStep::fail(CLOSE_PROTOCOL);
+        }
+
+        if ($f->fin) {
+            return finished($op, $f->payload);
+        }
+
+        $this->partialOp = $op;
+        $this->partial = $f->payload;
+        return null;
+    }
+
+    /**
+     * One frame off the front of the buffer. `$room` is how much payload the
+     * message still has space for; a data frame past it is 1009 before its
+     * payload has arrived.
+     */
+    private function next(usize $room) : FrameStep
+    {
+        usize $have = $this->buffer->size();
+
+        if ($have < 2) {
+            return .needMore;
+        }
+
+        uint8 $b0 = $this->buffer->byte(0);
+        uint8 $b1 = $this->buffer->byte(1);
+        bool $fin = ($b0 & 0x80) != 0;
+        uint8 $rsv = ($b0 >> 4) & 7;
+        uint8 $op = $b0 & 0x0F;
+        bool $masked = ($b1 & 0x80) != 0;
+        uint64 $len = ($b1 & 0x7F) as uint64;
+
+        if ($rsv != 0 || !knownOpcode($op) || $masked != $this->masked) {
+            return .fail(CLOSE_PROTOCOL);
+        }
+
+        if (isControl($op) && (!$fin || $len > (CONTROL_CAP as uint64))) {
+            return .fail(CLOSE_PROTOCOL);
+        }
+
+        usize $at = 2;
+
+        if ($len == 126) {
+            if ($have < 4) {
+                return .needMore;
+            }
+
+            $len = readBE($this->buffer, 2, 2);
+            $at = 4;
+        } else if ($len == 127) {
+            if ($have < 10) {
+                return .needMore;
+            }
+
+            if (($this->buffer->byte(2) & 0x80) != 0) {
+                return .fail(CLOSE_PROTOCOL);
+            }
+
+            $len = readBE($this->buffer, 2, 8);
+            $at = 10;
+        }
+
+        if (!isControl($op) && $len > ($room as uint64)) {
+            return .fail(CLOSE_TOO_BIG);
+        }
+
+        usize $size = $len as usize;
+        uint32 $key = 0;
+
+        if ($masked) {
+            if ($have < $at + 4) {
+                return .needMore;
+            }
+
+            $key = readBE($this->buffer, $at, 4) as uint32;
+            $at = $at + 4;
+        }
+
+        usize $end = $at + $size;
+
+        if ($have < $end) {
+            $this->buffer->reserve($end);
+            return .needMore;
+        }
+
+        string $payload = $this->buffer->sub($at, $size);
+
+        if ($masked) {
+            $payload = unmask($payload, $key);
+        }
+
+        // a buffer read to the end keeps its capacity for the next read
+        if ($end == $have) {
+            $this->buffer->clear();
+        } else {
+            $this->buffer = $this->buffer->sub($end, $have - $end);
+        }
+
+        return .frame(Frame($fin, $op, $payload));
+    }
+}
+
+/**
+ * A finished text or binary message. Text has to be UTF-8.
+ */
+private function finished(uint8 $op, const string& $data) : WsStep
+{
+    if ($op == OP_TEXT) {
+        if (!utf8Valid($data)) {
+            return .fail(CLOSE_BAD_DATA);
+        }
+
+        return .message(Message::text($data));
+    }
+
+    return .message(Message::binary($data));
+}
+
+/**
+ * A close frame's payload as a step: no payload is 1005, one byte is a
+ * protocol error, a code nobody may send is too, and the reason is UTF-8.
+ */
+private function closeStep(const string& $payload) : WsStep
+{
+    if ($payload->empty()) {
+        return .close(CLOSE_NO_STATUS, '');
+    }
+
+    if ($payload->size() == 1) {
+        return .fail(CLOSE_PROTOCOL);
+    }
+
+    int32 $code = readBE($payload, 0, 2) as int32;
+
+    if (!closeCodeOk($code)) {
+        return .fail(CLOSE_PROTOCOL);
+    }
+
+    string $reason = $payload->sub(2, $payload->size() - 2);
+
+    if (!utf8Valid($reason)) {
+        return .fail(CLOSE_BAD_DATA);
+    }
+
+    return .close($code, $reason);
+}
+
+/**
+ * XORs `$data` with the 4-byte key, first byte of the key first. Masking and
+ * unmasking are the same operation.
+ */
+internal function unmask(const string& $data, uint32 $key) : string
+{
+    // locals, not a fixed_array: an index into one is a call under --optimize module
+    uint8 $k0 = ($key >> 24) as uint8;
+    uint8 $k1 = (($key >> 16) & 0xFF) as uint8;
+    uint8 $k2 = (($key >> 8) & 0xFF) as uint8;
+    uint8 $k3 = ($key & 0xFF) as uint8;
+
+    usize $n = $data->size();
+    string $out = '';
+    usize $i = 0;
+
+    $out->reserve($n);
+
+    // raw reads and writes: every payload comes through here
+    ptr<const uint8> $src = $data->data();
+    ptr<uint8> $dst = $out->spare();
+
+    while ($i + 4 <= $n) {
+        $dst:$[$i] = $src:$[$i] ^ $k0;
+        $dst:$[$i + 1] = $src:$[$i + 1] ^ $k1;
+        $dst:$[$i + 2] = $src:$[$i + 2] ^ $k2;
+        $dst:$[$i + 3] = $src:$[$i + 3] ^ $k3;
+        $i = $i + 4;
+    }
+
+    if ($i < $n) {
+        $dst:$[$i] = $src:$[$i] ^ $k0;
+    }
+
+    if ($i + 1 < $n) {
+        $dst:$[$i + 1] = $src:$[$i + 1] ^ $k1;
+    }
+
+    if ($i + 2 < $n) {
+        $dst:$[$i + 2] = $src:$[$i + 2] ^ $k2;
+    }
+
+    $out->commit($n);
+    return $out;
+}
+
+/**
+ * The head of a frame up to, not including, a masking key.
+ */
+private function frameHead(uint8 $op, usize $size, bool $fin, bool $masked) : string
+{
+    string $out = '';
+    uint8 $b0 = $op;
+    uint8 $maskBit = 0;
+
+    if ($fin) {
+        $b0 = $b0 | 0x80;
+    }
+
+    if ($masked) {
+        $maskBit = 0x80;
+    }
+
+    $out->push($b0);
+
+    if ($size <= CONTROL_CAP) {
+        $out->push(($size as uint8) | $maskBit);
+    } else if ($size <= 65535) {
+        $out->push(126 | $maskBit);
+        pushBE($out, $size as uint64, 2);
+    } else {
+        $out->push(127 | $maskBit);
+        pushBE($out, $size as uint64, 8);
+    }
+
+    return $out;
+}
+
+/**
+ * One unmasked frame, the way a server sends it.
+ */
+internal function encode(uint8 $op, const string& $payload, bool $fin = true) : string
+{
+    string $out = frameHead($op, $payload->size(), $fin, false);
+
+    $out->append($payload);
+    return $out;
+}
+
+/**
+ * One frame masked with `$key`, the way a client sends it.
+ */
+internal function encode(uint8 $op, const string& $payload, mask: uint32 $key, bool $fin = true) : string
+{
+    string $out = frameHead($op, $payload->size(), $fin, true);
+
+    pushBE($out, $key as uint64, 4);
+    $out->append(unmask($payload, $key));
+    return $out;
+}
+
+/**
+ * A close frame's payload: the code big-endian, then as much of the reason
+ * as fits in a control frame, cut back to a whole UTF-8 character.
+ */
+internal function closePayload(int32 $code, const string& $reason) : string
+{
+    string $out = '';
+
+    pushBE($out, $code as uint64, 2);
+
+    usize $keep = $reason->size();
+
+    if ($keep > CONTROL_CAP - 2) {
+        $keep = CONTROL_CAP - 2;
+
+        // back off continuation bytes so the cut lands on a character
+        while ($keep > 0 && ($reason->byte($keep) & 0xC0) == 0x80) {
+            $keep = $keep - 1;
+        }
+    }
+
+    $out->append($reason->sub(0, $keep));
+    return $out;
+}

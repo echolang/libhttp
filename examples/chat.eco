@@ -1,0 +1,84 @@
+use http::{Server, Request, Response, Channel, Message, Close, Group, Socket};
+
+/**
+ * The rooms, as `Group`s. Two fixed ones keep the example short:
+ * `/chat/lobby`, and every other name shares the second.
+ */
+#[atomic]
+internal class Rooms
+{
+    private Group $lobby;
+    private Group $other;
+
+    public constructor()
+    {
+        $this->lobby = Group();
+        $this->other = Group();
+    }
+
+    public function of(const Socket& $ws) : Group
+    {
+        string $name = $ws->request->param('room') ?? 'lobby';
+
+        if ($name == 'lobby') {
+            return $this->lobby;
+        }
+
+        return $this->other;
+    }
+}
+
+Rooms $rooms = Rooms();
+Server $app = Server();
+Channel $chat = Channel();
+
+$chat->onOpen(function(Socket $ws) : void {
+    Group $room = $rooms->of($ws);
+
+    $room->add($ws);
+    $room->broadcast(text: "#{$ws->id()} joined");
+});
+
+$chat->onMessage(function(Socket $ws, Message $m) : void {
+    match ($m) {
+        Message::text($t) => {
+            $rooms->of($ws)->broadcast(text: "#{$ws->id()}: {$t}");
+        },
+        Message::binary($b) => {
+            $ws->close(1003, 'text only');
+        },
+    }
+});
+
+$chat->onClose(function(Socket $ws, Close $c) : void {
+    Group $room = $rooms->of($ws);
+
+    $room->remove($ws);
+    $room->broadcast(text: "#{$ws->id()} left ({$c->code})");
+});
+
+$app->ws('/chat/{room}', $chat);
+
+$app->get('/', function(Request $req) : Response {
+    return Response(html: '<!doctype html>
+<title>chat</title>
+<pre id="log"></pre>
+<input id="say" placeholder="say something, then enter" autofocus>
+<script>
+const ws = new WebSocket(`ws://${location.host}/chat/lobby`);
+const log = (line) => document.getElementById("log").textContent += line + String.fromCharCode(10);
+ws.onmessage = (e) => log(e.data);
+ws.onclose = (e) => log(`closed ${e.code}`);
+document.getElementById("say").onkeydown = (e) => {
+    if (e.key === "Enter" && e.target.value) { ws.send(e.target.value); e.target.value = ""; }
+};
+</script>');
+});
+
+echo 'open http://127.0.0.1:8080 in two tabs';
+
+int32 $port = guard $app->listen('127.0.0.1', 8080) else ($e) {
+    die("listen failed: {$e}");
+}
+
+echo $port;

@@ -1,0 +1,109 @@
+/**
+ * SHA-1, base64, and UTF-8 against their published vectors. No network.
+ */
+
+internal function hex(const string& $raw) : string
+{
+    string $digits = '0123456789abcdef';
+    string $out = '';
+    usize $i = 0;
+
+    while ($i < $raw->size()) {
+        uint8 $b = $raw->byte($i);
+
+        $out->push($digits->byte(($b >> 4) as usize));
+        $out->push($digits->byte(($b & 15) as usize));
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function bytes(const array<int32>& $xs) : string
+{
+    string $out = '';
+    usize $i = 0;
+
+    while ($i < $xs->count()) {
+        $out->push($xs[$i] as uint8);
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+#[group: "unit"]
+test sha1_vectors {
+    assert(hex(http::sha1('')) == 'da39a3ee5e6b4b0d3255bfef95601890afd80709', 'empty');
+    assert(hex(http::sha1('abc')) == 'a9993e364706816aba3e25717850c26c9cd0d89d', 'abc');
+    assert(hex(http::sha1('abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq')) == '84983e441c3bd26ebaae4aa1f95129e5e54670f1', 'two blocks');
+}
+
+#[group: "unit"]
+test sha1_million_a {
+    string $a = '';
+
+    $a->reserve(1000000);
+
+    usize $i = 0;
+
+    while ($i < 1000000) {
+        $a->push(97 as uint8);
+        $i = $i + 1;
+    }
+
+    assert(hex(http::sha1($a)) == '34aa973cd4c4daa4f61eeb2bdbad27316534016f', 'a million a');
+}
+
+#[group: "unit"]
+test base64_vectors {
+    assert(http::base64('') == '', 'empty');
+    assert(http::base64('f') == 'Zg==', 'f');
+    assert(http::base64('fo') == 'Zm8=', 'fo');
+    assert(http::base64('foo') == 'Zm9v', 'foo');
+    assert(http::base64('foob') == 'Zm9vYg==', 'foob');
+    assert(http::base64('fooba') == 'Zm9vYmE=', 'fooba');
+    assert(http::base64('foobar') == 'Zm9vYmFy', 'foobar');
+    assert(http::base64(bytes([255, 254, 253])) == '//79', 'high bytes');
+}
+
+#[group: "unit"]
+test accept_key_from_rfc6455 {
+    string $key = SAMPLE_KEY;
+    string $guid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+    assert(http::base64(http::sha1("{$key}{$guid}")) == 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=', 'section 1.3 example');
+}
+
+#[group: "unit"]
+test key_shape {
+    assert(http::keyShape(SAMPLE_KEY), 'a real key');
+    assert(!http::keyShape('dGhlIHNhbXBsZSBub25jZQ='), 'too short');
+    assert(!http::keyShape('dGhlIHNhbXBsZSBub25jZQ=x'), 'bad padding');
+    assert(!http::keyShape('dGhlIHNhbXBsZSBub25j*Q=='), 'outside the alphabet');
+    assert(!http::keyShape('Zm9vYmFy'), 'not 16 bytes');
+}
+
+#[group: "unit"]
+test utf8_accepts_well_formed {
+    assert(http::utf8Valid(''), 'empty');
+    assert(http::utf8Valid('hello'), 'ascii');
+    assert(http::utf8Valid(bytes([0xC3, 0xA9])), 'two bytes');
+    assert(http::utf8Valid(bytes([0xE2, 0x82, 0xAC])), 'three bytes');
+    assert(http::utf8Valid(bytes([0xF0, 0x9F, 0x98, 0x80])), 'four bytes');
+    assert(http::utf8Valid(bytes([0xF4, 0x8F, 0xBF, 0xBF])), 'U+10FFFF');
+    assert(http::utf8Valid(bytes([0xED, 0x9F, 0xBF])), 'U+D7FF');
+}
+
+#[group: "unit"]
+test utf8_refuses_malformed {
+    assert(!http::utf8Valid(bytes([0x80])), 'lone continuation');
+    assert(!http::utf8Valid(bytes([0xC0, 0xAF])), 'overlong two');
+    assert(!http::utf8Valid(bytes([0xE0, 0x80, 0xAF])), 'overlong three');
+    assert(!http::utf8Valid(bytes([0xF0, 0x80, 0x80, 0xAF])), 'overlong four');
+    assert(!http::utf8Valid(bytes([0xED, 0xA0, 0x80])), 'surrogate');
+    assert(!http::utf8Valid(bytes([0xF4, 0x90, 0x80, 0x80])), 'past U+10FFFF');
+    assert(!http::utf8Valid(bytes([0xF5, 0x80, 0x80, 0x80])), 'bad lead');
+    assert(!http::utf8Valid(bytes([0xE2, 0x82])), 'cut short');
+    assert(!http::utf8Valid(bytes([0xE2, 0x28, 0xA1])), 'bad continuation');
+}

@@ -1,12 +1,13 @@
 /**
- * The server: a route table, a listen socket, a reactor, and a worker pool.
+ * The server: a route table, a listen socket, reactors, and a worker pool.
  *
  * `#[atomic]` because workers copy the handle. Routes snapshot at `listen`.
- * `listen` runs the reactor on the calling thread and returns the bound
- * port after `stop()`.
+ * `listen` runs the first reactor on the calling thread, the rest on their
+ * own, and returns the bound port after `stop()`.
  *
  * A worker only ever sees a whole request. Idle connections sit on the
- * reactor. A handler that dies kills the process: Echo has no catch.
+ * reactor that accepted them. A handler that dies kills the process: Echo
+ * has no catch.
  */
 
 use std::thread;
@@ -25,29 +26,122 @@ internal function joinAll(array<thread::handle>& $workers) : void
     }
 }
 
+internal function wakeAll(const array<int32>& $fds) : void
+{
+    usize $n = $fds->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        http_wake($fds[$i]);
+        $i = $i + 1;
+    }
+}
+
+internal function closeAll(array<int32>& $fds) : void
+{
+    usize $n = $fds->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        http_close($fds[$i]);
+        $i = $i + 1;
+    }
+
+    $fds->clear();
+}
+
+/**
+ * How many reactors `listen` runs: `$asked`, or one per four workers when
+ * that is zero. At least one, and never more than there are workers.
+ */
+internal function reactorsFor(int32 $asked, int32 $workers) : int32
+{
+    int32 $n = $asked;
+
+    if ($n < 1) {
+        $n = ($workers + 3) / 4;
+    }
+
+    if ($n > $workers) {
+        $n = $workers;
+    }
+
+    if ($n < 1) {
+        $n = 1;
+    }
+
+    return $n;
+}
+
+/**
+ * The first error any reactor stopped on. Later ones are the same broken
+ * listen socket seen again.
+ */
+internal function failWith(thread::mutex<Error?> $failed, Error $e) : void
+{
+    thread::locked<Error?> $held = $failed->lock();
+
+    if ($held->value == null) {
+        $held->value = $e;
+    }
+}
+
+/**
+ * One reactor's whole run: serve until stopping, then let go of what it
+ * holds. One that stops on a broken listen socket stops the others too.
+ */
+internal function runReactor(
+    int32 $ev,
+    int32 $listenFd,
+    int32 $wakeRd,
+    int32 $home,
+    int32 $batch,
+    Limits $limits,
+    int32 $maxConns,
+    Shared $shared,
+    JobQueue $jobs,
+    thread::receiver<Back> $back,
+    array<int32> $wakes,
+    thread::mutex<Error?> $failed
+) : void
+{
+    Reactor $reactor = Reactor($ev, $listenFd, $wakeRd, $home, $batch, $limits, $maxConns, $shared, $jobs, $back);
+    status<Error> $ran = $reactor->run();
+
+    if ($ran->failed()) {
+        failWith($failed, $ran->failure());
+        $shared->stopping->store(true);
+        wakeAll($wakes);
+    }
+
+    $reactor->shutdown();
+}
+
 #[atomic]
 public class Server
 {
     private array<Route> $routes;
     private array<function<Response(Request, Next)>> $layers;
     private int32 $workerCount;
-    private usize $bodyCap;
-    private time::duration $headTime;
-    private time::duration $bodyTime;
-    private time::duration $idleTime;
-    private int32 $requestCap;
-    private int32 $queueCap;
+
+    // zero: one reactor per four workers
+    private int32 $reactorCount;
+
+    // what each connection may cost, copied to the reactors and workers at listen
+    private Limits $limits;
     private int32 $connCap;
     private int32 $listenFd;
-    private int32 $evFd;
-    private int32 $wakeRead;
 
-    // the wake pipe's write end, behind a lock so stop() never writes to an fd
-    // release() has closed and the process has handed to someone else
-    private thread::mutex<int32> $wakeWrite;
+    // one event set and one wake pipe per reactor
+    private array<int32> $evFds;
+    private array<int32> $wakeReads;
 
-    // what the running listen shares with its workers. Swapped under the
-    // wakeWrite lock, which is also where stop() reads it
+    // the wake pipes' write ends, behind a lock so stop() never writes to an
+    // fd release() has closed and the process has handed to someone else
+    private thread::mutex<array<int32>> $wakeWrites;
+
+    // what the running listen shares with its reactors and workers. Swapped
+    // under the wakeWrites lock, which is also where stop() reads it
     private Shared $shared;
     private atomic<int32> $boundPort;
 
@@ -63,18 +157,14 @@ public class Server
         }
 
         $this->workerCount = $workers;
-        $this->bodyCap = DEFAULT_BODY_CAP;
-        $this->headTime = time::duration::secs(HEADER_TIMEOUT_SECS);
-        $this->bodyTime = time::duration::secs(BODY_TIMEOUT_SECS);
-        $this->idleTime = time::duration::secs(IDLE_TIMEOUT_SECS);
-        $this->requestCap = DEFAULT_MAX_REQUESTS;
-        $this->queueCap = DEFAULT_QUEUE_CAP;
+        $this->reactorCount = 0;
+        $this->limits = Limits();
         $this->connCap = DEFAULT_MAX_CONNECTIONS;
         $this->listenFd = -1;
-        $this->evFd = -1;
-        $this->wakeRead = -1;
-        $this->wakeWrite = thread::mutex<int32>(-1);
-        $this->shared = Shared(-1);
+        $this->evFds = array<int32>();
+        $this->wakeReads = array<int32>();
+        $this->wakeWrites = thread::mutex<array<int32>>(array<int32>());
+        $this->shared = Shared();
         $this->boundPort = atomic<int32>(0);
     }
 
@@ -93,9 +183,30 @@ public class Server
         return $this->workerCount;
     }
 
+    /**
+     * How many reactor threads accept and read connections. Zero, the
+     * default, is one per four workers. Never more than there are workers.
+     */
+    public function reactors(int32 $n) : void
+    {
+        if ($n < 0) {
+            $n = 0;
+        }
+
+        $this->reactorCount = $n;
+    }
+
+    /**
+     * How many reactors `listen` will run, with the default worked out.
+     */
+    public const function reactors() : int32
+    {
+        return reactorsFor($this->reactorCount, $this->workerCount);
+    }
+
     public function maxBody(usize $n) : void
     {
-        $this->bodyCap = $n;
+        $this->limits->maxBody = $n;
     }
 
     /**
@@ -104,7 +215,7 @@ public class Server
      */
     public function headerTimeout(time::duration $d) : void
     {
-        $this->headTime = $d;
+        $this->limits->headerTimeout = $d;
     }
 
     /**
@@ -113,7 +224,7 @@ public class Server
      */
     public function bodyTimeout(time::duration $d) : void
     {
-        $this->bodyTime = $d;
+        $this->limits->bodyTimeout = $d;
     }
 
     /**
@@ -123,7 +234,7 @@ public class Server
      */
     public function idleTimeout(time::duration $d) : void
     {
-        $this->idleTime = $d;
+        $this->limits->idleTimeout = $d;
     }
 
     /**
@@ -136,7 +247,7 @@ public class Server
             $n = 1;
         }
 
-        $this->requestCap = $n;
+        $this->limits->maxRequests = $n;
     }
 
     /**
@@ -154,16 +265,36 @@ public class Server
     }
 
     /**
-     * How many whole requests may wait for a free worker before a new
-     * connection is answered 503. At least one. Default 256.
+     * How long the oldest whole request may wait for a free worker before a
+     * new connection is answered 503. At least 1 ms. Default 1 second.
      */
-    public function maxQueue(int32 $n) : void
+    public function maxQueueWait(time::duration $d) : void
     {
-        if ($n < 1) {
-            $n = 1;
+        if ($d < time::duration::millis(1)) {
+            $d = time::duration::millis(1);
         }
 
-        $this->queueCap = $n;
+        $this->limits->queueWait = $d;
+    }
+
+    /**
+     * The largest websocket message, fragments put together, a client may
+     * send. Past it the socket is closed with 1009, decided from the frame
+     * header before the payload is read. Default 1 MiB.
+     */
+    public function maxMessage(usize $n) : void
+    {
+        $this->limits->maxMessage = $n;
+    }
+
+    /**
+     * How long a websocket may be quiet before the server pings it. A socket
+     * that stays quiet for another interval is closed, and its `onClose` sees
+     * 1006. Zero never pings. Default 30 seconds.
+     */
+    public function pingInterval(time::duration $d) : void
+    {
+        $this->limits->pingInterval = $d;
     }
 
     public const function port() : int32
@@ -224,16 +355,30 @@ public class Server
     }
 
     /**
+     * A websocket at `$path`: a GET route whose answer is the upgrade, with
+     * `$channel`'s hooks. A request that is not a websocket upgrade gets 426.
+     * Middleware runs first, as it does for every route. To choose per
+     * request (check auth, pick a subprotocol), register a GET that returns
+     * `Response(websocket: $channel)` yourself.
+     */
+    public function ws(const string& $path, Channel $channel) : void
+    {
+        $this->on(Method::get, $path, function(Request $req) : Response {
+            return Response(websocket: $channel);
+        });
+    }
+
+    /**
      * Unblocks `listen`. Safe from another thread. Idle connections close
      * at once. A request a worker already has still finishes.
      */
     public function stop() : void
     {
-        thread::locked<int32> $wr = $this->wakeWrite->lock();
+        thread::locked<array<int32>> $wr = $this->wakeWrites->lock();
 
-        if ($wr->value >= 0) {
+        if (!$wr->value->empty()) {
             $this->shared->stopping->store(true);
-            http_wake($wr->value);
+            wakeAll($wr->value);
         }
     }
 
@@ -265,32 +410,55 @@ public class Server
             return .error(.bind(lastError()));
         }
 
-        int32 $ev = http_ev_open();
+        int32 $count = reactorsFor($this->reactorCount, $this->workerCount);
+        array<int32> $evs = array<int32>();
+        array<int32> $rds = array<int32>();
+        array<int32> $wrs = array<int32>();
 
-        if ($ev < 0) {
-            http_close($listenFd);
-            return .error(.bind(lastError()));
+        // and one way back to each reactor, unbounded so a worker never blocks on it
+        array<Home> $homes = array<Home>();
+        array<thread::receiver<Back>> $backs = array<thread::receiver<Back>>();
+        int32 $k = 0;
+
+        while ($k < $count) {
+            int32 $ev = http_ev_open();
+            int32 $rd = -1;
+            int32 $wr = -1;
+
+            if ($ev < 0 || http_pipe_open(&$rd, &$wr) != 0) {
+                Error $opened = .bind(lastError());
+
+                if ($ev >= 0) {
+                    http_close($ev);
+                }
+
+                closeAll($evs);
+                closeAll($rds);
+                closeAll($wrs);
+                http_close($listenFd);
+                return .error($opened);
+            }
+
+            $evs[] = $ev;
+            $rds[] = $rd;
+            $wrs[] = $wr;
+
+            thread::channel<Back> $returns = thread::channel<Back>();
+
+            $homes[] = Home($returns->tx(), $wr);
+            $backs[] = $returns->rx();
+            $k = $k + 1;
         }
 
-        int32 $rd = -1;
-        int32 $wr = -1;
-        int32 $pipeRc = http_pipe_open(&$rd, &$wr);
-
-        if ($pipeRc != 0) {
-            http_close($ev);
-            http_close($listenFd);
-            return .error(.bind(lastError()));
-        }
-
-        Shared $shared = Shared($wr);
+        Shared $shared = Shared();
 
         $this->listenFd = $listenFd;
-        $this->evFd = $ev;
-        $this->wakeRead = $rd;
+        $this->evFds = $evs;
+        $this->wakeReads = $rds;
         {
-            thread::locked<int32> $held = $this->wakeWrite->lock();
+            thread::locked<array<int32>> $held = $this->wakeWrites->lock();
 
-            $held->value = $wr;
+            $held->value = $wrs;
             $this->shared = $shared;
         }
 
@@ -298,37 +466,27 @@ public class Server
 
         array<Route> $table = $this->routes;
         Router $router = Router(mv $table);
-        Limits $limits = Limits(
-            $this->bodyCap,
-            $this->headTime,
-            $this->bodyTime,
-            $this->idleTime,
-            $this->requestCap
-        );
-        int32 $n = $this->workerCount;
+        Limits $limits = $this->limits;
+        int32 $maxConns = $this->connCap;
 
         function<Response(Request)> $app = chain($this->layers, function(Request $req) : Response {
             return dispatch($router, $req);
         });
 
-        // unbounded both ways: a full bounded send would block the reactor, or a worker
-        thread::channel<Job> $jobs = thread::channel<Job>();
-        thread::sender<Job> $tx = $jobs->tx();
-        thread::receiver<Job> $rx = $jobs->rx();
-        thread::channel<Parked> $returns = thread::channel<Parked>();
-        thread::sender<Parked> $back = $returns->tx();
-        thread::receiver<Parked> $backRx = $returns->rx();
+        // one line of jobs for every reactor, so any free worker takes any request
+        JobQueue $jobs = JobQueue();
 
         array<thread::handle> $workers = array<thread::handle>();
+        int32 $n = $this->workerCount;
         int32 $i = 0;
 
         while ($i < $n) {
             result<thread::handle, thread::error> $started = thread::spawn(function() : void {
-                workerLoop($rx, $back, $app, $limits, $shared);
+                workerLoop($jobs, $homes, $app, $limits, $shared);
             });
 
             thread::handle $w = guard $started else ($e) {
-                $tx->close();
+                $jobs->close();
                 joinAll($workers);
                 $this->release();
                 return .error(.spawn($e->message()));
@@ -338,19 +496,65 @@ public class Server
             $i = $i + 1;
         }
 
-        Reactor $reactor = Reactor($ev, $listenFd, $rd, $limits, $this->queueCap, $this->connCap, $shared, $tx, $backRx);
-        status<Error> $ran = $reactor->run();
+        // an opening burst of connections spreads over the reactors rather than all landing on one
+        int32 $batch = ACCEPT_BATCH / $count;
 
-        $reactor->shutdown();
-        joinAll($workers);
-        $reactor->drain();
-        $this->release();
-
-        guard $ran else ($e) {
-            return .error($e);
+        if ($batch < 1) {
+            $batch = 1;
         }
 
-        return .ok($bound);
+        thread::mutex<Error?> $failed = thread::mutex<Error?>(null);
+        array<thread::handle> $others = array<thread::handle>();
+
+        $k = 1;
+
+        while ($k < $count) {
+            int32 $at = $k;
+            result<thread::handle, thread::error> $spawned = thread::spawn(function() : void {
+                runReactor($evs[$at], $listenFd, $rds[$at], $at, $batch, $limits, $maxConns, $shared, $jobs, $backs[$at], $wrs, $failed);
+            });
+
+            if ($spawned->failed()) {
+                // the reactors already running stop the usual way, and so does the first
+                failWith($failed, .spawn($spawned->failure()->message()));
+                $shared->stopping->store(true);
+                wakeAll($wrs);
+                break;
+            }
+
+            $others[] = $spawned->unwrap();
+            $k = $k + 1;
+        }
+
+        runReactor($evs[0], $listenFd, $rds[0], 0, $batch, $limits, $maxConns, $shared, $jobs, $backs[0], $wrs, $failed);
+        joinAll($others);
+
+        // no reactor sends any more: workers finish what is queued, then return
+        $jobs->close();
+        joinAll($workers);
+
+        $k = 0;
+
+        while ($k < $count) {
+            drainReturned($backs[$k], $shared);
+            $k = $k + 1;
+        }
+
+        $this->release();
+
+        Error? $first = null;
+
+        {
+            thread::locked<Error?> $held = $failed->lock();
+
+            $first = $held->value;
+        }
+
+        Error $e = guard $first else {
+            return .ok($bound);
+        }
+
+        return .error($e);
     }
 
     private function release() : void
@@ -360,21 +564,11 @@ public class Server
             $this->listenFd = -1;
         }
 
-        if ($this->evFd >= 0) {
-            http_close($this->evFd);
-            $this->evFd = -1;
-        }
+        closeAll($this->evFds);
+        closeAll($this->wakeReads);
 
-        if ($this->wakeRead >= 0) {
-            http_close($this->wakeRead);
-            $this->wakeRead = -1;
-        }
+        thread::locked<array<int32>> $wr = $this->wakeWrites->lock();
 
-        thread::locked<int32> $wr = $this->wakeWrite->lock();
-
-        if ($wr->value >= 0) {
-            http_close($wr->value);
-            $wr->value = -1;
-        }
+        closeAll($wr->value);
     }
 }

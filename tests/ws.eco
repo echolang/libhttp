@@ -1,0 +1,586 @@
+/**
+ * Websockets over loopback: a real handshake, masked frames out, the
+ * server's frames read back with the same codec a client would use.
+ */
+
+use std::thread;
+use std::time;
+
+internal const uint32 CLIENT_KEY = 0x0A1B2C3D;
+
+/**
+ * A test's side of one websocket.
+ */
+internal class Peer
+{
+    public http::Conn $conn;
+    public http::Reader $reader;
+
+    // the handshake response as it arrived
+    public string $head;
+
+    public constructor(int32 $port, const string& $path, string $extra = '')
+    {
+        $this->conn = dialOrDie($port);
+
+        bool $sent = $this->conn->writeAll(handshakeText($path, '13', $extra));
+
+        assert($sent, 'sent the handshake');
+
+        string $pending = '';
+
+        $this->head = readResponse($this->conn, $pending);
+        $this->reader = http::Reader(false, $pending);
+    }
+
+    public function upgraded() : bool
+    {
+        return $this->head->starts('HTTP/1.1 101 ');
+    }
+
+    public function frame(uint8 $op, const string& $payload) : bool
+    {
+        return $this->conn->writeAll(http::encode($op, $payload, mask: CLIENT_KEY));
+    }
+
+    public function text(const string& $data) : bool
+    {
+        return $this->frame(http::OP_TEXT, $data);
+    }
+
+    /**
+     * The next thing the server sent. `needMore` once the server has closed
+     * and nothing whole is left.
+     */
+    public function next() : http::WsStep
+    {
+        while (true) {
+            http::WsStep $s = $this->reader->advance(16777216);
+
+            if (!needsMore($s)) {
+                return $s;
+            }
+
+            if (!fill($this->conn, $this->reader->buffer)) {
+                return $s;
+            }
+        }
+    }
+
+    /**
+     * The next text message, or `(...)` naming what came instead.
+     */
+    public function nextText() : string
+    {
+        http::WsStep $s = $this->next();
+
+        return textOf($s) ?? describe($s);
+    }
+
+    /**
+     * Whether the server closed the TCP connection.
+     */
+    public function ended() : bool
+    {
+        if (!$this->reader->buffer->empty()) {
+            return false;
+        }
+
+        return !fill($this->conn, $this->reader->buffer);
+    }
+}
+
+internal function describe(const http::WsStep& $s) : string
+{
+    return match ($s) {
+        http::WsStep::needMore => '(closed)',
+        http::WsStep::message($m) => '(binary)',
+        http::WsStep::ping($p) => '(ping)',
+        http::WsStep::pong => '(pong)',
+        http::WsStep::close($code, $reason) => "(close {$code})",
+        http::WsStep::fail($code) => "(fail {$code})",
+    };
+}
+
+internal function closeCodeOf(const http::WsStep& $s) : int32
+{
+    return match ($s) {
+        http::WsStep::close($code, $reason) => $code,
+        else => -1,
+    };
+}
+
+/**
+ * Where hooks leave what they saw, for the test thread to read.
+ */
+#[atomic]
+internal class Seen
+{
+    public atomic<int32> $opened;
+    public atomic<int32> $closedCode;
+    public atomic<int32> $closes;
+    public atomic<bool> $clean;
+    public http::Group $group;
+
+    public constructor()
+    {
+        $this->opened = atomic<int32>(0);
+        $this->closedCode = atomic<int32>(0);
+        $this->closes = atomic<int32>(0);
+        $this->clean = atomic<bool>(false);
+        $this->group = http::Group();
+    }
+
+    public function first() : http::Socket?
+    {
+        array<http::Socket> $all = $this->group->members();
+
+        if ($all->empty()) {
+            return null;
+        }
+
+        return $all[0];
+    }
+}
+
+/**
+ * Waits up to two seconds for `onClose` to have run `$n` times.
+ */
+internal function waitCloses(Seen $seen, int32 $n) : bool
+{
+    int32 $tries = 0;
+
+    while ($tries < 400) {
+        if ($seen->closes->load() >= $n) {
+            return true;
+        }
+
+        thread::sleep(5);
+        $tries = $tries + 1;
+    }
+
+    return false;
+}
+
+/**
+ * A channel that echoes every message and records opens and closes.
+ */
+internal function echoChannel(Seen $seen) : http::Channel
+{
+    http::Channel $c = http::Channel();
+
+    $c->onOpen(function(http::Socket $ws) : void {
+        $seen->opened->add(1);
+        $seen->group->add($ws);
+    });
+    $c->onMessage(function(http::Socket $ws, http::Message $m) : void {
+        match ($m) {
+            http::Message::text($t) => {
+                if ($t == 'quit') {
+                    $ws->close(4000, 'asked to');
+                } else {
+                    $ws->send(text: $t);
+                }
+            },
+            http::Message::binary($b) => {
+                $ws->send(binary: $b);
+            },
+        }
+    });
+    $c->onClose(function(http::Socket $ws, http::Close $how) : void {
+        $seen->closedCode->store($how->code);
+        $seen->clean->store($how->clean);
+        $seen->group->remove($ws);
+        $seen->closes->add(1);
+    });
+
+    return $c;
+}
+
+internal function echoServer(Seen $seen) : http::Server
+{
+    http::Server $app = http::Server();
+
+    $app->workers(2);
+    $app->ws('/echo', echoChannel($seen));
+    $app->get('/hello', function(http::Request $req) : http::Response {
+        return http::Response(text: 'hello');
+    });
+
+    return $app;
+}
+
+#[group: "net"]
+test ws_handshake_and_echo {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+    thread::handle $srv = serve($app);
+    Peer $p = Peer($app->port(), '/echo');
+
+    bool $up = $p->upgraded();
+    bool $accept = $p->head->contains('Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n');
+    bool $sent = $p->text('hello there');
+    string $back = $p->nextText();
+
+    bool $bin = $p->frame(http::OP_BINARY, bytes([0, 255, 7]));
+    string $binBack = binaryOf($p->next()) ?? '(none)';
+
+    $app->stop();
+    $srv->join();
+
+    assert($up, '101');
+    assert($accept, 'the accept key');
+    assert($sent && $back == 'hello there', 'echoed');
+    assert($bin && $binBack == bytes([0, 255, 7]), 'binary echoed');
+    assert($seen->opened->load() == 1, 'onOpen ran once');
+}
+
+#[group: "net"]
+test ws_fragments_and_ping {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+    thread::handle $srv = serve($app);
+    Peer $p = Peer($app->port(), '/echo');
+
+    string $wire = http::encode(http::OP_TEXT, 'frag', mask: CLIENT_KEY, $fin: false);
+
+    $wire->append(http::encode(http::OP_PING, 'mid', mask: CLIENT_KEY));
+    $wire->append(http::encode(http::OP_CONTINUATION, 'mented', mask: CLIENT_KEY));
+
+    bool $sent = $p->conn->writeAll($wire);
+    http::WsStep $first = $p->next();
+    bool $pong = match ($first) {
+        http::WsStep::pong => true,
+        else => false,
+    };
+    string $whole = $p->nextText();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent, 'sent');
+    assert($pong, 'the ping in the middle was answered first');
+    assert($whole == 'fragmented', 'the fragments put together');
+}
+
+#[group: "net"]
+test ws_frames_right_behind_the_handshake {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+    thread::handle $srv = serve($app);
+    http::Conn $c = dialOrDie($app->port());
+
+    // the handshake and two frames in one write: the frames sit in the HTTP buffer
+    string $req = handshakeText('/echo', '13', '');
+
+    $req->append(http::encode(http::OP_TEXT, 'early', mask: CLIENT_KEY));
+    $req->append(http::encode(http::OP_TEXT, 'bird', mask: CLIENT_KEY));
+
+    bool $sent = $c->writeAll($req);
+    string $pending = '';
+    string $head = readResponse($c, $pending);
+    http::Reader $r = http::Reader(false, $pending);
+    string $got = '';
+
+    while ($got->size() < 9) {
+        http::WsStep $s = $r->advance(1024);
+
+        if (needsMore($s)) {
+            if (!fill($c, $r->buffer)) {
+                break;
+            }
+
+            continue;
+        }
+
+        $got->append(textOf($s) ?? '?');
+    }
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $head->starts('HTTP/1.1 101 '), 'upgraded');
+    assert($got == 'earlybird', 'both frames answered in order');
+}
+
+#[group: "net"]
+test ws_client_close_is_answered {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+    thread::handle $srv = serve($app);
+    Peer $p = Peer($app->port(), '/echo');
+
+    bool $sent = $p->frame(http::OP_CLOSE, http::closePayload(1000, 'bye'));
+    int32 $answer = closeCodeOf($p->next());
+    bool $ended = $p->ended();
+    bool $ran = waitCloses($seen, 1);
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent, 'sent');
+    assert($answer == 1000, 'the close echoed');
+    assert($ended, 'then the server closed the connection');
+    assert($ran && $seen->closedCode->load() == 1000 && $seen->clean->load(), 'onClose saw a clean 1000');
+    assert($seen->closes->load() == 1, 'once');
+}
+
+#[group: "net"]
+test ws_server_close {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+    thread::handle $srv = serve($app);
+    Peer $p = Peer($app->port(), '/echo');
+
+    bool $sent = $p->text('quit');
+    http::WsStep $s = $p->next();
+    string $why = match ($s) {
+        http::WsStep::close($code, $said) => $said,
+        else => '',
+    };
+    bool $reason = closeCodeOf($s) == 4000 && $why == 'asked to';
+    bool $answered = $p->frame(http::OP_CLOSE, http::closePayload(4000, ''));
+    bool $ended = $p->ended();
+    bool $ran = waitCloses($seen, 1);
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $reason, 'the servers close, with its code and reason');
+    assert($answered && $ended, 'closed once the client answered');
+    assert($ran && $seen->closedCode->load() == 4000, 'onClose saw 4000');
+}
+
+#[group: "net"]
+test ws_send_from_another_thread {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+    thread::handle $srv = serve($app);
+    Peer $p = Peer($app->port(), '/echo');
+    int32 $tries = 0;
+
+    while ($seen->first() == null && $tries < 400) {
+        thread::sleep(5);
+        $tries = $tries + 1;
+    }
+
+    http::Socket $ws = guard $seen->first() else {
+        die('onOpen never ran');
+    }
+
+    // the test thread is not a worker: this is a broadcast's shape
+    bool $pushed = $ws->send(text: 'pushed');
+    string $got = $p->nextText();
+    bool $open = $ws->open();
+
+    $app->stop();
+    $srv->join();
+
+    assert($pushed && $got == 'pushed', 'arrived');
+    assert($open, 'still open');
+    assert($ws->id() > 0, 'an id');
+}
+
+#[group: "net"]
+test ws_route_params_reach_the_socket {
+    http::Server $app = http::Server();
+    http::Channel $c = http::Channel();
+
+    $c->onOpen(function(http::Socket $ws) : void {
+        string $room = $ws->request->param('room') ?? '(none)';
+
+        $ws->send(text: "welcome to {$room}");
+    });
+    $app->workers(1);
+    $app->ws('/rooms/{room}', $c);
+
+    thread::handle $srv = serve($app);
+    Peer $p = Peer($app->port(), '/rooms/lobby');
+    string $got = $p->nextText();
+
+    $app->stop();
+    $srv->join();
+
+    assert($got == 'welcome to lobby', 'the room param reached onOpen');
+}
+
+#[group: "net"]
+test ws_refusals_are_http {
+    http::Server $app = http::Server();
+    http::Channel $c = http::Channel();
+
+    $app->workers(1);
+    $app->wrap(function(http::Request $req, http::Next $next) : http::Response {
+        if ($req->path == '/private' && $req->header('Authorization') == null) {
+            return http::Response(401, 'Unauthorized');
+        }
+
+        return $next->run($req);
+    });
+    $app->ws('/chat', $c);
+    $app->ws('/private', $c);
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    string $plain = exchange($port, "GET /chat HTTP/1.1\r\nHost: x\r\n\r\n");
+    Peer $old = Peer($port, '/chat', '');
+    string $eight = exchange($port, handshakeText('/chat', '8', ''));
+    Peer $denied = Peer($port, '/private');
+    Peer $allowed = Peer($port, '/private', 'Authorization: yes\r\n');
+
+    $app->stop();
+    $srv->join();
+
+    assert($plain->starts('HTTP/1.1 426 '), 'a plain GET is 426');
+    assert($old->upgraded(), 'a real upgrade on the same route works');
+    assert($eight->starts('HTTP/1.1 426 ') && $eight->contains('Sec-WebSocket-Version: 13'), 'version 8 is told 13');
+    assert($denied->head->starts('HTTP/1.1 401 '), 'middleware refused the upgrade');
+    assert($allowed->upgraded(), 'and let the authorized one through');
+}
+
+#[group: "net"]
+test ws_idle_socket_holds_no_worker {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+
+    $app->workers(1);
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    Peer $a = Peer($port, '/echo');
+    Peer $b = Peer($port, '/echo');
+    time::instant $start = time::instant::now();
+    string $got = exchange($port, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    time::duration $took = $start->elapsed();
+    bool $sent = $a->text('still here');
+    string $echo = $a->nextText();
+
+    $app->stop();
+    $srv->join();
+
+    assert($a->upgraded() && $b->upgraded(), 'two sockets open on one worker');
+    assert($got->ends('hello') && $took < time::duration::millis(500), 'the worker was free for a request');
+    assert($sent && $echo == 'still here', 'and the socket still works');
+}
+
+#[group: "net"]
+test ws_stop_says_going_away {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+    thread::handle $srv = serve($app);
+    Peer $p = Peer($app->port(), '/echo');
+    bool $sent = $p->text('ready');
+    string $echo = $p->nextText();
+
+    $app->stop();
+
+    int32 $code = closeCodeOf($p->next());
+
+    $srv->join();
+
+    assert($sent && $echo == 'ready', 'open first');
+    assert($code == 1001, 'the server said it is going away');
+    assert($seen->closes->load() == 1 && $seen->closedCode->load() == 1001, 'onClose ran once, before listen returned');
+}
+
+#[group: "net"]
+test ws_too_big_and_bad_text {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+
+    $app->maxMessage(16);
+
+    thread::handle $srv = serve($app);
+    Peer $big = Peer($app->port(), '/echo');
+    bool $sentBig = $big->text('this message is longer than sixteen bytes');
+    int32 $bigCode = closeCodeOf($big->next());
+    Peer $bad = Peer($app->port(), '/echo');
+    bool $sentBad = $bad->frame(http::OP_TEXT, bytes([0xC0, 0xAF]));
+    int32 $badCode = closeCodeOf($bad->next());
+    Peer $raw = Peer($app->port(), '/echo');
+
+    // unmasked, which a client may not send
+    bool $sentRaw = $raw->conn->writeAll(http::encode(http::OP_TEXT, 'x'));
+    int32 $rawCode = closeCodeOf($raw->next());
+    bool $ran = waitCloses($seen, 3);
+
+    $app->stop();
+    $srv->join();
+
+    assert($sentBig && $bigCode == 1009, 'too big is 1009');
+    assert($sentBad && $badCode == 1007, 'bad UTF-8 is 1007');
+    assert($sentRaw && $rawCode == 1002, 'unmasked is 1002');
+    assert($ran, 'onClose ran for all three');
+}
+
+#[group: "net"]
+test ws_quiet_socket_is_pinged_then_dropped {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+
+    $app->pingInterval(time::duration::millis(200));
+
+    thread::handle $srv = serve($app);
+    Peer $p = Peer($app->port(), '/echo');
+    http::WsStep $s = $p->next();
+    bool $pinged = match ($s) {
+        http::WsStep::ping($payload) => true,
+        else => false,
+    };
+
+    // no pong: the server gives up after another interval
+    bool $ended = $p->ended();
+    bool $ran = waitCloses($seen, 1);
+
+    $app->stop();
+    $srv->join();
+
+    assert($pinged, 'a quiet socket was pinged');
+    assert($ended, 'and dropped when it never answered');
+    assert($ran && $seen->closedCode->load() == 1006 && !$seen->clean->load(), 'onClose saw 1006');
+}
+
+#[group: "net"]
+test ws_across_reactors {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+
+    $app->reactors(2);
+
+    thread::handle $srv = serve($app);
+    array<Peer> $peers = array<Peer>();
+    int32 $i = 0;
+
+    while ($i < 6) {
+        $peers[] = Peer($app->port(), '/echo');
+        $i = $i + 1;
+    }
+
+    // twice each, so every socket goes back to its reactor and comes out again
+    int32 $echoed = 0;
+    int32 $round = 0;
+
+    while ($round < 2) {
+        $i = 0;
+
+        while ($i < 6) {
+            Peer $p = $peers[$i as usize];
+
+            if ($p->text("m{$i}") && $p->nextText() == "m{$i}") {
+                $echoed = $echoed + 1;
+            }
+
+            $i = $i + 1;
+        }
+
+        $round = $round + 1;
+    }
+
+    $app->stop();
+    $srv->join();
+
+    assert($echoed == 12, 'all twelve echoed');
+    assert($seen->opened->load() == 6, 'six opened');
+    assert($seen->closes->load() == 6, 'onClose once each, on stop');
+    assert($seen->closedCode->load() == 1001, 'going away');
+}

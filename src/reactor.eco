@@ -4,6 +4,13 @@
  * It waits on the listen socket, the wake pipe, and every idle or
  * half-read connection. A whole request goes to a worker. Everything
  * else costs a slot in the map. The reactor never waits on a client.
+ *
+ * Open websockets live here too, in their own map. Their bytes are decoded
+ * as they arrive, and a whole message, a ping, a close, or a broken frame
+ * goes to a worker the same way a request does. A pong only resets the
+ * socket's quiet clock. The sweep pings a socket that has gone quiet, and
+ * gives up on one that stays quiet, broke a send, or never answered a
+ * close.
  */
 
 use std::thread;
@@ -35,12 +42,18 @@ internal class Reactor
     private int32 $listenFd;
     private int32 $wakeRd;
     private Limits $limits;
-    private int32 $queueCap;
     private int32 $maxConns;
     private Shared $shared;
-    private thread::sender<Job> $tx;
-    private thread::receiver<Parked> $back;
+    private JobQueue $jobs;
+    private thread::receiver<Back> $back;
+
+    // this reactor's index among the server's, which is where its
+    // connections come back to, and how many it accepts per wake
+    private int32 $home;
+    private int32 $acceptBatch;
+
     private map<int32, Slot> $slots;
+    private map<int32, WsConn> $sockets;
     private time::instant $swept;
 
     // out of descriptors: the listen socket is disarmed until PAUSE_MS passes
@@ -51,24 +64,27 @@ internal class Reactor
         int32 $ev,
         int32 $listenFd,
         int32 $wakeRd,
+        int32 $home,
+        int32 $acceptBatch,
         Limits $limits,
-        int32 $queueCap,
         int32 $maxConns,
         Shared $shared,
-        thread::sender<Job> $tx,
-        thread::receiver<Parked> $back
+        JobQueue $jobs,
+        thread::receiver<Back> $back
     )
     {
         $this->ev = $ev;
         $this->listenFd = $listenFd;
         $this->wakeRd = $wakeRd;
+        $this->home = $home;
+        $this->acceptBatch = $acceptBatch;
         $this->limits = $limits;
-        $this->queueCap = $queueCap;
         $this->maxConns = $maxConns;
         $this->shared = $shared;
-        $this->tx = $tx;
+        $this->jobs = $jobs;
         $this->back = $back;
         $this->slots = map<int32, Slot>();
+        $this->sockets = map<int32, WsConn>();
         $this->swept = time::instant::now();
         $this->paused = false;
         $this->pausedAt = time::instant::now();
@@ -90,7 +106,7 @@ internal class Reactor
             int32 $wait = -1;
 
             // deadlines need a sweep even when nothing is readable
-            if (!$this->slots->empty() || $this->paused) {
+            if (!$this->slots->empty() || !$this->sockets->empty() || $this->paused) {
                 $wait = SWEEP_MS;
             }
 
@@ -140,7 +156,8 @@ internal class Reactor
 
     /**
      * The first half of stopping: every connection the reactor holds is
-     * closed, and workers are told no more jobs are coming.
+     * closed. An open websocket goes to a worker for its 1001 and `onClose`
+     * first. The server closes the job queue once every reactor is here.
      */
     internal function shutdown() : void
     {
@@ -153,37 +170,25 @@ internal class Reactor
             $i = $i + 1;
         }
 
-        $this->tx->close();
-    }
+        array<int32> $open = $this->sockets->keys();
 
-    /**
-     * The second half, once the workers are joined: a connection a worker
-     * handed back on its way out is closed too.
-     */
-    internal function drain() : void
-    {
-        bool $more = true;
+        $n = $open->count();
+        $i = 0;
 
-        while ($more) {
-            thread::poll<Parked> $p = $this->back->try_recv();
-
-            match ($p) {
-                thread::poll<Parked>::item($parked) => {
-                    http_close($parked->fd);
-                    $this->shared->live->sub(1);
-                },
-                else => {
-                    $more = false;
-                },
-            }
+        while ($i < $n) {
+            $this->hand($open[$i], WsEvent::goingAway);
+            $i = $i + 1;
         }
     }
 
     private function acceptAll() : status<Error>
     {
+        // behind is the oldest job waiting too long, not a queue a burst just
+        // filled. Asked once per batch: it takes the lock every worker contends for
+        bool $behind = $this->jobs->oldestWait() >= $this->limits->queueWait;
         int32 $round = 0;
 
-        while ($round < ACCEPT_BATCH) {
+        while ($round < $this->acceptBatch) {
             $round = $round + 1;
 
             string $peer = '';
@@ -226,7 +231,7 @@ internal class Reactor
 
             $peer->commit($pn);
 
-            if ($this->shared->queued->load() >= $this->queueCap || $this->shared->live->load() >= $this->maxConns) {
+            if ($behind || $this->shared->live->load() >= $this->maxConns) {
                 reject($fd);
                 continue;
             }
@@ -245,27 +250,14 @@ internal class Reactor
     private function readable(int32 $fd) : void
     {
         if (!$this->slots->has($fd)) {
+            if ($this->sockets->has($fd)) {
+                $this->socketReadable($fd);
+            }
+
             return;
         }
 
-        isize $got = 0;
-
-        {
-            Slot& $slot = $this->slots->at($fd);
-
-            if ($slot->framer->buffer->room() < READ_MIN) {
-                $slot->framer->buffer->reserve($slot->framer->buffer->size() + READ_CHUNK);
-            }
-
-            usize $room = $slot->framer->buffer->room();
-            ptr<uint8> $dst = $slot->framer->buffer->spare();
-
-            $got = http_recv_now($fd, $dst, $room);
-
-            if ($got > 0) {
-                $slot->framer->buffer->commit($got as usize);
-            }
-        }
+        isize $got = recvInto($fd, $this->slots->at($fd)->framer->buffer);
 
         if ($got == RECV_AGAIN) {
             $this->arm($fd);
@@ -309,55 +301,39 @@ internal class Reactor
                         $more = true;
                     }
                 },
-                Step::ready($req) => {
+                Step::ready => {
+                    // the whole slot moves: the request inside it is never copied here
                     Slot $slot = $this->slots->take($fd);
-                    Request $full = $req;
 
-                    $full->peer = $slot->peer;
-                    $this->send(Job::serve(Visit($fd, $slot->peer, $full, $slot->framer->buffer, $slot->served)));
+                    $this->jobs->send(Job::serve(Visit($fd, $this->home, mv $slot)));
                 },
                 Step::fail($e) => {
                     Slot $gone = $this->slots->take($fd);
 
-                    $this->send(Job::fail($fd, $e));
+                    $this->jobs->send(Job::fail($fd, $e));
                 },
             }
         }
     }
 
-    private function send(Job $job) : void
-    {
-        $this->shared->queued->add(1);
-
-        if ($this->tx->send($job)) {
-            return;
-        }
-
-        // no worker left to take it: only while stopping
-        $this->shared->queued->sub(1);
-
-        int32 $fd = match ($job) {
-            Job::serve($visit) => $visit->fd,
-            Job::fail($failed, $e) => $failed,
-        };
-
-        http_close($fd);
-        $this->shared->live->sub(1);
-    }
-
     private function adoptReturned() : void
     {
-        bool $more = true;
-
-        while ($more) {
-            thread::poll<Parked> $p = $this->back->try_recv();
+        while (true) {
+            thread::poll<Back> $p = $this->back->try_recv();
 
             match ($p) {
-                thread::poll<Parked>::item($parked) => {
-                    $this->adopt($parked);
+                thread::poll<Back>::item($returned) => {
+                    match ($returned) {
+                        Back::kept($parked) => {
+                            $this->adopt($parked);
+                        },
+                        Back::socket($ws) => {
+                            $this->adoptSocket($ws);
+                        },
+                    }
                 },
                 else => {
-                    $more = false;
+                    return;
                 },
             }
         }
@@ -375,6 +351,103 @@ internal class Reactor
         }
 
         $this->process($fd);
+    }
+
+    private function adoptSocket(WsConn $ws) : void
+    {
+        int32 $fd = $ws->fd;
+        bool $pending = !$ws->reader->buffer->empty();
+
+        $this->sockets[$fd] = $ws;
+
+        // frames that came in behind the last one never make the socket readable again
+        if ($pending) {
+            $this->socketProcess($fd);
+            return;
+        }
+
+        $this->armSocket($fd);
+    }
+
+    private function socketReadable(int32 $fd) : void
+    {
+        isize $got = 0;
+
+        {
+            WsConn& $ws = $this->sockets->at($fd);
+
+            $got = recvInto($fd, $ws->reader->buffer);
+
+            if ($got > 0) {
+                $ws->hear();
+            }
+        }
+
+        if ($got == RECV_AGAIN) {
+            $this->armSocket($fd);
+            return;
+        }
+
+        // the client went away without a close frame
+        if ($got <= 0) {
+            $this->hand($fd, WsEvent::gone);
+            return;
+        }
+
+        $this->socketProcess($fd);
+    }
+
+    /**
+     * Decodes what the socket holds, and hands a worker the first thing that
+     * needs one. A pong needs nothing; decoding goes on past it.
+     */
+    private function socketProcess(int32 $fd) : void
+    {
+        while (true) {
+            WsStep $step = $this->sockets->at($fd)->reader->advance($this->limits->maxMessage);
+
+            match ($step) {
+                WsStep::needMore => {
+                    $this->armSocket($fd);
+                    return;
+                },
+                WsStep::pong => {
+                },
+                WsStep::message($m) => {
+                    $this->hand($fd, WsEvent::message($m));
+                    return;
+                },
+                WsStep::ping($payload) => {
+                    $this->hand($fd, WsEvent::ping($payload));
+                    return;
+                },
+                WsStep::close($code, $reason) => {
+                    $this->hand($fd, WsEvent::close($code, $reason));
+                    return;
+                },
+                WsStep::fail($code) => {
+                    $this->hand($fd, WsEvent::fail($code));
+                    return;
+                },
+            }
+        }
+    }
+
+    /**
+     * Takes a socket off the reactor and gives a worker `$event` for it.
+     */
+    private function hand(int32 $fd, WsEvent $event) : void
+    {
+        WsConn $ws = $this->sockets->take($fd);
+
+        $this->jobs->send(Job::ws(mv $ws, $event));
+    }
+
+    private function armSocket(int32 $fd) : void
+    {
+        if (http_ev_arm($this->ev, $fd, 1) != 0) {
+            $this->hand($fd, WsEvent::gone);
+        }
     }
 
     /**
@@ -415,9 +488,28 @@ internal class Reactor
 
                     // armed while it was waiting: it must not report to the reactor on a worker
                     http_ev_drop($this->ev, $fd);
-                    $this->send(Job::fail($fd, .timeout));
+                    $this->jobs->send(Job::fail($fd, .timeout));
                 },
             }
+        }
+
+        array<int32> $open = $this->sockets->keys();
+
+        $n = $open->count();
+        $i = 0;
+
+        while ($i < $n) {
+            int32 $fd = $open[$i];
+
+            $i = $i + 1;
+
+            WsEvent $due = guard $this->sockets->at($fd)->due($this->limits->pingInterval) else {
+                continue;
+            }
+
+            // armed while it was waiting: it must not report to the reactor on a worker
+            http_ev_drop($this->ev, $fd);
+            $this->hand($fd, $due);
         }
     }
 
@@ -441,6 +533,56 @@ internal class Reactor
         http_close($fd);
         $this->shared->live->sub(1);
     }
+}
+
+/**
+ * The second half of stopping, once the workers are joined: a connection a
+ * worker handed back to a reactor on its way out is closed too.
+ */
+internal function drainReturned(thread::receiver<Back> $back, Shared $shared) : void
+{
+    while (true) {
+        thread::poll<Back> $p = $back->try_recv();
+
+        match ($p) {
+            thread::poll<Back>::item($returned) => {
+                match ($returned) {
+                    Back::kept($parked) => {
+                        http_close($parked->fd);
+                        $shared->live->sub(1);
+                    },
+                    Back::socket($ws) => {
+                        // no worker is left, and onClose still has to run once
+                        goAway($ws, $shared);
+                    },
+                }
+            },
+            else => {
+                return;
+            },
+        }
+    }
+}
+
+/**
+ * One read onto the end of `$buf`, which grows first when it is nearly full.
+ * What `http_recv_now` answered: a count, `RECV_AGAIN`, or the end.
+ */
+internal function recvInto(int32 $fd, string& $buf) : isize
+{
+    if ($buf->room() < READ_MIN) {
+        $buf->reserve($buf->size() + READ_CHUNK);
+    }
+
+    usize $room = $buf->room();
+    ptr<uint8> $dst = $buf->spare();
+    isize $got = http_recv_now($fd, $dst, $room);
+
+    if ($got > 0) {
+        $buf->commit($got as usize);
+    }
+
+    return $got;
 }
 
 /**

@@ -1,0 +1,303 @@
+/**
+ * SHA-1, base64, and UTF-8 checking: the three things the websocket handshake
+ * and frames need that the standard library does not have.
+ *
+ * SHA-1 is here for `Sec-WebSocket-Accept` and nothing else. It is broken for
+ * anything that needs collision resistance, and the handshake does not: the
+ * accept key only proves the server read the request.
+ *
+ * `uint32` arithmetic wraps, which is what SHA-1's additions want.
+ */
+
+namespace http;
+
+private function rotl(uint32 $x, uint32 $n) : uint32
+{
+    return ($x << $n) | ($x >> (32 - $n));
+}
+
+/**
+ * The SHA-1 digest of `$data`, as its 20 raw bytes.
+ */
+internal function sha1(const string& $data) : string
+{
+    uint32 $h0 = 0x67452301;
+    uint32 $h1 = 0xEFCDAB89;
+    uint32 $h2 = 0x98BADCFE;
+    uint32 $h3 = 0x10325476;
+    uint32 $h4 = 0xC3D2E1F0;
+
+    // the message, a 1 bit, zeros to 56 mod 64, then the bit length big-endian
+    string $m = '';
+    uint64 $bits = ($data->size() as uint64) * 8;
+
+    $m->reserve($data->size() + 72);
+    $m->append($data);
+    $m->push(0x80 as uint8);
+
+    while ($m->size() % 64 != 56) {
+        $m->push(0 as uint8);
+    }
+
+    pushBE($m, $bits, 8);
+
+    fixed_array<uint32, 80> $w = fixed_array<uint32, 80>();
+    usize $block = 0;
+
+    while ($block < $m->size()) {
+        usize $t = 0;
+
+        while ($t < 16) {
+            $w[$t] = readBE($m, $block + $t * 4, 4) as uint32;
+            $t = $t + 1;
+        }
+
+        while ($t < 80) {
+            $w[$t] = rotl($w[$t - 3] ^ $w[$t - 8] ^ $w[$t - 14] ^ $w[$t - 16], 1);
+            $t = $t + 1;
+        }
+
+        uint32 $a = $h0;
+        uint32 $b = $h1;
+        uint32 $c = $h2;
+        uint32 $d = $h3;
+        uint32 $e = $h4;
+
+        $t = 0;
+
+        while ($t < 80) {
+            uint32 $f = 0;
+            uint32 $k = 0;
+
+            if ($t < 20) {
+                $f = ($b & $c) | ((~$b) & $d);
+                $k = 0x5A827999;
+            } else if ($t < 40) {
+                $f = $b ^ $c ^ $d;
+                $k = 0x6ED9EBA1;
+            } else if ($t < 60) {
+                $f = ($b & $c) | ($b & $d) | ($c & $d);
+                $k = 0x8F1BBCDC;
+            } else {
+                $f = $b ^ $c ^ $d;
+                $k = 0xCA62C1D6;
+            }
+
+            uint32 $next = rotl($a, 5) + $f + $e + $k + $w[$t];
+
+            $e = $d;
+            $d = $c;
+            $c = rotl($b, 30);
+            $b = $a;
+            $a = $next;
+            $t = $t + 1;
+        }
+
+        $h0 = $h0 + $a;
+        $h1 = $h1 + $b;
+        $h2 = $h2 + $c;
+        $h3 = $h3 + $d;
+        $h4 = $h4 + $e;
+        $block = $block + 64;
+    }
+
+    string $out = '';
+
+    $out->reserve(20);
+    pushBE($out, $h0 as uint64, 4);
+    pushBE($out, $h1 as uint64, 4);
+    pushBE($out, $h2 as uint64, 4);
+    pushBE($out, $h3 as uint64, 4);
+    pushBE($out, $h4 as uint64, 4);
+    return $out;
+}
+
+/**
+ * Appends the low `$bytes` bytes of `$v`, most significant first: how SHA-1
+ * and websocket frames write their numbers.
+ */
+internal function pushBE(string& $out, uint64 $v, usize $bytes) : void
+{
+    usize $i = $bytes;
+
+    while ($i > 0) {
+        $i = $i - 1;
+        $out->push((($v >> (($i * 8) as uint64)) & 0xFF) as uint8);
+    }
+}
+
+/**
+ * The `$bytes` bytes of `$s` from `$at` as one big-endian number.
+ */
+internal function readBE(const string& $s, usize $at, usize $bytes) : uint64
+{
+    uint64 $v = 0;
+    usize $i = 0;
+
+    while ($i < $bytes) {
+        $v = ($v << 8) | ($s->byte($at + $i) as uint64);
+        $i = $i + 1;
+    }
+
+    return $v;
+}
+
+/**
+ * Standard base64 (RFC 4648), padded with `=`.
+ */
+internal function base64(const string& $raw) : string
+{
+    string $abc = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    usize $n = $raw->size();
+    string $out = '';
+    usize $i = 0;
+
+    $out->reserve(($n + 2) / 3 * 4);
+
+    while ($i + 3 <= $n) {
+        uint32 $v = (($raw->byte($i) as uint32) << 16) | (($raw->byte($i + 1) as uint32) << 8) | ($raw->byte($i + 2) as uint32);
+
+        $out->push($abc->byte(($v >> 18) as usize));
+        $out->push($abc->byte((($v >> 12) & 63) as usize));
+        $out->push($abc->byte((($v >> 6) & 63) as usize));
+        $out->push($abc->byte(($v & 63) as usize));
+        $i = $i + 3;
+    }
+
+    usize $left = $n - $i;
+
+    if ($left > 0) {
+        uint32 $v = ($raw->byte($i) as uint32) << 16;
+
+        if ($left == 2) {
+            $v = $v | (($raw->byte($i + 1) as uint32) << 8);
+        }
+
+        $out->push($abc->byte(($v >> 18) as usize));
+        $out->push($abc->byte((($v >> 12) & 63) as usize));
+
+        if ($left == 2) {
+            $out->push($abc->byte((($v >> 6) & 63) as usize));
+        } else {
+            $out->push(CH_EQUALS);
+        }
+
+        $out->push(CH_EQUALS);
+    }
+
+    return $out;
+}
+
+private function base64Char(uint8 $b) : bool
+{
+    return ($b >= CH_UPPER_A && $b <= CH_UPPER_Z)
+        || ($b >= CH_LOWER_A && $b <= CH_LOWER_Z)
+        || ($b >= CH_ZERO && $b <= CH_NINE)
+        || $b == CH_PLUS
+        || $b == CH_SLASH;
+}
+
+/**
+ * Whether `$key` is the base64 of 16 bytes, the one shape a
+ * `Sec-WebSocket-Key` may have: 22 alphabet characters and `==`.
+ */
+internal function keyShape(const string& $key) : bool
+{
+    if ($key->size() != 24) {
+        return false;
+    }
+
+    if ($key->byte(22) != CH_EQUALS || $key->byte(23) != CH_EQUALS) {
+        return false;
+    }
+
+    usize $i = 0;
+
+    while ($i < 22) {
+        if (!base64Char($key->byte($i))) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    return true;
+}
+
+/**
+ * Whether `$s` is well-formed UTF-8: no overlong forms, no surrogates, nothing
+ * past U+10FFFF, and no sequence cut short.
+ */
+internal function utf8Valid(const string& $s) : bool
+{
+    usize $n = $s->size();
+    usize $i = 0;
+
+    // raw reads: a byte() per byte is a stdlib call each under --optimize module
+    ptr<const uint8> $p = $s->data();
+
+    while ($i < $n) {
+        uint8 $b = $p:$[$i];
+
+        if ($b < 0x80) {
+            $i = $i + 1;
+            continue;
+        }
+
+        usize $need = 0;
+
+        // the first continuation byte's range is what rules out overlongs,
+        // surrogates, and code points past U+10FFFF
+        uint8 $lo = 0x80;
+        uint8 $hi = 0xBF;
+
+        if ($b >= 0xC2 && $b <= 0xDF) {
+            $need = 1;
+        } else if ($b == 0xE0) {
+            $need = 2;
+            $lo = 0xA0;
+        } else if ($b == 0xED) {
+            $need = 2;
+            $hi = 0x9F;
+        } else if ($b >= 0xE1 && $b <= 0xEF) {
+            $need = 2;
+        } else if ($b == 0xF0) {
+            $need = 3;
+            $lo = 0x90;
+        } else if ($b >= 0xF1 && $b <= 0xF3) {
+            $need = 3;
+        } else if ($b == 0xF4) {
+            $need = 3;
+            $hi = 0x8F;
+        } else {
+            return false;
+        }
+
+        // a sequence cut short by the end of the string
+        if ($i + $need >= $n) {
+            return false;
+        }
+
+        uint8 $first = $p:$[$i + 1];
+
+        if ($first < $lo || $first > $hi) {
+            return false;
+        }
+
+        usize $k = 2;
+
+        while ($k <= $need) {
+            uint8 $c = $p:$[$i + $k];
+
+            if ($c < 0x80 || $c > 0xBF) {
+                return false;
+            }
+
+            $k = $k + 1;
+        }
+
+        $i = $i + $need + 1;
+    }
+
+    return true;
+}

@@ -1,0 +1,138 @@
+/**
+ * The websocket opening handshake (RFC 6455 section 4.2): whether a request
+ * may be upgraded, and the 101 that says yes.
+ *
+ * A request is only an attempt at all when its `Upgrade` lists `websocket`.
+ * Anything else, on a route that answers with a websocket, is 426 Upgrade
+ * Required. An attempt then needs GET, HTTP/1.1, `upgrade` in `Connection`,
+ * and a `Sec-WebSocket-Key` that is the base64 of 16 bytes, or it is a 400.
+ * A `Sec-WebSocket-Version` other than 13 is 426 with the version this server
+ * speaks, which is how the RFC asks a client to retry.
+ *
+ * The 101 is the server's: a handler's own `Upgrade`, `Connection` or
+ * `Sec-WebSocket-*` headers are replaced. Its other headers (a cookie, say)
+ * go out with it. A subprotocol the handler picked is sent back only when the
+ * client offered it, since a client must fail a handshake that names one it
+ * did not ask for.
+ */
+
+namespace http;
+
+internal const string WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+internal enum UpgradeError
+{
+    // not a websocket request at all
+    case notUpgrade;
+
+    // an attempt, but a malformed one
+    case badRequest;
+
+    // a Sec-WebSocket-Version this server does not speak
+    case badVersion;
+}
+
+/**
+ * The request's `Sec-WebSocket-Key`, once every other part of the handshake
+ * checks out.
+ */
+internal function upgradeKey(const Request& $req) : result<string, UpgradeError>
+{
+    if (!hasToken($req->headers, 'Upgrade', 'websocket')) {
+        return .error(.notUpgrade);
+    }
+
+    if (!methodEq($req->method, Method::get) || $req->version != 'HTTP/1.1') {
+        return .error(.badRequest);
+    }
+
+    if (!hasToken($req->headers, 'Connection', 'upgrade')) {
+        return .error(.badRequest);
+    }
+
+    array<string> $keys = $req->headers->all('Sec-WebSocket-Key');
+
+    if ($keys->count() != 1) {
+        return .error(.badRequest);
+    }
+
+    string $key = str::from(str::trim($keys[0]));
+
+    if (!keyShape($key)) {
+        return .error(.badRequest);
+    }
+
+    array<string> $versions = $req->headers->all('Sec-WebSocket-Version');
+
+    if ($versions->count() != 1) {
+        return .error(.badVersion);
+    }
+
+    string $version = str::from(str::trim($versions[0]));
+
+    if ($version != '13') {
+        return .error(.badVersion);
+    }
+
+    return .ok($key);
+}
+
+/**
+ * `Sec-WebSocket-Accept` for a key: base64 of the SHA-1 of the key and the
+ * RFC's fixed GUID.
+ */
+internal function acceptKey(const string& $key) : string
+{
+    string $joined = $key;
+
+    $joined->append(WS_GUID);
+    return base64(sha1($joined));
+}
+
+/**
+ * The answer to a request that could not be upgraded.
+ */
+internal function refusal(const UpgradeError& $e) : Response
+{
+    return match ($e) {
+        UpgradeError::badRequest => errorResponse(400, 'Bad Request'),
+        UpgradeError::notUpgrade => upgradeRequired(false),
+        UpgradeError::badVersion => upgradeRequired(true),
+    };
+}
+
+private function upgradeRequired(bool $version) : Response
+{
+    Response $r = errorResponse(426, 'Upgrade Required');
+
+    $r->headers->set('Upgrade', 'websocket');
+
+    if ($version) {
+        $r->headers->set('Sec-WebSocket-Version', '13');
+    }
+
+    return $r;
+}
+
+/**
+ * The 101 for a handler's websocket response, the key it answers, and the
+ * subprotocol agreed on, or empty for none.
+ */
+internal function switching(const Response& $res, const string& $key, const string& $protocol) : Response
+{
+    Response $out = Response(101, '');
+
+    // set replaces a handler's Upgrade and Sec-WebSocket-Accept
+    $out->headers = $res->headers;
+    $out->headers->remove('Sec-WebSocket-Protocol');
+    $out->headers->remove('Sec-WebSocket-Extensions');
+    $out->headers->remove('Content-Type');
+    $out->headers->set('Upgrade', 'websocket');
+    $out->headers->set('Sec-WebSocket-Accept', acceptKey($key));
+
+    if (!$protocol->empty()) {
+        $out->headers->set('Sec-WebSocket-Protocol', $protocol);
+    }
+
+    return $out;
+}

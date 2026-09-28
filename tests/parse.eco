@@ -326,7 +326,7 @@ test http10_expect_is_ignored {
 internal function isReady(const http::Step& $s) : bool
 {
     return match ($s) {
-        http::Step::ready($req) => true,
+        http::Step::ready => true,
         else => false,
     };
 }
@@ -339,12 +339,17 @@ internal function isNeedMore(const http::Step& $s) : bool
     };
 }
 
-internal function readyBody(const http::Step& $s) : string
+internal function readyBody(const http::Step& $s, const http::Framer& $f) : string
 {
-    return match ($s) {
-        http::Step::ready($req) => $req->body,
-        else => '(not ready)',
-    };
+    if (!isReady($s)) {
+        return '(not ready)';
+    }
+
+    http::Request $req = guard $f->request() else {
+        return '(no request)';
+    }
+
+    return $req->body;
 }
 
 #[group: "unit"]
@@ -385,7 +390,7 @@ test framer_takes_a_head_a_byte_at_a_time {
 
         if (isReady($s)) {
             $readyAt = $i;
-            $body = readyBody($s);
+            $body = readyBody($s, $f);
         }
     }
 
@@ -402,7 +407,7 @@ test framer_keeps_the_next_request {
 
     http::Step $first = $f->advance($limits);
 
-    assert(readyBody($first) == 'hi', 'first body stops at its length');
+    assert(readyBody($first, $f) == 'hi', 'first body stops at its length');
     assert($f->buffer->starts('GET /b HTTP/1.1'), 'the rest is kept');
 
     http::Step $second = $f->advance($limits);
@@ -430,7 +435,9 @@ test framer_asks_for_the_100_before_the_body {
 
     $f->buffer->append('ok');
 
-    assert(readyBody($f->advance($limits)) == 'ok', 'body');
+    http::Step $done = $f->advance($limits);
+
+    assert(readyBody($done, $f) == 'ok', 'body');
 }
 
 #[group: "unit"]
@@ -506,12 +513,14 @@ test chunked_body_split_at_every_byte {
         $f->buffer->append($raw->sub(0, $cut));
 
         http::Step $first = $f->advance($limits);
-        string $body = readyBody($first);
+        string $body = readyBody($first, $f);
 
         $f->buffer->append($raw->sub($cut, $n - $cut));
 
         if (!isReady($first)) {
-            $body = readyBody($f->advance($limits));
+            http::Step $second = $f->advance($limits);
+
+            $body = readyBody($second, $f);
         }
 
         if ($body != 'abcde' || $f->buffer != 'GET /next') {

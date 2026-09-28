@@ -1,28 +1,29 @@
 /**
  * A complete request in, a response out, the connection back or closed.
+ * The same for a websocket: one whole message in, the hook run, the socket
+ * back to the reactor.
  *
  * A worker never waits on a client that is still sending. Writes still
  * block under the 10 second send timeout.
  */
 
 use std::thread;
+use std::time;
 
 namespace http;
 
 /**
- * One complete request and the connection it came in on.
+ * One complete request and the connection it came in on: the reactor's
+ * whole slot, moved rather than copied. Its Framer holds the request, and
+ * its buffer the bytes past it, the start of the next one when pipelined.
  */
 internal struct Visit
 {
     public int32 $fd;
-    public string $peer;
-    public Request $req;
 
-    // bytes past this request: the start of the next one, when pipelined
-    public string $rest;
-
-    // requests this connection finished before this one
-    public int32 $served;
+    // which reactor the connection goes back to
+    public int32 $home;
+    public Slot $slot;
 }
 
 /**
@@ -36,35 +37,70 @@ internal struct Parked
     public int32 $served;
 }
 
+/**
+ * A connection on its way back to the reactor: a kept HTTP one, or an open
+ * websocket.
+ */
+internal enum Back
+{
+    case kept(Parked $p);
+    case socket(WsConn $ws);
+}
+
 internal enum Job
 {
     case serve(Visit $visit);
 
     // the reactor could not make a request of the bytes: answer, then close
     case fail(int32 $fd, WireError $e);
+
+    // something for an open websocket's worker to do
+    case ws(WsConn $ws, WsEvent $event);
 }
 
 /**
- * What the reactor and every worker share. `#[atomic]` because all of them
- * hold it. `$wake` is written once, before any worker starts.
+ * What the reactors and every worker share. `#[atomic]` because all of them
+ * hold it.
  */
 #[atomic]
 internal class Shared
 {
-    // jobs sent and not yet taken by a worker
-    public atomic<int32> $queued;
-
     // connections open anywhere: idle, being read, or on a worker
     public atomic<int32> $live;
     public atomic<bool> $stopping;
-    public int32 $wake;
 
-    public constructor(int32 $wake)
+    // websockets opened so far, which is where a Socket's id comes from
+    public atomic<int64> $sockets;
+
+    public constructor()
     {
-        $this->queued = atomic<int32>(0);
         $this->live = atomic<int32>(0);
         $this->stopping = atomic<bool>(false);
-        $this->wake = $wake;
+        $this->sockets = atomic<int64>(0);
+    }
+}
+
+/**
+ * Where a worker hands a connection back: one reactor's return channel, and
+ * the pipe that wakes it.
+ */
+internal struct Home
+{
+    public thread::sender<Back> $back;
+    public int32 $wake;
+
+    /**
+     * Sends `$b` home and wakes the reactor. False when that reactor is
+     * gone; `$b` is then dropped with this call.
+     */
+    public function hand(Back $b) : bool
+    {
+        if (!$this->back->send($b)) {
+            return false;
+        }
+
+        http_wake($this->wake);
+        return true;
     }
 }
 
@@ -102,9 +138,14 @@ internal function dispatch(const Router& $router, Request $req) : Response
 
     applyParams($req, $router->routes[$at], $path);
 
-    function<Response(Request)> $handler = $router->routes[$at]->handler;
+    Response $res = $router->routes[$at]->handler($req);
 
-    return $handler($req);
+    // the Socket keeps the request as the handler saw it, params and all
+    if ($res->upgrades()) {
+        $res->origin = $req;
+    }
+
+    return $res;
 }
 
 /**
@@ -112,13 +153,13 @@ internal function dispatch(const Router& $router, Request $req) : Response
  * the client asked, the connection has requests left, and the server is not
  * stopping.
  */
-internal function persistFor(const Visit& $visit, const Limits& $limits, const Shared& $shared) : Persist
+internal function persistFor(const Request& $req, int32 $served, const Limits& $limits, const Shared& $shared) : Persist
 {
-    if (!persistent($visit->req)) {
+    if (!persistent($req)) {
         return .close;
     }
 
-    if ($visit->served + 1 >= $limits->maxRequests) {
+    if ($served + 1 >= $limits->maxRequests) {
         return .close;
     }
 
@@ -126,7 +167,7 @@ internal function persistFor(const Visit& $visit, const Limits& $limits, const S
         return .close;
     }
 
-    if ($visit->req->version == 'HTTP/1.1') {
+    if ($req->version == 'HTTP/1.1') {
         return .keep;
     }
 
@@ -180,13 +221,28 @@ internal function streamTo(Conn $conn, const Response& $res, bool $head, bool $h
     return $w->finish();
 }
 
-internal function serveVisit(Visit $visit, thread::sender<Parked> $back, function<Response(Request)> $app, const Limits& $limits, Shared $shared) : void
+internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<Response(Request)> $app, const Limits& $limits, Shared $shared) : void
 {
     Conn $conn = Conn($visit->fd);
-    Response $res = $app($visit->req);
-    bool $head = methodEq($visit->req->method, Method::head);
-    bool $http11 = $visit->req->version == 'HTTP/1.1';
-    Persist $persist = persistFor($visit, $limits, $shared);
+
+    // the reactor only hands over a slot whose Framer said ready
+    Request $req = guard $visit->slot->framer->request() else {
+        $shared->live->sub(1);
+        return;
+    }
+
+    $req->peer = $visit->slot->peer;
+
+    Response $res = $app($req);
+
+    if ($res->upgrades()) {
+        upgrade($conn, $visit, $req, $res, $homes, $shared);
+        return;
+    }
+
+    bool $head = methodEq($req->method, Method::head);
+    bool $http11 = $req->version == 'HTTP/1.1';
+    Persist $persist = persistFor($req, $visit->slot->served, $limits, $shared);
     bool $whole = false;
 
     if ($res->streamed()) {
@@ -213,28 +269,24 @@ internal function serveVisit(Visit $visit, thread::sender<Parked> $back, functio
     }
 
     int32 $fd = $conn->release();
+    Parked $parked = Parked($fd, $visit->slot->peer, $visit->slot->framer->buffer, $visit->slot->served + 1);
 
-    if (!$back->send(Parked($fd, $visit->peer, $visit->rest, $visit->served + 1))) {
+    if (!$homes[$visit->home]->hand(Back::kept($parked))) {
         http_close($fd);
         $shared->live->sub(1);
-        return;
     }
-
-    http_wake($shared->wake);
 }
 
-internal function workerLoop(thread::receiver<Job> $rx, thread::sender<Parked> $back, function<Response(Request)> $app, Limits $limits, Shared $shared) : void
+internal function workerLoop(JobQueue $jobs, array<Home> $homes, function<Response(Request)> $app, Limits $limits, Shared $shared) : void
 {
     while (true) {
-        Job $job = guard $rx->recv() else {
+        Job $job = guard $jobs->recv() else {
             return;
         }
 
-        $shared->queued->sub(1);
-
         match ($job) {
             Job::serve($visit) => {
-                serveVisit($visit, $back, $app, $limits, $shared);
+                serveVisit($visit, $homes, $app, $limits, $shared);
             },
             Job::fail($fd, $e) => {
                 Conn $conn = Conn($fd);
@@ -242,6 +294,129 @@ internal function workerLoop(thread::receiver<Job> $rx, thread::sender<Parked> $
                 respond($conn, errorResponse($e->status(), $e->body()), true);
                 $shared->live->sub(1);
             },
+            Job::ws($ws, $event) => {
+                serveSocket($ws, $event, $homes, $shared);
+            },
         }
     }
+}
+
+/**
+ * Answers a websocket response: the 101, `onOpen`, and the socket handed to
+ * the reactor. A request that is not a valid upgrade gets its 426 or 400 and
+ * the connection closes, with no hook run.
+ */
+internal function upgrade(Conn $conn, const Visit& $visit, const Request& $asked, const Response& $res, array<Home>& $homes, Shared $shared) : void
+{
+    Request $req = $res->origin ?? $asked;
+    result<string, UpgradeError> $checked = upgradeKey($req);
+
+    string $key = guard $checked else ($e) {
+        respond($conn, refusal($e), !methodEq($req->method, Method::head));
+        $shared->live->sub(1);
+        return;
+    }
+
+    // serveVisit only calls this for a response that upgrades
+    Upgrade $to = guard $res->upgrade;
+    Channel $channel = $to->channel;
+    string $protocol = '';
+
+    // a client must fail a handshake that names a subprotocol it did not offer
+    if (hasToken($req->headers, 'Sec-WebSocket-Protocol', $to->protocol, exact: true)) {
+        $protocol = $to->protocol;
+    }
+
+    if (!$conn->writeAll(renderHead(switching($res, $key, $protocol), Length::none, Persist::upgrade))) {
+        $shared->live->sub(1);
+        return;
+    }
+
+    int32 $fd = $conn->release();
+    Socket $socket = Socket($fd, $req, $protocol, $shared);
+    WsConn $ws = WsConn($fd, $visit->home, $socket, $channel, Reader(true, $visit->slot->framer->buffer), time::instant::now(), false, null);
+
+    $channel->runOpen($socket);
+    park($ws, $homes, $shared);
+}
+
+/**
+ * One thing done for an open websocket, then the socket back to the reactor,
+ * unless it ended.
+ */
+internal function serveSocket(WsConn $ws, WsEvent $event, array<Home>& $homes, Shared $shared) : void
+{
+    Socket $s = $ws->socket;
+
+    match ($event) {
+        WsEvent::message($m) => {
+            // once a close went out, what the client still sends is read and dropped
+            if (!$s->closing()) {
+                $ws->channel->runMessage($s, $m);
+            }
+        },
+        WsEvent::ping($payload) => {
+            $s->frame(OP_PONG, $payload);
+        },
+        WsEvent::keepalive => {
+            $s->frame(OP_PING, '');
+        },
+        WsEvent::close($code, $reason) => {
+            // the answer to the client's close, unless this was the answer to ours
+            $s->shut($code, '');
+            end($ws, Close($code, $reason, true), $shared);
+            return;
+        },
+        WsEvent::fail($code) => {
+            $s->shut($code, '');
+            end($ws, Close($code, '', false), $shared);
+            return;
+        },
+        WsEvent::gone => {
+            end($ws, Close(CLOSE_ABNORMAL, '', false), $shared);
+            return;
+        },
+        WsEvent::goingAway => {
+            goAway($ws, $shared);
+            return;
+        },
+    }
+
+    park($ws, $homes, $shared);
+}
+
+/**
+ * Hands an open socket back to the reactor. A server that is stopping gets
+ * a 1001 instead: the reactor may already have stopped taking sockets back.
+ */
+internal function park(WsConn $ws, array<Home>& $homes, Shared $shared) : void
+{
+    if ($shared->stopping->load()) {
+        goAway($ws, $shared);
+        return;
+    }
+
+    // the failed send dropped its copy; this one still owns the socket
+    if (!$homes[$ws->home]->hand(Back::socket($ws))) {
+        end($ws, Close(CLOSE_ABNORMAL, '', false), $shared);
+    }
+}
+
+/**
+ * Closes a socket because the server is stopping.
+ */
+internal function goAway(WsConn $ws, Shared $shared) : void
+{
+    $ws->socket->shut(CLOSE_GOING_AWAY, 'server stopping');
+    end($ws, Close(CLOSE_GOING_AWAY, '', false), $shared);
+}
+
+/**
+ * The end of a socket: the connection closed, then `onClose`, once.
+ */
+internal function end(WsConn $ws, Close $c, Shared $shared) : void
+{
+    $ws->socket->release();
+    $shared->live->sub(1);
+    $ws->channel->runClose($ws->socket, $c);
 }

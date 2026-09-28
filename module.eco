@@ -6,7 +6,7 @@
  */
 
 #[module: "libhttp"]
-#[version: "0.2.0"]
+#[version: "0.3.0"]
 #[epm::license: "MIT"]
 #[epm::description: "an http/1.1 server for echolang"]
 

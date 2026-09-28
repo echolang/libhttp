@@ -271,6 +271,9 @@ internal enum Persist
     case close;
     case keep;
     case keepAlive(int64 $idleSecs);
+
+    // a 101: the connection stops being HTTP after this head
+    case upgrade;
 }
 
 /**
@@ -383,6 +386,9 @@ internal function renderHead(const Response& $res, const Length& $length, const 
             int64 $idle = $secs;
 
             $out->append("Connection: keep-alive\r\nKeep-Alive: timeout={$idle}\r\n");
+        },
+        Persist::upgrade => {
+            $out->append('Connection: Upgrade\r\n');
         },
     }
 

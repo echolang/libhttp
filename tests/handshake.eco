@@ -1,0 +1,150 @@
+/**
+ * The websocket opening handshake. No network.
+ */
+
+internal const string SAMPLE_KEY = 'dGhlIHNhbXBsZSBub25jZQ==';
+
+/**
+ * A GET upgrade to `/chat`, with `$extra` header lines (each ending CRLF)
+ * after the usual ones.
+ */
+internal function upgradeRequest(const string& $extra) : http::Request
+{
+    string $raw = 'GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n';
+
+    $raw->append($extra);
+    $raw->append('\r\n');
+    return mustParse($raw);
+}
+
+/**
+ * A whole websocket upgrade to `$path` as sent: the sample key, version
+ * `$version`, and `$extra` header lines (each ending CRLF).
+ */
+internal function handshakeText(const string& $path, const string& $version, const string& $extra) : string
+{
+    string $raw = "GET {$path} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ";
+
+    $raw->append(SAMPLE_KEY);
+    $raw->append('\r\nSec-WebSocket-Version: ');
+    $raw->append($version);
+    $raw->append('\r\n');
+    $raw->append($extra);
+    $raw->append('\r\n');
+    return $raw;
+}
+
+internal function valid(const string& $extra) : http::Request
+{
+    return mustParse(handshakeText('/chat', '13', $extra));
+}
+
+internal function refusedWith(const http::Request& $req) : int32
+{
+    result<string, http::UpgradeError> $r = http::upgradeKey($req);
+
+    if (!$r->failed()) {
+        return 101;
+    }
+
+    return http::refusal($r->failure())->status;
+}
+
+#[group: "unit"]
+test a_valid_upgrade_answers_its_key {
+    http::Request $req = valid('');
+
+    assert(http::upgradeKey($req)->unwrap() == SAMPLE_KEY, 'the key');
+    assert(http::acceptKey(SAMPLE_KEY) == 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=', 'and its accept value');
+    assert($req->websocket(), 'Request::websocket agrees');
+}
+
+#[group: "unit"]
+test token_lists_and_case {
+    string $raw = 'GET /chat HTTP/1.1\r\nHost: x\r\nupgrade: WebSocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: ';
+
+    $raw->append(SAMPLE_KEY);
+    $raw->append('\r\nSec-WebSocket-Version: 13\r\n\r\n');
+    assert(mustParse($raw)->websocket(), 'Firefox sends keep-alive, Upgrade');
+}
+
+#[group: "unit"]
+test refusals {
+    assert(refusedWith(mustParse('GET /chat HTTP/1.1\r\nHost: x\r\n\r\n')) == 426, 'a plain GET is 426');
+    assert(refusedWith(upgradeRequest('Sec-WebSocket-Version: 13\r\n')) == 400, 'no key');
+    assert(refusedWith(upgradeRequest('Sec-WebSocket-Key: short==\r\nSec-WebSocket-Version: 13\r\n')) == 400, 'a key of the wrong shape');
+
+    string $two = 'Sec-WebSocket-Key: ';
+
+    $two->append(SAMPLE_KEY);
+    $two->append('\r\nSec-WebSocket-Key: ');
+    $two->append(SAMPLE_KEY);
+    $two->append('\r\nSec-WebSocket-Version: 13\r\n');
+    assert(refusedWith(upgradeRequest($two)) == 400, 'two keys');
+
+    assert(refusedWith(mustParse(handshakeText('/chat', '8', ''))) == 426, 'an old version is 426');
+
+    string $noConn = 'GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nSec-WebSocket-Key: ';
+
+    $noConn->append(SAMPLE_KEY);
+    $noConn->append('\r\nSec-WebSocket-Version: 13\r\n\r\n');
+    assert(refusedWith(mustParse($noConn)) == 400, 'no Connection: upgrade');
+
+    string $post = 'POST /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ';
+
+    $post->append(SAMPLE_KEY);
+    $post->append('\r\nSec-WebSocket-Version: 13\r\n\r\n');
+    assert(refusedWith(mustParse($post)) == 400, 'POST');
+
+    string $old = 'GET /chat HTTP/1.0\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ';
+
+    $old->append(SAMPLE_KEY);
+    $old->append('\r\nSec-WebSocket-Version: 13\r\n\r\n');
+    assert(refusedWith(mustParse($old)) == 400, 'HTTP/1.0');
+}
+
+#[group: "unit"]
+test version_refusal_names_13 {
+    http::Response $r = http::refusal(http::upgradeKey(mustParse(handshakeText('/chat', '8', '')))->failure());
+
+    assert(($r->headers->get('Sec-WebSocket-Version') ?? '') == '13', 'the version to retry with');
+    assert(($r->headers->get('Upgrade') ?? '') == 'websocket', 'and what to upgrade to');
+}
+
+#[group: "unit"]
+test the_101_is_the_servers {
+    http::Channel $c = http::Channel();
+    http::Response $res = http::Response(websocket: $c);
+
+    $res->header('Set-Cookie', 'seen=1');
+    $res->header('Upgrade', 'h2c');
+    $res->header('Sec-WebSocket-Accept', 'forged');
+
+    http::Response $out = http::switching($res, SAMPLE_KEY, '');
+    string $head = http::renderHead($out, http::Length::none, http::Persist::upgrade);
+
+    assert($head->starts('HTTP/1.1 101 Switching Protocols\r\n'), 'the status line');
+    assert($head->contains('Upgrade: websocket\r\n'), 'the upgrade');
+    assert($head->contains('Connection: Upgrade\r\n'), 'the connection');
+    assert($head->contains('Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n'), 'the accept key');
+    assert($head->contains('Set-Cookie: seen=1\r\n'), 'a handler header goes along');
+    assert(!$head->contains('h2c') && !$head->contains('forged'), 'the handshake ones are replaced');
+    assert(!$head->contains('Content-Length'), 'a 101 has no length');
+    assert(!$head->contains('Sec-WebSocket-Protocol'), 'no protocol was picked');
+}
+
+#[group: "unit"]
+test protocol_only_when_offered {
+    http::Channel $c = http::Channel();
+    http::Response $res = http::Response(websocket: $c, protocol: 'chat.v2');
+    http::Request $both = valid('Sec-WebSocket-Protocol: chat.v1, chat.v2\r\n');
+    http::Request $one = valid('Sec-WebSocket-Protocol: chat.v1\r\n');
+    http::Response $out = http::switching($res, SAMPLE_KEY, 'chat.v2');
+
+    assert(http::hasToken($both->headers, 'Sec-WebSocket-Protocol', 'chat.v2', exact: true), 'offered');
+    assert(!http::hasToken($one->headers, 'Sec-WebSocket-Protocol', 'chat.v2', exact: true), 'not offered');
+    assert(!http::hasToken($both->headers, 'Sec-WebSocket-Protocol', 'Chat.V2', exact: true), 'names compare exactly');
+    assert(($out->headers->get('Sec-WebSocket-Protocol') ?? '') == 'chat.v2', 'the agreed one goes out');
+    assert($res->upgrades(), 'a websocket response upgrades');
+    assert(!http::Response(text: 'hi')->upgrades(), 'a text one does not');
+}
