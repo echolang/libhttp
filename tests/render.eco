@@ -1,0 +1,226 @@
+/**
+ * Response bytes.
+ */
+
+#[group: "unit"]
+test labelled_constructors {
+    http::Response $ok = http::Response(ok: 'hi');
+    http::Response $text = http::Response(text: 'hi');
+    http::Response $json = http::Response(json: '{}');
+    http::Response $html = http::Response(html: '<p>');
+
+    assert($ok->status == 200, 'ok');
+    assert(($text->headers->get('Content-Type') ?? '') == 'text/plain; charset=utf-8', 'text');
+    assert(($json->headers->get('Content-Type') ?? '') == 'application/json', 'json');
+    assert(($html->headers->get('Content-Type') ?? '') == 'text/html; charset=utf-8', 'html');
+    assert(http::Response::notFound()->status == 404, 'not found');
+    assert(http::Response::noContent()->status == 204, 'no content');
+}
+
+#[group: "unit"]
+test render_writes_length_and_close {
+    http::Response $r = http::Response(text: 'hello');
+    string $bytes = http::render($r, true);
+
+    assert($bytes->starts('HTTP/1.1 200 OK'), 'status line');
+    assert($bytes->contains('Content-Length: 5'), 'length of hello');
+    assert($bytes->contains('Connection: close'), 'close');
+    assert($bytes->contains("\r\n\r\nhello"), 'body after the blank line');
+}
+
+#[group: "unit"]
+test head_strips_body_keeps_length {
+    http::Response $r = http::Response(text: 'hello');
+    string $bytes = http::render($r, false);
+
+    assert($bytes->contains('Content-Length: 5'), 'length stays');
+    assert(!$bytes->contains("\r\n\r\nhello"), 'body is not on the wire');
+}
+
+#[group: "unit"]
+test interpolating_a_response {
+    http::Response $r = http::Response(200, 'abc');
+
+    assert("{$r}" == '200 (3 bytes)', 'short form');
+}
+
+#[group: "unit"]
+test render_skips_crlf_headers {
+    http::Response $r = http::Response(text: 'hello');
+
+    $r->header('X-Name', "a\r\nLocation: evil");
+
+    string $bytes = http::render($r, true);
+
+    assert(!$bytes->contains('Location: evil'), 'no injected header');
+    assert(!$bytes->contains("a\r\n"), 'CRLF not on the wire');
+    assert($bytes->contains('Content-Length: 5'), 'length still written');
+    assert($bytes->contains("\r\n\r\nhello"), 'body intact');
+}
+
+#[group: "unit"]
+test serializer_owns_content_length {
+    http::Response $r = http::Response(ok: 'hello');
+
+    $r->header('Content-Length', '999');
+
+    string $bytes = http::render($r, true);
+
+    assert(!$bytes->contains('999'), 'handler length dropped');
+    assert($bytes->contains('Content-Length: 5'), 'real length written');
+}
+
+#[group: "unit"]
+test serializer_owns_connection {
+    http::Response $r = http::Response(ok: 'hello');
+
+    $r->header('Connection', 'keep-alive');
+
+    string $bytes = http::render($r, true);
+
+    assert(!$bytes->contains('keep-alive'), 'no keep-alive promise');
+    assert($bytes->contains('Connection: close'), 'close is written');
+}
+
+#[group: "unit"]
+test no_content_has_no_length {
+    string $bytes = http::render(http::Response::noContent(), true);
+
+    assert($bytes->starts('HTTP/1.1 204 No Content'), 'status line');
+    assert(!$bytes->contains('Content-Length'), 'no length on 204');
+}
+
+#[group: "unit"]
+test not_modified_drops_the_body {
+    http::Response $r = http::Response(304, 'stale');
+    string $bytes = http::render($r, true);
+
+    assert(!$bytes->contains('Content-Length'), 'no length on 304');
+    assert(!$bytes->contains('stale'), 'no body on 304');
+}
+
+#[group: "unit"]
+test redirect_has_a_reason {
+    http::Response $r = http::Response(302, '');
+
+    $r->header('Location', '/elsewhere');
+
+    string $bytes = http::render($r, true);
+
+    assert($bytes->starts('HTTP/1.1 302 Found'), 'reason phrase');
+    assert($bytes->contains('Location: /elsewhere'), 'location');
+}
+
+#[group: "unit"]
+test render_skips_bad_header_names {
+    http::Response $r = http::Response(ok: 'x');
+
+    $r->header('X-A: b', 'c');
+    $r->header('', 'empty');
+
+    string $bytes = http::render($r, true);
+
+    assert(!$bytes->contains('X-A: b'), 'colon in a name');
+    assert(!$bytes->contains(': empty'), 'empty name');
+}
+
+#[group: "unit"]
+test http_date_formats {
+    assert(http::httpDate(0) == 'Thu, 01 Jan 1970 00:00:00 GMT', 'epoch');
+    assert(http::httpDate(784111777) == 'Sun, 06 Nov 1994 08:49:37 GMT', 'the RFC example');
+    assert(http::httpDate(951782400) == 'Tue, 29 Feb 2000 00:00:00 GMT', 'leap day');
+    assert(http::httpDate(-1) == 'Wed, 31 Dec 1969 23:59:59 GMT', 'before 1970 floors');
+}
+
+#[group: "unit"]
+test render_writes_a_date {
+    string $bytes = http::render(http::Response(ok: 'x'), true);
+
+    assert($bytes->contains('\r\nDate: '), 'date header');
+    assert($bytes->contains(' GMT\r\n'), 'in GMT');
+}
+
+#[group: "unit"]
+test handler_date_is_kept_once {
+    http::Response $r = http::Response(ok: 'x');
+
+    $r->header('Date', 'Sun, 06 Nov 1994 08:49:37 GMT');
+
+    string $bytes = http::render($r, true);
+    usize $first = $bytes->find('Date: ');
+
+    assert($bytes->contains('Date: Sun, 06 Nov 1994 08:49:37 GMT'), 'handler date');
+    assert($bytes->find('Date: ', $first + 1) >= $bytes->size(), 'only one Date');
+}
+
+#[group: "unit"]
+test expectation_failed_has_a_reason {
+    http::Response $r = http::Response(417, '');
+    string $bytes = http::render($r, true);
+
+    assert($bytes->starts('HTTP/1.1 417 Expectation Failed'), 'reason phrase');
+}
+
+#[group: "unit"]
+test kept_response_has_no_connection_header {
+    string $bytes = http::render(http::Response(text: 'hi'), true, http::Persist::keep);
+
+    assert(!$bytes->contains('Connection:'), 'HTTP/1.1 is kept by default');
+    assert($bytes->contains('Content-Length: 2'), 'length');
+    assert($bytes->ends("\r\n\r\nhi"), 'body');
+}
+
+#[group: "unit"]
+test http10_keep_alive_is_spelled_out {
+    string $bytes = http::render(http::Response(text: 'hi'), true, http::Persist::keepAlive(5));
+
+    assert($bytes->contains('Connection: keep-alive\r\n'), 'the yes');
+    assert($bytes->contains('Keep-Alive: timeout=5\r\n'), 'for how long');
+}
+
+#[group: "unit"]
+test serializer_owns_keep_alive {
+    http::Response $r = http::Response(ok: 'x');
+
+    $r->header('Keep-Alive', 'timeout=999');
+    $r->header('Transfer-Encoding', 'chunked');
+
+    string $bytes = http::render($r, true, http::Persist::keep);
+
+    assert(!$bytes->contains('999'), 'handler Keep-Alive dropped');
+    assert(!$bytes->contains('Transfer-Encoding'), 'handler Transfer-Encoding dropped');
+}
+
+#[group: "unit"]
+test chunked_head_has_no_length {
+    http::Response $r = http::Response(stream: function(http::Writer $w) : void {
+    });
+    string $bytes = http::renderHead($r, http::Length::chunked, http::Persist::keep);
+
+    assert($bytes->contains('Transfer-Encoding: chunked\r\n'), 'chunked');
+    assert(!$bytes->contains('Content-Length'), 'no length');
+    assert($bytes->ends('\r\n\r\n'), 'head only');
+}
+
+#[group: "unit"]
+test streamed_response_describes_itself {
+    http::Response $open = http::Response(stream: function(http::Writer $w) : void {
+    });
+    http::Response $sized = http::Response(stream: function(http::Writer $w) : void {
+    }, length: 12);
+
+    assert($open->streamed(), 'streamed');
+    assert(!http::Response(ok: 'x')->streamed(), 'a string body is not');
+    assert("{$open}" == '200 (streamed)', 'unsized');
+    assert("{$sized}" == '200 (12 bytes, streamed)', 'sized');
+}
+
+#[group: "unit"]
+test mime_types_by_extension {
+    assert(http::mimeOf('/a/index.HTML') == 'text/html; charset=utf-8', 'html, any case');
+    assert(http::mimeOf('app.js') == 'text/javascript; charset=utf-8', 'js');
+    assert(http::mimeOf('logo.svg') == 'image/svg+xml', 'svg');
+    assert(http::mimeOf('README.md') == 'text/markdown; charset=utf-8', 'markdown');
+    assert(http::mimeOf('archive.tar.gz') == 'application/octet-stream', 'unknown');
+    assert(http::mimeOf('dir.d/README') == 'application/octet-stream', 'a dot in a directory is not an extension');
+}

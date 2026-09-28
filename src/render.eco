@@ -1,0 +1,391 @@
+/**
+ * A Response as HTTP/1.1 bytes.
+ *
+ * The serializer owns the framing. A handler's Content-Length,
+ * Connection, Keep-Alive or Transfer-Encoding is dropped. 1xx, 204 and
+ * 304 carry no body. HEAD keeps the length and drops the body.
+ */
+
+use std::time;
+
+namespace http;
+
+internal function reason(int32 $status) : string
+{
+    if ($status == 100) {
+        return 'Continue';
+    }
+
+    if ($status == 101) {
+        return 'Switching Protocols';
+    }
+
+    if ($status == 200) {
+        return 'OK';
+    }
+
+    if ($status == 201) {
+        return 'Created';
+    }
+
+    if ($status == 202) {
+        return 'Accepted';
+    }
+
+    if ($status == 204) {
+        return 'No Content';
+    }
+
+    if ($status == 206) {
+        return 'Partial Content';
+    }
+
+    if ($status == 301) {
+        return 'Moved Permanently';
+    }
+
+    if ($status == 302) {
+        return 'Found';
+    }
+
+    if ($status == 303) {
+        return 'See Other';
+    }
+
+    if ($status == 304) {
+        return 'Not Modified';
+    }
+
+    if ($status == 307) {
+        return 'Temporary Redirect';
+    }
+
+    if ($status == 308) {
+        return 'Permanent Redirect';
+    }
+
+    if ($status == 400) {
+        return 'Bad Request';
+    }
+
+    if ($status == 401) {
+        return 'Unauthorized';
+    }
+
+    if ($status == 403) {
+        return 'Forbidden';
+    }
+
+    if ($status == 404) {
+        return 'Not Found';
+    }
+
+    if ($status == 405) {
+        return 'Method Not Allowed';
+    }
+
+    if ($status == 406) {
+        return 'Not Acceptable';
+    }
+
+    if ($status == 408) {
+        return 'Request Timeout';
+    }
+
+    if ($status == 409) {
+        return 'Conflict';
+    }
+
+    if ($status == 410) {
+        return 'Gone';
+    }
+
+    if ($status == 411) {
+        return 'Length Required';
+    }
+
+    if ($status == 412) {
+        return 'Precondition Failed';
+    }
+
+    if ($status == 413) {
+        return 'Payload Too Large';
+    }
+
+    if ($status == 415) {
+        return 'Unsupported Media Type';
+    }
+
+    if ($status == 417) {
+        return 'Expectation Failed';
+    }
+
+    if ($status == 422) {
+        return 'Unprocessable Content';
+    }
+
+    if ($status == 429) {
+        return 'Too Many Requests';
+    }
+
+    if ($status == 500) {
+        return 'Internal Server Error';
+    }
+
+    if ($status == 501) {
+        return 'Not Implemented';
+    }
+
+    if ($status == 502) {
+        return 'Bad Gateway';
+    }
+
+    if ($status == 503) {
+        return 'Service Unavailable';
+    }
+
+    if ($status == 504) {
+        return 'Gateway Timeout';
+    }
+
+    if ($status == 505) {
+        return 'HTTP Version Not Supported';
+    }
+
+    return 'Unknown';
+}
+
+/**
+ * 1xx, 204 and 304: the statuses that never carry a body, and never a
+ * Content-Length of one.
+ */
+internal function bodyless(int32 $status) : bool
+{
+    return $status < 200 || $status == 204 || $status == 304;
+}
+
+internal function pad(int64 $v, usize $width) : string
+{
+    return str::lpad("{$v}", $width, CH_ZERO);
+}
+
+/**
+ * Seconds since 1970 as an IMF-fixdate, `Sun, 06 Nov 1994 08:49:37 GMT`, the
+ * one form RFC 9110 lets a sender write. Days to a civil date is Howard
+ * Hinnant's `civil_from_days`, since std::time stops at the Unix number.
+ */
+internal function httpDate(int64 $unixSecs) : string
+{
+    array<string> $dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    array<string> $monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+    int64 $days = $unixSecs / 86400;
+    int64 $sod = $unixSecs % 86400;
+
+    // floor, not truncation: a time before 1970 is the previous day
+    if ($sod < 0) {
+        $sod = $sod + 86400;
+        $days = $days - 1;
+    }
+
+    // 1970-01-01 was a Thursday
+    int64 $wday = ($days + 4) % 7;
+
+    if ($wday < 0) {
+        $wday = $wday + 7;
+    }
+
+    int64 $z = $days + 719468;
+    int64 $era = $z / 146097;
+
+    if ($z < 0) {
+        $era = ($z - 146096) / 146097;
+    }
+
+    int64 $doe = $z - $era * 146097;
+    int64 $yoe = ($doe - $doe / 1460 + $doe / 36524 - $doe / 146096) / 365;
+    int64 $doy = $doe - (365 * $yoe + $yoe / 4 - $yoe / 100);
+    int64 $mp = (5 * $doy + 2) / 153;
+    int64 $day = $doy - (153 * $mp + 2) / 5 + 1;
+    int64 $month = $mp + 3;
+
+    if ($mp >= 10) {
+        $month = $mp - 9;
+    }
+
+    int64 $year = $yoe + $era * 400;
+
+    if ($month <= 2) {
+        $year = $year + 1;
+    }
+
+    string $wd = $dayNames[$wday as usize];
+    string $mon = $monthNames[($month - 1) as usize];
+    string $dd = pad($day, 2);
+    string $yyyy = pad($year, 4);
+    string $hh = pad($sod / 3600, 2);
+    string $mi = pad(($sod / 60) % 60, 2);
+    string $ss = pad($sod % 60, 2);
+
+    return "{$wd}, {$dd} {$mon} {$yyyy} {$hh}:{$mi}:{$ss} GMT";
+}
+
+internal function headerSafe(const string& $s) : bool
+{
+    usize $n = $s->size();
+    usize $i = 0;
+
+    while ($i < $n) {
+        uint8 $b = $s->byte($i);
+
+        if ($b == CH_NUL || $b == CH_CR || $b == CH_LF) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    return true;
+}
+
+/**
+ * A name that cannot turn into a different header on the wire: non-empty,
+ * no colon, and `headerSafe`.
+ */
+internal function nameSafe(const string& $s) : bool
+{
+    if ($s->empty() || $s->find(':') < $s->size()) {
+        return false;
+    }
+
+    return headerSafe($s);
+}
+
+/**
+ * What the response says about the connection after it. `keep` is HTTP/1.1,
+ * where staying open is the default and needs no header. `keepAlive` is an
+ * HTTP/1.0 client that asked, which has to be told yes, and for how long.
+ */
+internal enum Persist
+{
+    case close;
+    case keep;
+    case keepAlive(int64 $idleSecs);
+}
+
+/**
+ * The header names only the serializer writes.
+ */
+internal function framingHeader(const string& $name) : bool
+{
+    string $len = 'Content-Length';
+    string $conn = 'Connection';
+    string $alive = 'Keep-Alive';
+    string $te = 'Transfer-Encoding';
+
+    return str::iequals($name->view(), $len->view())
+        || str::iequals($name->view(), $conn->view())
+        || str::iequals($name->view(), $alive->view())
+        || str::iequals($name->view(), $te->view());
+}
+
+internal function render(const Response& $res, bool $sendBody) : string
+{
+    return render($res, $sendBody, Persist::close);
+}
+
+/**
+ * How the head says the body ends. `exact` is Content-Length, `chunked`
+ * is Transfer-Encoding, `none` is neither.
+ */
+internal enum Length
+{
+    case exact(usize $n);
+    case chunked;
+    case none;
+}
+
+internal function render(const Response& $res, bool $sendBody, const Persist& $persist) : string
+{
+    string $out = renderHead($res, Length::exact($res->body->size()), $persist);
+
+    if ($sendBody && !bodyless($res->status)) {
+        $out->append($res->body);
+    }
+
+    return $out;
+}
+
+/**
+ * The status line and headers, through the blank line.
+ */
+internal function renderHead(const Response& $res, const Length& $length, const Persist& $persist) : string
+{
+    string $out = '';
+    string $phrase = reason($res->status);
+
+    $out->append("HTTP/1.1 {$res->status} {$phrase}\r\n");
+
+    string $dateName = 'Date';
+    bool $hasDate = false;
+    usize $count = $res->headers->items->count();
+    usize $i = 0;
+
+    while ($i < $count) {
+        Header $h = $res->headers->items[$i];
+
+        $i = $i + 1;
+
+        if (!nameSafe($h->name) || !headerSafe($h->value)) {
+            continue;
+        }
+
+        // framing is the serializer's, never the handler's
+        if (framingHeader($h->name)) {
+            continue;
+        }
+
+        if (str::iequals($h->name->view(), $dateName->view())) {
+            $hasDate = true;
+        }
+
+        $out->append("{$h->name}: {$h->value}\r\n");
+    }
+
+    if (!$hasDate) {
+        string $now = httpDate(time::timestamp::now()->unix_secs());
+
+        $out->append("Date: {$now}\r\n");
+    }
+
+    if (!bodyless($res->status)) {
+        match ($length) {
+            Length::exact($n) => {
+                usize $len = $n;
+
+                $out->append("Content-Length: {$len}\r\n");
+            },
+            Length::chunked => {
+                $out->append('Transfer-Encoding: chunked\r\n');
+            },
+            Length::none => {
+            },
+        }
+    }
+
+    match ($persist) {
+        Persist::close => {
+            $out->append('Connection: close\r\n');
+        },
+        Persist::keep => {
+        },
+        Persist::keepAlive($secs) => {
+            int64 $idle = $secs;
+
+            $out->append("Connection: keep-alive\r\nKeep-Alive: timeout={$idle}\r\n");
+        },
+    }
+
+    $out->append('\r\n');
+    return $out;
+}

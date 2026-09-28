@@ -1,0 +1,32 @@
+/**
+ * Query string decoding.
+ */
+
+#[group: "unit"]
+test unescape_percent_and_plus {
+    assert(http::unescape('a%20b') == 'a b', 'percent');
+    assert(http::unescape('a+b') == 'a b', 'plus');
+    assert(http::unescape('%zz') == '%zz', 'bad percent is kept');
+}
+
+#[group: "unit"]
+test path_unescape_keeps_plus {
+    assert(http::unescape(path: 'a%20b') == 'a b', 'percent');
+    assert(http::unescape(path: 'a+b') == 'a+b', 'plus is a plus in a path');
+}
+
+#[group: "unit"]
+test parse_query_repeats {
+    http::Query $q = http::parseQuery('a=1&a=2&b=');
+
+    assert($q->count() == 3, 'three pairs');
+    assert(($q->get('a') ?? '') == '1', 'first a');
+    assert(($q->get('b') ?? '') == '', 'empty value');
+}
+
+#[group: "unit"]
+test parse_query_without_equals {
+    http::Query $q = http::parseQuery('flag');
+
+    assert(($q->get('flag') ?? 'missing') == '', 'bare name, empty value');
+}

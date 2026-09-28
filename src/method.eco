@@ -1,0 +1,122 @@
+/**
+ * The request method: a closed set plus a leftover.
+ *
+ * Named cases are the verbs `get` / `post` / ... register. Anything
+ * else is `.other('COPY')`.
+ */
+
+namespace http;
+
+public enum Method
+{
+    case get;
+    case post;
+    case put;
+    case patch;
+    case delete;
+    case head;
+    case options;
+    case other(string $name);
+}
+
+internal function methodName(Method $method) : string
+{
+    return match ($method) {
+        Method::get => 'GET',
+        Method::post => 'POST',
+        Method::put => 'PUT',
+        Method::patch => 'PATCH',
+        Method::delete => 'DELETE',
+        Method::head => 'HEAD',
+        Method::options => 'OPTIONS',
+        Method::other($name) => $name,
+    };
+}
+
+internal function methodOf(const string& $raw) : Method
+{
+    if ($raw == 'GET') {
+        return .get;
+    }
+
+    if ($raw == 'POST') {
+        return .post;
+    }
+
+    if ($raw == 'PUT') {
+        return .put;
+    }
+
+    if ($raw == 'PATCH') {
+        return .patch;
+    }
+
+    if ($raw == 'DELETE') {
+        return .delete;
+    }
+
+    if ($raw == 'HEAD') {
+        return .head;
+    }
+
+    if ($raw == 'OPTIONS') {
+        return .options;
+    }
+
+    return .other($raw);
+}
+
+internal const int32 VERB_OTHER = 0;
+internal const int32 VERB_GET = 1;
+internal const int32 VERB_HEAD = 6;
+
+/**
+ * A named case as a small number, `.other` as 0. Lets `methodEq` compare two
+ * named verbs without spelling either one, and the router compare verbs as
+ * integers.
+ */
+internal function methodCode(const Method& $method) : int32
+{
+    return match ($method) {
+        Method::get => VERB_GET,
+        Method::post => 2,
+        Method::put => 3,
+        Method::patch => 4,
+        Method::delete => 5,
+        Method::head => VERB_HEAD,
+        Method::options => 7,
+        else => VERB_OTHER,
+    };
+}
+
+/**
+ * The code of the verb this method spells. `.other('GET')` is `VERB_GET`,
+ * the same as `.get`; only a verb this library does not name is
+ * `VERB_OTHER`.
+ */
+internal function verbCode(const Method& $method) : int32
+{
+    int32 $code = methodCode($method);
+
+    if ($code != VERB_OTHER) {
+        return $code;
+    }
+
+    return methodCode(methodOf(methodName($method)));
+}
+
+/**
+ * Same verb. Two named cases compare by case; the spelling is only built when
+ * an `.other` is involved, so `.other('GET')` still equals `.get`.
+ */
+internal function methodEq(const Method& $a, const Method& $b) : bool
+{
+    int32 $left = methodCode($a);
+    int32 $right = methodCode($b);
+
+    if ($left != 0 && $right != 0) {
+        return $left == $right;
+    }
+
+    return methodName($a) == methodName($b);
+}

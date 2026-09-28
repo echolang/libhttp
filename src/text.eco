@@ -1,0 +1,47 @@
+/**
+ * Named ASCII bytes the rest of the module compares against.
+ *
+ * A mistyped `34` is a name the compiler can refuse.
+ */
+
+namespace http;
+
+internal const uint8 CH_NUL = 0;
+internal const uint8 CH_TAB = 9;
+internal const uint8 CH_LF = 10;
+internal const uint8 CH_CR = 13;
+internal const uint8 CH_SPACE = 32;
+internal const uint8 CH_PERCENT = 37;
+internal const uint8 CH_STAR = 42;
+internal const uint8 CH_PLUS = 43;
+internal const uint8 CH_DASH = 45;
+internal const uint8 CH_DOT = 46;
+internal const uint8 CH_SLASH = 47;
+internal const uint8 CH_ZERO = 48;
+internal const uint8 CH_SEVEN = 55;
+internal const uint8 CH_NINE = 57;
+internal const uint8 CH_COLON = 58;
+internal const uint8 CH_SEMI = 59;
+internal const uint8 CH_QUESTION = 63;
+internal const uint8 CH_UPPER_A = 65;
+internal const uint8 CH_UPPER_F = 70;
+internal const uint8 CH_UPPER_Z = 90;
+internal const uint8 CH_LOWER_A = 97;
+internal const uint8 CH_LOWER_F = 102;
+internal const uint8 CH_LOWER_I = 105;
+internal const uint8 CH_LOWER_L = 108;
+internal const uint8 CH_LOWER_O = 111;
+internal const uint8 CH_LOWER_U = 117;
+internal const uint8 CH_LOWER_Z = 122;
+internal const uint8 CH_LCURLY = 123;
+internal const uint8 CH_PIPE = 124;
+internal const uint8 CH_RCURLY = 125;
+
+internal const usize HEADER_CAP = 8192;
+internal const usize DEFAULT_BODY_CAP = 1048576;
+internal const int64 HEADER_TIMEOUT_SECS = 10;
+internal const int64 BODY_TIMEOUT_SECS = 60;
+internal const int64 IDLE_TIMEOUT_SECS = 5;
+internal const int32 DEFAULT_QUEUE_CAP = 256;
+internal const int32 DEFAULT_MAX_REQUESTS = 100;
+internal const int32 DEFAULT_MAX_CONNECTIONS = 1024;

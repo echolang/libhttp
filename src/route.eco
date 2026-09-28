@@ -1,0 +1,813 @@
+/**
+ * One registered path, and the matching that fills its params.
+ *
+ * First match wins. A pattern segment is a literal or a param:
+ * `{name}` is one whole, non-empty segment, `{name?}` is one or none,
+ * `{name*}` is every segment left, and `{name:kind}` is one that passes a
+ * check (`number`, `alpha`, `alphanum`, `uuid`, `ulid`, or `a|b|c`). `?`
+ * and `*` only go last. Split on `/` first, then percent-decode, so `%2F`
+ * stays inside its segment. HEAD with no HEAD route falls back to GET.
+ *
+ * A pattern is compiled once, at registration. `Router` is the table the
+ * workers read: routes bucketed by how many segments they take, so a
+ * request only looks at routes it could match, in registration order.
+ */
+
+namespace http;
+
+internal const uint8 CLASS_DIGIT = 1;
+internal const uint8 CLASS_ALPHA = 2;
+internal const uint8 CLASS_HEX = 4;
+internal const uint8 CLASS_CROCKFORD = 8;
+
+internal const usize UUID_SIZE = 36;
+internal const usize ULID_SIZE = 26;
+
+internal enum Kind
+{
+    case literal;
+    case one;
+    case optional;
+    case rest;
+}
+
+internal enum Check
+{
+    case any;
+    case number;
+    case alpha;
+    case alphanum;
+    case uuid;
+    case ulid;
+    case oneOf;
+}
+
+/**
+ * Why a pattern was refused. The name is the param's, as written.
+ */
+internal enum PatternError
+{
+    case misplaced(string $name);
+    case emptyName;
+    case duplicate(string $name);
+    case unknownKind(string $kind);
+    case checkedRest(string $name);
+    case emptyChoice(string $name);
+}
+
+/**
+ * One compiled pattern segment. `$text` is the literal, or the param's
+ * name. `$choices` is only filled for `.oneOf`.
+ */
+internal struct Part
+{
+    internal Kind $kind;
+    internal string $text;
+    internal Check $check;
+    internal array<string> $choices;
+}
+// the fields are public only because echoc 0.4.1 checks the element copy
+// behind `array<Route>` from inside the stdlib, where an internal field is
+// out of reach. the struct itself is still internal
+internal struct Route
+{
+    public Method $method;
+    public int32 $verb;
+    public string $pattern;
+    public array<Part> $parts;
+    public usize $fixed;
+    public bool $optional;
+    public bool $rest;
+    public bool $captures;
+    public function<Response(Request)> $handler;
+
+    /**
+     * Compiles `$pattern`. A pattern that cannot mean anything stops the
+     * program here, at registration, rather than failing to match later.
+     */
+    public constructor(Method $method, const string& $pattern, function<Response(Request)> $handler)
+    {
+        array<Part> $parts = guard parsePattern($pattern) else ($e) {
+            string $why = patternReason($e);
+
+            die("http: route '{$pattern}': {$why}");
+        }
+
+        usize $n = $parts->count();
+        usize $fixed = $n;
+        bool $optional = false;
+        bool $rest = false;
+        bool $captures = false;
+        usize $i = 0;
+
+        while ($i < $n) {
+            if ($parts[$i]->kind != Kind::literal) {
+                $captures = true;
+            }
+
+            $i = $i + 1;
+        }
+
+        if ($n > 0 && $parts[$n - 1]->kind == Kind::optional) {
+            $optional = true;
+            $fixed = $n - 1;
+        }
+
+        if ($n > 0 && $parts[$n - 1]->kind == Kind::rest) {
+            $rest = true;
+            $fixed = $n - 1;
+        }
+
+        $this->method = $method;
+        $this->verb = verbCode($method);
+        $this->pattern = $pattern;
+        $this->parts = $parts;
+        $this->fixed = $fixed;
+        $this->optional = $optional;
+        $this->rest = $rest;
+        $this->captures = $captures;
+        $this->handler = $handler;
+    }
+}
+
+/**
+ * The route table as the workers read it, built once at `listen`.
+ *
+ * `$byCount[n]` lists the routes that take exactly `n` segments, and a
+ * `{name?}` route sits in two of them. `$open` lists the `{name*}` routes,
+ * which take any count from their prefix up. Both lists ascend, so walking
+ * them together in index order is registration order.
+ */
+internal struct Router
+{
+    internal array<Route> $routes;
+    internal array<array<usize>> $byCount;
+    internal array<usize> $open;
+    internal fixed_array<uint8, 256> $cls;
+
+    internal constructor(mv array<Route> $routes)
+    {
+        $this->routes = mv $routes;
+        $this->byCount = array<array<usize>>();
+        $this->open = array<usize>();
+        $this->cls = byteClasses();
+
+        usize $n = $this->routes->count();
+        usize $i = 0;
+
+        while ($i < $n) {
+            if ($this->routes[$i]->rest) {
+                $this->open[] = $i;
+                $i = $i + 1;
+                continue;
+            }
+
+            $this->bucket($this->routes[$i]->fixed, $i);
+
+            if ($this->routes[$i]->optional) {
+                $this->bucket($this->routes[$i]->fixed + 1, $i);
+            }
+
+            $i = $i + 1;
+        }
+    }
+
+    private function bucket(usize $count, usize $at) : void
+    {
+        while ($this->byCount->count() <= $count) {
+            $this->byCount[] = array<usize>();
+        }
+
+        $this->byCount[$count][] = $at;
+    }
+
+    /**
+     * The index of the first route for this method and these segments. A
+     * HEAD with no HEAD route gets the first matching GET, found on the same
+     * walk.
+     */
+    internal const function find(const Method& $method, const array<string>& $path) : usize?
+    {
+        int32 $code = verbCode($method);
+        usize $n = $path->count();
+        usize $a = 0;
+        usize $aEnd = 0;
+        usize $b = 0;
+        usize $bEnd = $this->open->count();
+        usize $get = 0;
+        bool $hasGet = false;
+
+        if ($n < $this->byCount->count()) {
+            $aEnd = $this->byCount[$n]->count();
+        }
+
+        while ($a < $aEnd || $b < $bEnd) {
+            usize $at = 0;
+
+            if ($b >= $bEnd || ($a < $aEnd && $this->byCount[$n][$a] < $this->open[$b])) {
+                $at = $this->byCount[$n][$a];
+                $a = $a + 1;
+            } else {
+                $at = $this->open[$b];
+                $b = $b + 1;
+
+                if ($n < $this->routes[$at]->fixed) {
+                    continue;
+                }
+            }
+
+            int32 $verb = $this->routes[$at]->verb;
+
+            if ($verb == $code && ($code != VERB_OTHER || methodEq($this->routes[$at]->method, $method))) {
+                if (pathMatch($this->routes[$at], $path, $this->cls)) {
+                    return $at;
+                }
+
+                continue;
+            }
+
+            if ($code == VERB_HEAD && $verb == VERB_GET && !$hasGet) {
+                if (pathMatch($this->routes[$at], $path, $this->cls)) {
+                    $get = $at;
+                    $hasGet = true;
+                }
+            }
+        }
+
+        if ($hasGet) {
+            return $get;
+        }
+
+        return null;
+    }
+
+    /**
+     * The `Allow` value for a path no route of the request's method matched.
+     * Empty when no route matches the path at all. The same walk as `find`,
+     * with no verb to check.
+     */
+    internal const function allow(const array<string>& $path) : string
+    {
+        array<string> $names = array<string>();
+        usize $n = $path->count();
+        usize $a = 0;
+        usize $aEnd = 0;
+        usize $b = 0;
+        usize $bEnd = $this->open->count();
+        bool $hasGet = false;
+
+        if ($n < $this->byCount->count()) {
+            $aEnd = $this->byCount[$n]->count();
+        }
+
+        while ($a < $aEnd || $b < $bEnd) {
+            usize $at = 0;
+
+            if ($b >= $bEnd || ($a < $aEnd && $this->byCount[$n][$a] < $this->open[$b])) {
+                $at = $this->byCount[$n][$a];
+                $a = $a + 1;
+            } else {
+                $at = $this->open[$b];
+                $b = $b + 1;
+
+                if ($n < $this->routes[$at]->fixed) {
+                    continue;
+                }
+            }
+
+            if (pathMatch($this->routes[$at], $path, $this->cls)) {
+                pushUnique($names, methodName($this->routes[$at]->method));
+
+                if ($this->routes[$at]->verb == VERB_GET) {
+                    $hasGet = true;
+                }
+            }
+        }
+
+        if ($hasGet) {
+            pushUnique($names, 'HEAD');
+        }
+
+        string $out = '';
+        usize $size = $names->count();
+
+        $i = 0;
+
+        while ($i < $size) {
+            if ($i > 0) {
+                $out->append(', ');
+            }
+
+            $out->append($names[$i]);
+            $i = $i + 1;
+        }
+
+        return $out;
+    }
+}
+
+internal function splitPath(const string& $path) : array<string>
+{
+    array<string> $out = array<string>();
+    usize $n = $path->size();
+    usize $i = 0;
+
+    if ($n > 0 && $path->byte(0) == CH_SLASH) {
+        $i = 1;
+    }
+
+    if ($i >= $n) {
+        return $out;
+    }
+
+    usize $start = $i;
+
+    while ($i < $n) {
+        if ($path->byte($i) == CH_SLASH) {
+            $out[] = $path->sub($start, $i - $start);
+            $i = $i + 1;
+            $start = $i;
+            continue;
+        }
+
+        $i = $i + 1;
+    }
+
+    $out[] = $path->sub($start, $i - $start);
+    return $out;
+}
+
+/**
+ * A request path as the router compares it: split on `/`, then each segment
+ * percent-decoded. One pass; a segment with no `%` is a substring, not a
+ * decoded copy.
+ */
+internal function segments(const string& $path) : array<string>
+{
+    string::view $v = $path->view();
+    usize $n = $v->size;
+    usize $i = 0;
+
+    if ($n > 0 && $v->byte(0) == CH_SLASH) {
+        $i = 1;
+    }
+
+    if ($i >= $n) {
+        return array<string>();
+    }
+
+    usize $count = 1;
+    usize $j = $i;
+
+    while ($j < $n) {
+        if ($v->byte($j) == CH_SLASH) {
+            $count = $count + 1;
+        }
+
+        $j = $j + 1;
+    }
+
+    array<string> $out = arr::room<string>($count);
+    usize $start = $i;
+    bool $escaped = false;
+
+    while ($i < $n) {
+        uint8 $b = $v->byte($i);
+
+        if ($b == CH_SLASH) {
+            $out[] = cut($path, $start, $i - $start, $escaped);
+            $escaped = false;
+            $start = $i + 1;
+        } else if ($b == CH_PERCENT) {
+            $escaped = true;
+        }
+
+        $i = $i + 1;
+    }
+
+    $out[] = cut($path, $start, $n - $start, $escaped);
+    return $out;
+}
+
+private function cut(const string& $path, usize $from, usize $len, bool $escaped) : string
+{
+    if ($escaped) {
+        return unescape(path: $path->sub($from, $len));
+    }
+
+    return $path->sub($from, $len);
+}
+
+/**
+ * Compiles a pattern into its parts. The error says what is wrong with the
+ * first param that is.
+ */
+internal function parsePattern(const string& $pattern) : result<array<Part>, PatternError>
+{
+    array<string> $raw = splitPath($pattern);
+    usize $n = $raw->count();
+    array<Part> $parts = arr::room<Part>($n);
+    usize $i = 0;
+
+    while ($i < $n) {
+        string $seg = $raw[$i];
+        usize $size = $seg->size();
+
+        if ($size < 3 || $seg->byte(0) != CH_LCURLY || $seg->byte($size - 1) != CH_RCURLY) {
+            $parts[] = Part(Kind::literal, $seg, Check::any, array<string>());
+            $i = $i + 1;
+            continue;
+        }
+
+        Part $part = guard parseParam($seg->sub(1, $size - 2)) else ($e) {
+            return .error($e);
+        }
+
+        if ($part->kind != Kind::one && $i + 1 < $n) {
+            return .error(.misplaced($part->text));
+        }
+
+        usize $k = 0;
+
+        while ($k < $parts->count()) {
+            if ($parts[$k]->kind != Kind::literal && $parts[$k]->text == $part->text) {
+                return .error(.duplicate($part->text));
+            }
+
+            $k = $k + 1;
+        }
+
+        $parts[] = $part;
+        $i = $i + 1;
+    }
+
+    return .ok($parts);
+}
+
+/**
+ * One `{...}` without its braces: a name, then `?` or `*`, then `:kind`.
+ */
+private function parseParam(const string& $body) : result<Part, PatternError>
+{
+    usize $colon = $body->find(':');
+    string $head = $body;
+    string $kind = '';
+    bool $checked = $colon < $body->size();
+
+    if ($checked) {
+        $head = $body->sub(0, $colon);
+        $kind = $body->sub($colon + 1, $body->size() - $colon - 1);
+    }
+
+    Kind $shape = Kind::one;
+    string $name = $head;
+    usize $last = $head->size();
+
+    if ($last > 0 && $head->byte($last - 1) == CH_QUESTION) {
+        $shape = Kind::optional;
+        $name = $head->sub(0, $last - 1);
+    } else if ($last > 0 && $head->byte($last - 1) == CH_STAR) {
+        $shape = Kind::rest;
+        $name = $head->sub(0, $last - 1);
+    }
+
+    if ($name->empty()) {
+        return .error(.emptyName);
+    }
+
+    if (!$checked) {
+        return .ok(Part($shape, $name, Check::any, array<string>()));
+    }
+
+    if ($shape == Kind::rest) {
+        return .error(.checkedRest($name));
+    }
+
+    array<string> $choices = array<string>();
+    Check $check = guard checkNamed($kind) else {
+        if ($kind->find('|') >= $kind->size()) {
+            return .error(.unknownKind($kind));
+        }
+
+        $choices = splitChoices($kind);
+
+        usize $i = 0;
+
+        while ($i < $choices->count()) {
+            if ($choices[$i]->empty()) {
+                return .error(.emptyChoice($name));
+            }
+
+            $i = $i + 1;
+        }
+
+        return .ok(Part($shape, $name, Check::oneOf, $choices));
+    }
+
+    return .ok(Part($shape, $name, $check, $choices));
+}
+
+private function checkNamed(const string& $kind) : Check?
+{
+    if ($kind == 'number') {
+        return Check::number;
+    }
+
+    if ($kind == 'alpha') {
+        return Check::alpha;
+    }
+
+    if ($kind == 'alphanum') {
+        return Check::alphanum;
+    }
+
+    if ($kind == 'uuid') {
+        return Check::uuid;
+    }
+
+    if ($kind == 'ulid') {
+        return Check::ulid;
+    }
+
+    return null;
+}
+
+private function splitChoices(const string& $kind) : array<string>
+{
+    array<string> $out = array<string>();
+    usize $n = $kind->size();
+    usize $start = 0;
+    usize $i = 0;
+
+    while ($i < $n) {
+        if ($kind->byte($i) == CH_PIPE) {
+            $out[] = $kind->sub($start, $i - $start);
+            $start = $i + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    $out[] = $kind->sub($start, $n - $start);
+    return $out;
+}
+
+internal function patternReason(const PatternError& $e) : string
+{
+    return match ($e) {
+        PatternError::misplaced($name) => "'{$name}' takes a variable number of segments, so it has to be the last one",
+        PatternError::emptyName => 'a param needs a name',
+        PatternError::duplicate($name) => "'{$name}' is named twice",
+        PatternError::unknownKind($kind) => "'{$kind}' is not a kind: number, alpha, alphanum, uuid, ulid, or a|b|c",
+        PatternError::checkedRest($name) => "'{$name}' is a rest of the path, which has no one segment to check",
+        PatternError::emptyChoice($name) => "'{$name}' lists an empty choice",
+    };
+}
+
+/**
+ * The byte classes the checks read: one load and one mask per byte.
+ */
+internal function byteClasses() : fixed_array<uint8, 256>
+{
+    fixed_array<uint8, 256> $t = fixed_array<uint8, 256>();
+    usize $i = 0;
+
+    while ($i < 256) {
+        uint8 $b = $i as uint8;
+        uint8 $lower = $b | 32;
+        uint8 $c = 0;
+
+        if ($b >= CH_ZERO && $b <= CH_NINE) {
+            $c = CLASS_DIGIT | CLASS_HEX | CLASS_CROCKFORD;
+        }
+
+        if ($lower >= CH_LOWER_A && $lower <= CH_LOWER_Z) {
+            $c = CLASS_ALPHA;
+
+            if ($lower <= CH_LOWER_F) {
+                $c = $c | CLASS_HEX;
+            }
+
+            if ($lower != CH_LOWER_I && $lower != CH_LOWER_L && $lower != CH_LOWER_O && $lower != CH_LOWER_U) {
+                $c = $c | CLASS_CROCKFORD;
+            }
+        }
+
+        $t[$i] = $c;
+        $i = $i + 1;
+    }
+
+    return $t;
+}
+
+/**
+ * The fixed prefix, then the `{name?}` segment when there is one. The
+ * caller has already checked the segment count.
+ */
+internal function pathMatch(const Route& $route, const array<string>& $path, const fixed_array<uint8, 256>& $cls) : bool
+{
+    usize $k = $route->fixed;
+    usize $i = 0;
+
+    while ($i < $k) {
+        if (!partMatch($route->parts[$i], $path[$i], $cls)) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    if ($route->optional && $path->count() > $k) {
+        return partMatch($route->parts[$k], $path[$k], $cls);
+    }
+
+    return true;
+}
+
+internal function partMatch(const Part& $part, const string& $seg, const fixed_array<uint8, 256>& $cls) : bool
+{
+    if ($part->kind == Kind::literal) {
+        return $seg == $part->text;
+    }
+
+    // a param is a whole segment, and an empty one is not there
+    if ($seg->empty()) {
+        return false;
+    }
+
+    if ($part->check == Check::any) {
+        return true;
+    }
+
+    return passes($part, $seg, $cls);
+}
+
+internal function passes(const Part& $part, const string& $seg, const fixed_array<uint8, 256>& $cls) : bool
+{
+    string::view $v = $seg->view();
+
+    return match ($part->check) {
+        Check::any => true,
+        Check::number => every($v, $cls, CLASS_DIGIT),
+        Check::alpha => every($v, $cls, CLASS_ALPHA),
+        Check::alphanum => every($v, $cls, CLASS_DIGIT | CLASS_ALPHA),
+        Check::uuid => isUuid($v, $cls),
+        Check::ulid => isUlid($v, $cls),
+        Check::oneOf => oneOf($part->choices, $seg),
+    };
+}
+
+private function every(string::view $seg, const fixed_array<uint8, 256>& $cls, uint8 $want) : bool
+{
+    usize $n = $seg->size;
+    usize $i = 0;
+
+    while ($i < $n) {
+        if (($cls[$seg->byte($i) as usize] & $want) == 0) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    return true;
+}
+
+private function isUuid(string::view $seg, const fixed_array<uint8, 256>& $cls) : bool
+{
+    if ($seg->size != UUID_SIZE) {
+        return false;
+    }
+
+    usize $i = 0;
+
+    while ($i < UUID_SIZE) {
+        uint8 $b = $seg->byte($i);
+
+        if ($i == 8 || $i == 13 || $i == 18 || $i == 23) {
+            if ($b != CH_DASH) {
+                return false;
+            }
+        } else if (($cls[$b as usize] & CLASS_HEX) == 0) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    return true;
+}
+
+private function isUlid(string::view $seg, const fixed_array<uint8, 256>& $cls) : bool
+{
+    // 26 base32 digits is 130 bits, and a ulid is 128: the first digit tops out at 7
+    if ($seg->size != ULID_SIZE || $seg->byte(0) > CH_SEVEN) {
+        return false;
+    }
+
+    return every($seg, $cls, CLASS_CROCKFORD);
+}
+
+private function oneOf(const array<string>& $choices, const string& $seg) : bool
+{
+    usize $n = $choices->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        if ($choices[$i] == $seg) {
+            return true;
+        }
+
+        $i = $i + 1;
+    }
+
+    return false;
+}
+
+/**
+ * Fills the route's params from a path it matched. A `{name?}` with no
+ * segment stays unset; a `{name*}` is always set, `''` when nothing is left.
+ */
+internal function applyParams(Request& $req, const Route& $route, const array<string>& $path) : void
+{
+    if (!$route->captures) {
+        return;
+    }
+
+    usize $k = $route->fixed;
+    usize $i = 0;
+
+    while ($i < $k) {
+        if ($route->parts[$i]->kind != Kind::literal) {
+            $req->params[$route->parts[$i]->text] = $path[$i];
+        }
+
+        $i = $i + 1;
+    }
+
+    if ($route->optional && $path->count() > $k) {
+        $req->params[$route->parts[$k]->text] = $path[$k];
+        return;
+    }
+
+    if ($route->rest) {
+        $req->params[$route->parts[$k]->text] = joinTail($path, $k);
+    }
+}
+
+/**
+ * `$path[$from..]` joined with `/`, sized once. One segment is that segment,
+ * no copy.
+ */
+private function joinTail(const array<string>& $path, usize $from) : string
+{
+    usize $n = $path->count();
+
+    if ($from >= $n) {
+        return '';
+    }
+
+    if ($from + 1 == $n) {
+        return $path[$from];
+    }
+
+    usize $size = $n - $from - 1;
+    usize $i = $from;
+
+    while ($i < $n) {
+        $size = $size + $path[$i]->size();
+        $i = $i + 1;
+    }
+
+    string $out = '';
+
+    $out->reserve($size);
+    $i = $from;
+
+    while ($i < $n) {
+        if ($i > $from) {
+            $out->push(CH_SLASH);
+        }
+
+        $out->append($path[$i]);
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+internal function pushUnique(array<string>& $out, const string& $name) : void
+{
+    usize $n = $out->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        if ($out[$i] == $name) {
+            return;
+        }
+
+        $i = $i + 1;
+    }
+
+    $out[] = $name;
+}

@@ -1,0 +1,247 @@
+/**
+ * A complete request in, a response out, the connection back or closed.
+ *
+ * A worker never waits on a client that is still sending. Writes still
+ * block under the 10 second send timeout.
+ */
+
+use std::thread;
+
+namespace http;
+
+/**
+ * One complete request and the connection it came in on.
+ */
+internal struct Visit
+{
+    public int32 $fd;
+    public string $peer;
+    public Request $req;
+
+    // bytes past this request: the start of the next one, when pipelined
+    public string $rest;
+
+    // requests this connection finished before this one
+    public int32 $served;
+}
+
+/**
+ * A kept connection on its way back to the reactor.
+ */
+internal struct Parked
+{
+    public int32 $fd;
+    public string $peer;
+    public string $rest;
+    public int32 $served;
+}
+
+internal enum Job
+{
+    case serve(Visit $visit);
+
+    // the reactor could not make a request of the bytes: answer, then close
+    case fail(int32 $fd, WireError $e);
+}
+
+/**
+ * What the reactor and every worker share. `#[atomic]` because all of them
+ * hold it. `$wake` is written once, before any worker starts.
+ */
+#[atomic]
+internal class Shared
+{
+    // jobs sent and not yet taken by a worker
+    public atomic<int32> $queued;
+
+    // connections open anywhere: idle, being read, or on a worker
+    public atomic<int32> $live;
+    public atomic<bool> $stopping;
+    public int32 $wake;
+
+    public constructor(int32 $wake)
+    {
+        $this->queued = atomic<int32>(0);
+        $this->live = atomic<int32>(0);
+        $this->stopping = atomic<bool>(false);
+        $this->wake = $wake;
+    }
+}
+
+/**
+ * Writes one response and ends the connection with a lingering close, so a
+ * client still sending (a 413 body, a pipelined request) reads the answer
+ * instead of a reset.
+ */
+internal function respond(Conn& $conn, const Response& $res, bool $sendBody) : void
+{
+    $conn->writeAll(render($res, $sendBody));
+    $conn->finish();
+}
+
+/**
+ * The route table as a handler: match, 404 or 405 with `Allow`, params, then
+ * the route's own handler.
+ */
+internal function dispatch(const Router& $router, Request $req) : Response
+{
+    array<string> $path = segments($req->path);
+
+    usize $at = guard $router->find($req->method, $path) else {
+        string $allow = $router->allow($path);
+
+        if ($allow->empty()) {
+            return .notFound();
+        }
+
+        Response $r = errorResponse(405, 'Method Not Allowed');
+
+        $r->headers->set('Allow', $allow);
+        return $r;
+    }
+
+    applyParams($req, $router->routes[$at], $path);
+
+    function<Response(Request)> $handler = $router->routes[$at]->handler;
+
+    return $handler($req);
+}
+
+/**
+ * What this response tells the client about the connection. Kept only when
+ * the client asked, the connection has requests left, and the server is not
+ * stopping.
+ */
+internal function persistFor(const Visit& $visit, const Limits& $limits, const Shared& $shared) : Persist
+{
+    if (!persistent($visit->req)) {
+        return .close;
+    }
+
+    if ($visit->served + 1 >= $limits->maxRequests) {
+        return .close;
+    }
+
+    if ($shared->stopping->load()) {
+        return .close;
+    }
+
+    if ($visit->req->version == 'HTTP/1.1') {
+        return .keep;
+    }
+
+    return .keepAlive($limits->idleTimeout->as_secs());
+}
+
+internal function closes(const Persist& $p) : bool
+{
+    return match ($p) {
+        Persist::close => true,
+        else => false,
+    };
+}
+
+/**
+ * Sends a streamed response: the head, then the callback through a Writer.
+ * A length is Content-Length. No length over HTTP/1.1 is chunked. HEAD,
+ * or a status with no body, never runs the stream.
+ */
+internal function streamTo(Conn $conn, const Response& $res, bool $head, bool $http11, const Persist& $persist, Shared $shared) : bool
+{
+    bool $sendBody = !$head && !bodyless($res->status);
+    Length $length = Length::none;
+    Mode $mode = Mode::raw;
+    uint64 $size = 0;
+
+    if ($res->length >= 0) {
+        $size = $res->length as uint64;
+        $length = Length::exact($res->length as usize);
+        $mode = Mode::sized;
+    } else if ($sendBody && $http11) {
+        $length = Length::chunked;
+        $mode = Mode::chunked;
+    }
+
+    if (!$conn->writeAll(renderHead($res, $length, $persist))) {
+        return false;
+    }
+
+    if (!$sendBody) {
+        return true;
+    }
+
+    function<void(Writer)> $fn = guard $res->stream else {
+        return $size == 0;
+    }
+
+    Writer $w = Writer($conn, $shared, $mode, $size);
+
+    $fn($w);
+    return $w->finish();
+}
+
+internal function serveVisit(Visit $visit, thread::sender<Parked> $back, function<Response(Request)> $app, const Limits& $limits, Shared $shared) : void
+{
+    Conn $conn = Conn($visit->fd);
+    Response $res = $app($visit->req);
+    bool $head = methodEq($visit->req->method, Method::head);
+    bool $http11 = $visit->req->version == 'HTTP/1.1';
+    Persist $persist = persistFor($visit, $limits, $shared);
+    bool $whole = false;
+
+    if ($res->streamed()) {
+        // an HTTP/1.0 client can only read the end of an unsized body as the close
+        if (!$http11 && !$head && $res->length < 0 && !bodyless($res->status)) {
+            $persist = Persist::close;
+        }
+
+        $whole = streamTo($conn, $res, $head, $http11, $persist, $shared);
+    } else {
+        $whole = $conn->writeAll(render($res, !$head, $persist));
+    }
+
+    if (!$whole) {
+        // the client is gone, or the body fell short: the conn closes on drop
+        $shared->live->sub(1);
+        return;
+    }
+
+    if (closes($persist) || $shared->stopping->load()) {
+        $conn->finish();
+        $shared->live->sub(1);
+        return;
+    }
+
+    int32 $fd = $conn->release();
+
+    if (!$back->send(Parked($fd, $visit->peer, $visit->rest, $visit->served + 1))) {
+        http_close($fd);
+        $shared->live->sub(1);
+        return;
+    }
+
+    http_wake($shared->wake);
+}
+
+internal function workerLoop(thread::receiver<Job> $rx, thread::sender<Parked> $back, function<Response(Request)> $app, Limits $limits, Shared $shared) : void
+{
+    while (true) {
+        Job $job = guard $rx->recv() else {
+            return;
+        }
+
+        $shared->queued->sub(1);
+
+        match ($job) {
+            Job::serve($visit) => {
+                serveVisit($visit, $back, $app, $limits, $shared);
+            },
+            Job::fail($fd, $e) => {
+                Conn $conn = Conn($fd);
+
+                respond($conn, errorResponse($e->status(), $e->body()), true);
+                $shared->live->sub(1);
+            },
+        }
+    }
+}

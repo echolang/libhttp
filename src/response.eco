@@ -1,0 +1,359 @@
+/**
+ * What the handler sends back.
+ *
+ * Public fields. Labelled constructors for the common 200s; `notFound`
+ * and friends are statics so `return .notFound()` works. A stream is a
+ * callback that writes through a `Writer` and holds the worker until it
+ * returns. The serializer owns Content-Length and Connection.
+ */
+
+use std::io;
+
+namespace http;
+
+internal const usize FILE_READ = 65536;
+
+public struct Response
+{
+    public int32 $status;
+    public Headers $headers = Headers();
+    public string $body;
+
+    internal bool $streaming = false;
+
+    // a stream's declared length, or -1 when the stream decides as it goes
+    internal int64 $length = -1;
+    internal function<void(Writer)>? $stream;
+
+    public constructor(int32 $status, const string& $body)
+    {
+        $this->stream = null;
+        $this->status = $status;
+        $this->body = $body;
+    }
+
+    public constructor(ok: const string& $body)
+    {
+        $this->stream = null;
+        $this->status = 200;
+        $this->body = $body;
+    }
+
+    public constructor(text: const string& $body)
+    {
+        $this->stream = null;
+        $this->status = 200;
+        $this->headers->set('Content-Type', 'text/plain; charset=utf-8');
+        $this->body = $body;
+    }
+
+    public constructor(json: const string& $body)
+    {
+        $this->stream = null;
+        $this->status = 200;
+        $this->headers->set('Content-Type', 'application/json');
+        $this->body = $body;
+    }
+
+    public constructor(html: const string& $body)
+    {
+        $this->stream = null;
+        $this->status = 200;
+        $this->headers->set('Content-Type', 'text/html; charset=utf-8');
+        $this->body = $body;
+    }
+
+    /**
+     * A 200 whose body `$fn` writes as it goes. Over HTTP/1.1 it is sent
+     * chunked, so the connection can be kept. Set a Content-Type yourself:
+     * `text/event-stream` for server-sent events.
+     */
+    public constructor(stream: function<void(Writer)> $fn)
+    {
+        $this->status = 200;
+        $this->body = '';
+        $this->streaming = true;
+        $this->stream = $fn;
+    }
+
+    /**
+     * A 200 whose body `$fn` writes, exactly `$length` bytes. Bytes past
+     * it are dropped. A short stream closes the connection.
+     */
+    public constructor(stream: function<void(Writer)> $fn, length: usize $length)
+    {
+        $this->status = 200;
+        $this->body = '';
+        $this->streaming = true;
+        $this->length = $length as int64;
+        $this->stream = $fn;
+    }
+
+    /**
+     * The file at `$path`, streamed from disk. Missing is 404, unreadable
+     * is 403, decided here. The path is used as given: keeping `..` out
+     * is the handler's job.
+     */
+    public constructor(file: const string& $path)
+    {
+        result<FileBody, int32> $opened = openFile($path);
+        int32 $code = 200;
+        string $text = '';
+        string $type = mimeOf($path);
+        int64 $size = -1;
+        function<void(Writer)>? $fn = null;
+
+        if ($opened->failed()) {
+            $code = $opened->failure();
+            $text = reason($code);
+            $type = 'text/plain; charset=utf-8';
+        } else {
+            FileBody $found = $opened->unwrap();
+            io::file $f = $found->file;
+
+            $size = $found->size;
+            $fn = function(Writer $w) : void {
+                sendFile($f, $w);
+            };
+        }
+
+        // every field once: a constructor may not build one twice
+        $this->status = $code;
+        $this->body = $text;
+        $this->streaming = $size >= 0;
+        $this->length = $size;
+        $this->stream = $fn;
+        $this->headers->set('Content-Type', $type);
+    }
+
+    public static function notFound() : Response
+    {
+        return errorResponse(404, 'Not Found');
+    }
+
+    public static function badRequest() : Response
+    {
+        return errorResponse(400, 'Bad Request');
+    }
+
+    public static function noContent() : Response
+    {
+        return Response(204, '');
+    }
+
+    /**
+     * Replaces any header of this name.
+     */
+    public function header(const string& $name, const string& $value) : void
+    {
+        $this->headers->set($name, $value);
+    }
+
+    /**
+     * 2xx.
+     */
+    public const function success() : bool
+    {
+        return $this->status >= 200 && $this->status <= 299;
+    }
+
+    /**
+     * 4xx.
+     */
+    public const function clientError() : bool
+    {
+        return $this->status >= 400 && $this->status <= 499;
+    }
+
+    /**
+     * Whether the body is a stream rather than `$body`.
+     */
+    public const function streamed() : bool
+    {
+        return $this->streaming;
+    }
+
+    /**
+     * 5xx.
+     */
+    public const function serverError() : bool
+    {
+        return $this->status >= 500 && $this->status <= 599;
+    }
+}
+
+/**
+ * An open file and how long it is.
+ */
+internal struct FileBody
+{
+    public io::file $file;
+    public int64 $size;
+}
+
+/**
+ * Opens a file to serve, or the status to send instead. A directory
+ * opens and has a size on POSIX, so we refuse it here, before the head
+ * promises a length.
+ */
+internal function openFile(const string& $path) : result<FileBody, int32>
+{
+    if (io::opendir($path)->has_value()) {
+        return .error(404);
+    }
+
+    io::file $f = guard io::open($path, .read) else ($e) {
+        return .error(fileStatus($e));
+    }
+
+    int64 $size = guard $f->size() else ($e) {
+        return .error(fileStatus($e));
+    }
+
+    return .ok(FileBody($f, $size));
+}
+
+/**
+ * The status a file that could not be opened answers with.
+ */
+internal function fileStatus(const io::ioerror& $e) : int32
+{
+    if ($e->missing()) {
+        return 404;
+    }
+
+    if ($e->denied()) {
+        return 403;
+    }
+
+    return 500;
+}
+
+internal function sendFile(io::file $f, Writer $w) : void
+{
+    string $chunk = '';
+
+    while ($w->open()) {
+        $chunk->clear();
+        $chunk->reserve(FILE_READ);
+
+        usize $got = guard $f->read($chunk->spare(), FILE_READ) else {
+            return;
+        }
+
+        if ($got == 0) {
+            return;
+        }
+
+        $chunk->commit($got);
+
+        if (!$w->write($chunk)) {
+            return;
+        }
+    }
+}
+
+/**
+ * A Content-Type for a file name, by extension. The common web ones;
+ * anything else is `application/octet-stream`.
+ */
+internal function mimeOf(const string& $path) : string
+{
+    usize $dot = $path->size();
+    usize $i = $path->size();
+
+    while ($i > 0) {
+        $i = $i - 1;
+
+        uint8 $b = $path->byte($i);
+
+        if ($b == CH_SLASH) {
+            break;
+        }
+
+        if ($b == CH_DOT) {
+            $dot = $i;
+            break;
+        }
+    }
+
+    if ($dot >= $path->size()) {
+        return 'application/octet-stream';
+    }
+
+    string $ext = str::lower($path->sub($dot + 1, $path->size() - $dot - 1));
+
+    if ($ext == 'html' || $ext == 'htm') {
+        return 'text/html; charset=utf-8';
+    }
+
+    if ($ext == 'css') {
+        return 'text/css; charset=utf-8';
+    }
+
+    if ($ext == 'js' || $ext == 'mjs') {
+        return 'text/javascript; charset=utf-8';
+    }
+
+    if ($ext == 'json') {
+        return 'application/json';
+    }
+
+    if ($ext == 'txt') {
+        return 'text/plain; charset=utf-8';
+    }
+
+    if ($ext == 'md') {
+        return 'text/markdown; charset=utf-8';
+    }
+
+    if ($ext == 'xml') {
+        return 'application/xml';
+    }
+
+    if ($ext == 'svg') {
+        return 'image/svg+xml';
+    }
+
+    if ($ext == 'png') {
+        return 'image/png';
+    }
+
+    if ($ext == 'jpg' || $ext == 'jpeg') {
+        return 'image/jpeg';
+    }
+
+    if ($ext == 'gif') {
+        return 'image/gif';
+    }
+
+    if ($ext == 'webp') {
+        return 'image/webp';
+    }
+
+    if ($ext == 'ico') {
+        return 'image/x-icon';
+    }
+
+    if ($ext == 'wasm') {
+        return 'application/wasm';
+    }
+
+    if ($ext == 'pdf') {
+        return 'application/pdf';
+    }
+
+    if ($ext == 'woff2') {
+        return 'font/woff2';
+    }
+
+    return 'application/octet-stream';
+}
+
+internal function errorResponse(int32 $status, const string& $body) : Response
+{
+    Response $r = Response($status, $body);
+
+    $r->headers->set('Content-Type', 'text/plain; charset=utf-8');
+    return $r;
+}

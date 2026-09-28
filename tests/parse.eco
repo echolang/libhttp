@@ -1,0 +1,556 @@
+/**
+ * Request parsing. No network.
+ */
+
+internal function mustParse(const string& $raw) : http::Request
+{
+    result<http::Request, http::WireError> $r = http::parse($raw);
+
+    return $r->unwrap();
+}
+
+internal function isBad(const http::WireError& $e) : bool
+{
+    return match ($e) {
+        http::WireError::badRequest => true,
+        else => false,
+    };
+}
+
+internal function isCoding(const http::WireError& $e) : bool
+{
+    return match ($e) {
+        http::WireError::unsupportedCoding => true,
+        else => false,
+    };
+}
+
+internal function isVersion(const http::WireError& $e) : bool
+{
+    return match ($e) {
+        http::WireError::unsupportedVersion => true,
+        else => false,
+    };
+}
+
+internal function isExpectation(const http::WireError& $e) : bool
+{
+    return match ($e) {
+        http::WireError::expectationFailed => true,
+        else => false,
+    };
+}
+
+#[group: "unit"]
+test parses_a_get {
+    http::Request $req = mustParse("GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    assert(http::methodName($req->method) == 'GET', 'method');
+    assert($req->path == '/hello', 'path');
+    assert($req->version == 'HTTP/1.1', 'version');
+    assert(($req->header('Host') ?? '') == 'localhost', 'host header');
+    assert($req->body->empty(), 'no body');
+}
+
+#[group: "unit"]
+test parses_query_string {
+    http::Request $req = mustParse("GET /search?q=echo+lang&page=2 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    assert($req->path == '/search', 'path stops at the question mark');
+    assert($req->queryString == 'q=echo+lang&page=2', 'raw query is kept');
+    assert(($req->query->get('q') ?? '') == 'echo lang', 'plus is a space');
+    assert(($req->query->get('page') ?? '') == '2', 'page');
+}
+
+#[group: "unit"]
+test parses_a_post_body {
+    http::Request $req = mustParse("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello");
+
+    assert(http::methodName($req->method) == 'POST', 'method');
+    assert($req->body == 'hello', 'body');
+}
+
+#[group: "unit"]
+test lf_only_separators {
+    http::Request $req = mustParse("GET /x HTTP/1.1\nHost: a\n\n");
+
+    assert($req->path == '/x', 'path');
+    assert(($req->header('Host') ?? '') == 'a', 'host');
+}
+
+#[group: "unit"]
+test unknown_verb_is_other {
+    http::Request $req = mustParse("COPY /file HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    string $name = http::methodName($req->method);
+
+    assert($name == 'COPY', 'other verbs survive');
+}
+
+#[group: "unit"]
+test missing_request_line_fails {
+    result<http::Request, http::WireError> $r = http::parse("\r\n\r\n");
+
+    assert($r->failed(), 'empty is not a request');
+    assert(isBad($r->failure()), 'badRequest');
+}
+
+#[group: "unit"]
+test chunked_body_is_decoded {
+    http::Request $req = mustParse("POST /x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n7\r\n, world\r\n0\r\n\r\n");
+
+    assert($req->body == 'hello, world', 'chunks joined');
+    assert(($req->header('Transfer-Encoding') ?? '') == 'chunked', 'headers stay as they arrived');
+}
+
+#[group: "unit"]
+test http2_is_refused {
+    result<http::Request, http::WireError> $r = http::parse("GET / HTTP/2.0\r\n\r\n");
+
+    assert($r->failed(), 'only 1.x');
+    assert(isVersion($r->failure()), '505');
+    assert($r->failure()->status() == 505, 'HTTP Version Not Supported');
+}
+
+#[group: "unit"]
+test garbage_version_is_bad {
+    result<http::Request, http::WireError> $r = http::parse("GET / FTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    assert($r->failed(), 'not HTTP');
+    assert(isBad($r->failure()), 'badRequest, not 505');
+}
+
+#[group: "unit"]
+test incomplete_body_fails {
+    result<http::Request, http::WireError> $r = http::parse("POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nshort");
+
+    assert($r->failed(), 'body shorter than Content-Length');
+}
+
+#[group: "unit"]
+test header_lookup_is_case_insensitive {
+    http::Request $req = mustParse("GET / HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\n\r\n");
+
+    assert(($req->header('content-type') ?? '') == 'text/plain', 'lower');
+    assert(($req->header('CONTENT-TYPE') ?? '') == 'text/plain', 'upper');
+}
+
+#[group: "unit"]
+test http11_needs_host {
+    result<http::Request, http::WireError> $r = http::parse("GET / HTTP/1.1\r\n\r\n");
+
+    assert($r->failed(), 'host is required');
+    assert(isBad($r->failure()), 'badRequest');
+}
+
+#[group: "unit"]
+test http10_without_host {
+    http::Request $req = mustParse("GET / HTTP/1.0\r\n\r\n");
+
+    assert($req->version == 'HTTP/1.0', '1.0');
+    assert($req->path == '/', 'path');
+}
+
+#[group: "unit"]
+test unknown_1x_is_refused {
+    result<http::Request, http::WireError> $r = http::parse("GET / HTTP/1.9\r\nHost: localhost\r\n\r\n");
+
+    assert($r->failed(), 'only 1.0 and 1.1');
+    assert(isVersion($r->failure()), '505');
+}
+
+#[group: "unit"]
+test identity_te_is_refused {
+    result<http::Request, http::WireError> $r = http::parse("POST /x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity\r\n\r\n");
+
+    assert($r->failed(), 'any TE is v1-out');
+    assert(isCoding($r->failure()), '501');
+}
+
+#[group: "unit"]
+test duplicate_content_length_must_agree {
+    result<http::Request, http::WireError> $bad = http::parse("POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 4\r\n\r\nhello");
+
+    assert($bad->failed(), 'disagreeing CL');
+    assert(isBad($bad->failure()), 'badRequest');
+
+    http::Request $ok = mustParse("POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello");
+
+    assert($ok->body == 'hello', 'identical CL is fine');
+}
+
+#[group: "unit"]
+test content_length_list_must_agree {
+    result<http::Request, http::WireError> $bad = http::parse("POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 4\r\n\r\nhello");
+
+    assert($bad->failed(), 'list disagrees');
+
+    http::Request $ok = mustParse("POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 5\r\n\r\nhello");
+
+    assert($ok->body == 'hello', 'identical list is fine');
+}
+
+#[group: "unit"]
+test cl_and_te_together_fail {
+    result<http::Request, http::WireError> $r = http::parse("POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello");
+
+    assert($r->failed(), 'CL+TE');
+    assert(isBad($r->failure()), 'badRequest: two hops could read two different bodies');
+}
+
+#[group: "unit"]
+test other_codings_are_501 {
+    result<http::Request, http::WireError> $gzip = http::parse("POST /x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n");
+
+    assert($gzip->failed(), 'gzip is not decoded');
+    assert($gzip->failure()->status() == 501, 'Not Implemented');
+}
+
+#[group: "unit"]
+test chunked_must_be_last_and_once {
+    result<http::Request, http::WireError> $twice = http::parse("POST /x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+
+    assert($twice->failed(), 'chunked twice');
+    assert(isBad($twice->failure()), 'badRequest');
+}
+
+#[group: "unit"]
+test http10_te_is_bad {
+    result<http::Request, http::WireError> $r = http::parse("POST /x HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+
+    assert($r->failed(), '1.0 has no transfer codings');
+    assert(isBad($r->failure()), 'badRequest');
+}
+
+#[group: "unit"]
+test chunk_extensions_and_trailers {
+    http::Request $req = mustParse("POST /x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: Chunked\r\n\r\na ; name=value\r\n0123456789\r\n0\r\nX-Checksum: abc\r\n\r\n");
+
+    assert($req->body == '0123456789', 'extension ignored');
+    assert(!$req->headers->has('X-Checksum'), 'trailers are dropped');
+}
+
+#[group: "unit"]
+test chunk_framing_is_strict {
+    result<http::Request, http::WireError> $hex = http::parse("POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n");
+    result<http::Request, http::WireError> $lf = http::parse("POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n");
+    result<http::Request, http::WireError> $tail = http::parse("POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n");
+    result<http::Request, http::WireError> $long = http::parse("POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n00000000000000001\r\nh\r\n0\r\n\r\n");
+    result<http::Request, http::WireError> $short = http::parse("POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel");
+
+    assert($hex->failed() && isBad($hex->failure()), 'not hex');
+    assert($lf->failed() && isBad($lf->failure()), 'bare LF after the size');
+    assert($tail->failed() && isBad($tail->failure()), 'no CRLF after the data');
+    assert($long->failed() && isBad($long->failure()), 'more than 16 hex digits');
+    assert($short->failed(), 'a body that stops mid-chunk');
+}
+
+#[group: "unit"]
+test earliest_blank_line_ends_the_head {
+    http::Request $req = mustParse("POST /a HTTP/1.1\nHost: x\nContent-Length: 12\n\nab\r\n\r\ncdefgh");
+
+    assert($req->body == "ab\r\n\r\ncdefgh", 'body starts after the LF blank line');
+}
+
+#[group: "unit"]
+test space_before_colon_is_bad {
+    result<http::Request, http::WireError> $r = http::parse("GET / HTTP/1.1\r\nHost : x\r\n\r\n");
+
+    assert($r->failed(), 'Host : x');
+    assert(isBad($r->failure()), 'badRequest');
+}
+
+#[group: "unit"]
+test header_without_colon_is_bad {
+    result<http::Request, http::WireError> $r = http::parse("GET / HTTP/1.1\r\nHost: x\r\nnonsense\r\n\r\n");
+
+    assert($r->failed(), 'no colon');
+    assert(isBad($r->failure()), 'badRequest');
+}
+
+#[group: "unit"]
+test empty_header_name_is_bad {
+    result<http::Request, http::WireError> $r = http::parse("GET / HTTP/1.1\r\nHost: x\r\n: v\r\n\r\n");
+
+    assert($r->failed(), 'empty name');
+}
+
+#[group: "unit"]
+test folded_header_joins {
+    http::Request $req = mustParse("GET / HTTP/1.1\r\nHost: x\r\nX-Long: a\r\n  b\r\n\r\n");
+
+    assert(($req->header('X-Long') ?? '') == 'a b', 'continuation joins with one space');
+}
+
+#[group: "unit"]
+test signed_content_length_is_bad {
+    result<http::Request, http::WireError> $plus = http::parse("POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: +5\r\n\r\nhello");
+    result<http::Request, http::WireError> $minus = http::parse("POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: -0\r\n\r\n");
+
+    assert($plus->failed(), 'plus sign');
+    assert(isBad($plus->failure()), 'badRequest');
+    assert($minus->failed(), 'minus sign');
+}
+
+#[group: "unit"]
+test expect_continue_parses {
+    http::Request $req = mustParse("POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
+    http::Request $loud = mustParse("POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-CONTINUE\r\nContent-Length: 2\r\n\r\nhi");
+    result<bool, http::WireError> $e = http::expectation($req);
+    bool $wants = $e->unwrap();
+
+    assert($wants, 'wants a 100');
+    assert($req->body == 'hi', 'body');
+    assert($loud->body == 'hi', 'case-insensitive');
+}
+
+#[group: "unit"]
+test unknown_expectation_is_417 {
+    result<http::Request, http::WireError> $r = http::parse("POST /echo HTTP/1.1\r\nHost: x\r\nExpect: bogus\r\nContent-Length: 0\r\n\r\n");
+
+    assert($r->failed(), 'an unknown Expect does not parse');
+    assert(isExpectation($r->failure()), 'expectationFailed');
+    assert($r->failure()->status() == 417, '417');
+}
+
+#[group: "unit"]
+test http10_expect_is_ignored {
+    http::Request $req = mustParse("POST /echo HTTP/1.0\r\nExpect: bogus\r\nContent-Length: 2\r\n\r\nhi");
+    result<bool, http::WireError> $e = http::expectation($req);
+    bool $wants = $e->unwrap();
+
+    assert(!$wants, 'no 100 for 1.0');
+    assert($req->body == 'hi', 'body');
+}
+
+internal function isReady(const http::Step& $s) : bool
+{
+    return match ($s) {
+        http::Step::ready($req) => true,
+        else => false,
+    };
+}
+
+internal function isNeedMore(const http::Step& $s) : bool
+{
+    return match ($s) {
+        http::Step::needMore => true,
+        else => false,
+    };
+}
+
+internal function readyBody(const http::Step& $s) : string
+{
+    return match ($s) {
+        http::Step::ready($req) => $req->body,
+        else => '(not ready)',
+    };
+}
+
+#[group: "unit"]
+test framer_waits_for_the_whole_head {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    http::Step $empty = $f->advance($limits);
+
+    $f->buffer->append('GET / HTTP/1.1\r\nHo');
+
+    http::Step $partial = $f->advance($limits);
+
+    $f->buffer->append('st: x\r\n\r\n');
+
+    http::Step $whole = $f->advance($limits);
+
+    assert(isNeedMore($empty), 'nothing yet');
+    assert(isNeedMore($partial), 'half a head');
+    assert(isReady($whole), 'the rest arrived');
+}
+
+#[group: "unit"]
+test framer_takes_a_head_a_byte_at_a_time {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+    string $raw = "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
+    usize $n = $raw->size();
+    usize $i = 0;
+    usize $readyAt = $n;
+    string $body = '';
+
+    while ($i < $n) {
+        $f->buffer->append($raw->sub($i, 1));
+        $i = $i + 1;
+
+        http::Step $s = $f->advance($limits);
+
+        if (isReady($s)) {
+            $readyAt = $i;
+            $body = readyBody($s);
+        }
+    }
+
+    assert($readyAt == $n, 'ready on the last byte and not before');
+    assert($body == 'abc', 'body');
+}
+
+#[group: "unit"]
+test framer_keeps_the_next_request {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $f->buffer->append("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhiGET /b HTTP/1.1\r\nHost: x\r\n\r\nGET /c");
+
+    http::Step $first = $f->advance($limits);
+
+    assert(readyBody($first) == 'hi', 'first body stops at its length');
+    assert($f->buffer->starts('GET /b HTTP/1.1'), 'the rest is kept');
+
+    http::Step $second = $f->advance($limits);
+
+    assert(isReady($second), 'the second request came from the leftover');
+    assert($f->buffer == 'GET /c', 'a partial third stays buffered');
+    assert(isNeedMore($f->advance($limits)), 'and waits for more');
+}
+
+#[group: "unit"]
+test framer_asks_for_the_100_before_the_body {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $f->buffer->append("POST /a HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n");
+
+    http::Step $s = $f->advance($limits);
+    bool $wantsContinue = match ($s) {
+        http::Step::sendContinue => true,
+        else => false,
+    };
+
+    assert($wantsContinue, 'the 100 comes first');
+    assert(isNeedMore($f->advance($limits)), 'then the body is waited for');
+
+    $f->buffer->append('ok');
+
+    assert(readyBody($f->advance($limits)) == 'ok', 'body');
+}
+
+#[group: "unit"]
+test framer_refuses_an_endless_head {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $f->buffer->append('GET / HTTP/1.1\r\n');
+
+    while ($f->buffer->size() < 9000) {
+        $f->buffer->append('X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n');
+    }
+
+    http::Step $s = $f->advance($limits);
+    bool $tooLarge = match ($s) {
+        http::Step::fail($e) => $e->status() == 413,
+        else => false,
+    };
+
+    assert($tooLarge, 'a head past 8 KiB is 413');
+}
+
+#[group: "unit"]
+test framer_is_idle_until_the_first_byte {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $limits->idleTimeout = std::time::duration::zero();
+    $limits->headerTimeout = std::time::duration::secs(60);
+
+    bool $idle = match ($f->expired($limits)) {
+        http::Expiry::idle => true,
+        else => false,
+    };
+
+    $f->buffer->append('GET / HT');
+
+    http::Step $s = $f->advance($limits);
+    bool $none = match ($f->expired($limits)) {
+        http::Expiry::none => true,
+        else => false,
+    };
+
+    assert($idle, 'no bytes yet is idle, and closes quietly');
+    assert(isNeedMore($s), 'half a request line');
+    assert($none, 'once a byte is in, the header clock runs instead');
+}
+
+#[group: "unit"]
+test persistence_follows_the_version {
+    http::Request $plain11 = mustParse("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    http::Request $close11 = mustParse("GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade, CLOSE\r\n\r\n");
+    http::Request $plain10 = mustParse("GET / HTTP/1.0\r\n\r\n");
+    http::Request $kept10 = mustParse("GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n");
+
+    assert(http::persistent($plain11), '1.1 is kept by default');
+    assert(!http::persistent($close11), 'close in a token list, any case');
+    assert(!http::persistent($plain10), '1.0 closes by default');
+    assert(http::persistent($kept10), '1.0 that asked is kept');
+}
+
+#[group: "unit"]
+test chunked_body_split_at_every_byte {
+    string $raw = "POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3;x=y\r\nabc\r\n2\r\nde\r\n0\r\nT: 1\r\n\r\nGET /next";
+    usize $n = $raw->size();
+    usize $cut = 1;
+    bool $allOk = true;
+
+    while ($cut < $n) {
+        http::Framer $f = http::Framer();
+        http::Limits $limits = http::Limits();
+
+        $f->buffer->append($raw->sub(0, $cut));
+
+        http::Step $first = $f->advance($limits);
+        string $body = readyBody($first);
+
+        $f->buffer->append($raw->sub($cut, $n - $cut));
+
+        if (!isReady($first)) {
+            $body = readyBody($f->advance($limits));
+        }
+
+        if ($body != 'abcde' || $f->buffer != 'GET /next') {
+            $allOk = false;
+        }
+
+        $cut = $cut + 1;
+    }
+
+    assert($allOk, 'the same body and the same leftover wherever the bytes split');
+}
+
+#[group: "unit"]
+test chunked_body_over_max_is_413 {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $limits->maxBody = 8;
+    $f->buffer->append("POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n");
+
+    bool $tooLarge = match ($f->advance($limits)) {
+        http::Step::fail($e) => $e->status() == 413,
+        else => false,
+    };
+
+    assert($tooLarge, 'the decoded size is what counts');
+}
+
+#[group: "unit"]
+test chunked_expect_asks_for_the_100 {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $f->buffer->append("POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n");
+
+    bool $wantsContinue = match ($f->advance($limits)) {
+        http::Step::sendContinue => true,
+        else => false,
+    };
+
+    assert($wantsContinue, 'no body bytes yet: the 100 comes first');
+}

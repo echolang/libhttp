@@ -1,0 +1,28 @@
+/**
+ * `str::from` so `"{$e}"` works. Own file: a file is one namespace.
+ */
+
+namespace str;
+
+public function from(const http::Error& $e) : string
+{
+    return $e->message();
+}
+
+public function from(http::Method $m) : string
+{
+    return http::methodName($m);
+}
+
+public function from(const http::Response& $r) : string
+{
+    if (!$r->streamed()) {
+        return "{$r->status} ({$r->body->size()} bytes)";
+    }
+
+    if ($r->length < 0) {
+        return "{$r->status} (streamed)";
+    }
+
+    return "{$r->status} ({$r->length} bytes, streamed)";
+}

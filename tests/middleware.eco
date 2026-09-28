@@ -1,0 +1,95 @@
+/**
+ * The middleware chain. No network: the chain is a function of a Request.
+ */
+
+internal function requestFor(const string& $path) : http::Request
+{
+    result<http::Request, http::WireError> $r = http::parse("GET {$path} HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    return $r->unwrap();
+}
+
+/**
+ * A layer that brackets whatever the rest of the chain answers with its name.
+ */
+internal function marker(const string& $name) : function<http::Response(http::Request, http::Next)>
+{
+    return function(http::Request $req, http::Next $next) : http::Response {
+        http::Response $res = $next->run($req);
+
+        $res->body = "{$name}({$res->body})";
+        return $res;
+    };
+}
+
+#[group: "unit"]
+test first_registered_runs_outermost {
+    array<function<http::Response(http::Request, http::Next)>> $layers = array<function<http::Response(http::Request, http::Next)>>();
+
+    $layers[] = marker('outer');
+    $layers[] = marker('inner');
+
+    function<http::Response(http::Request)> $app = http::chain($layers, function(http::Request $req) : http::Response {
+        return http::Response(text: 'handler');
+    });
+
+    http::Response $res = $app(requestFor('/'));
+
+    assert($res->body == 'outer(inner(handler))', 'registration order, outside in');
+}
+
+#[group: "unit"]
+test a_layer_can_answer_without_next {
+    array<function<http::Response(http::Request, http::Next)>> $layers = array<function<http::Response(http::Request, http::Next)>>();
+
+    $layers[] = function(http::Request $req, http::Next $next) : http::Response {
+        if (!$req->headers->has('Authorization')) {
+            return http::Response(401, 'no');
+        }
+
+        return $next->run($req);
+    };
+
+    function<http::Response(http::Request)> $app = http::chain($layers, function(http::Request $req) : http::Response {
+        return http::Response(text: 'secret');
+    });
+
+    http::Response $res = $app(requestFor('/'));
+
+    assert($res->status == 401, 'short-circuited');
+    assert($res->body == 'no', 'the handler never ran');
+}
+
+#[group: "unit"]
+test a_layer_sees_the_404 {
+    array<http::Route> $table = array<http::Route>();
+    array<function<http::Response(http::Request, http::Next)>> $layers = array<function<http::Response(http::Request, http::Next)>>();
+
+    $layers[] = function(http::Request $req, http::Next $next) : http::Response {
+        http::Response $res = $next->run($req);
+
+        $res->header('X-Seen', "{$res->status}");
+        return $res;
+    };
+
+    http::Router $router = http::Router(mv $table);
+    function<http::Response(http::Request)> $app = http::chain($layers, function(http::Request $req) : http::Response {
+        return http::dispatch($router, $req);
+    });
+
+    http::Response $res = $app(requestFor('/nowhere'));
+
+    assert($res->status == 404, 'routing answered');
+    assert(($res->headers->get('X-Seen') ?? '') == '404', 'and the layer saw it on the way out');
+}
+
+#[group: "unit"]
+test no_layers_is_the_handler {
+    array<function<http::Response(http::Request, http::Next)>> $layers = array<function<http::Response(http::Request, http::Next)>>();
+
+    function<http::Response(http::Request)> $app = http::chain($layers, function(http::Request $req) : http::Response {
+        return http::Response(text: 'plain');
+    });
+
+    assert($app(requestFor('/'))->body == 'plain', 'nothing in between');
+}

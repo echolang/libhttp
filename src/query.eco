@@ -1,0 +1,180 @@
+/**
+ * Percent-decoding, and the key/value pairs a query string holds.
+ *
+ * A list, not a map: `?a=1&a=2` is two values. `+` is a space in a
+ * query, a plus in a path.
+ */
+
+namespace http;
+
+public struct Field
+{
+    public string $name;
+    public string $value;
+}
+
+public struct Query
+{
+    public array<Field> $pairs;
+
+    public constructor()
+    {
+        $this->pairs = array<Field>();
+    }
+
+    public function add(const string& $name, const string& $value) : void
+    {
+        $this->pairs[] = Field($name, $value);
+    }
+
+    public const function count() : usize
+    {
+        return $this->pairs->count();
+    }
+
+    public const function empty() : bool
+    {
+        return $this->pairs->empty();
+    }
+
+    /**
+     * The first value of this name, or nothing.
+     */
+    public const function get(const string& $name) : string?
+    {
+        usize $count = $this->pairs->count();
+        usize $i = 0;
+
+        while ($i < $count) {
+            if ($this->pairs[$i]->name == $name) {
+                string $value = $this->pairs[$i]->value;
+
+                return $value;
+            }
+
+            $i = $i + 1;
+        }
+
+        return null;
+    }
+}
+
+internal function hexValue(uint8 $b) : int32
+{
+    int32 $wide = $b;
+
+    if ($wide >= CH_ZERO) {
+        if ($wide <= CH_NINE) {
+            return $wide - CH_ZERO;
+        }
+    }
+
+    if ($wide >= CH_UPPER_A) {
+        if ($wide <= CH_UPPER_F) {
+            return $wide - CH_UPPER_A + 10;
+        }
+    }
+
+    if ($wide >= CH_LOWER_A) {
+        if ($wide <= CH_LOWER_F) {
+            return $wide - CH_LOWER_A + 10;
+        }
+    }
+
+    return -1;
+}
+
+/**
+ * Percent-decodes a query name or value, where `+` is a space.
+ */
+internal function unescape(const string& $text) : string
+{
+    return decode($text, true);
+}
+
+/**
+ * Percent-decodes one path segment, where `+` stays a plus.
+ */
+internal function unescape(path: const string& $text) : string
+{
+    return decode($text, false);
+}
+
+private function decode(const string& $text, bool $plusIsSpace) : string
+{
+    string $out = '';
+    usize $size = $text->size();
+
+    $out->reserve($size);
+
+    usize $i = 0;
+
+    while ($i < $size) {
+        uint8 $b = $text->byte($i);
+
+        if ($plusIsSpace && $b == CH_PLUS) {
+            $out->push(CH_SPACE);
+            $i = $i + 1;
+            continue;
+        }
+
+        if ($b != CH_PERCENT || $i + 2 >= $size) {
+            $out->push($b);
+            $i = $i + 1;
+            continue;
+        }
+
+        int32 $hi = hexValue($text->byte($i + 1));
+        int32 $lo = hexValue($text->byte($i + 2));
+
+        if ($hi < 0 || $lo < 0) {
+            $out->push($b);
+            $i = $i + 1;
+            continue;
+        }
+
+        uint8 $decoded = ($hi * 16 + $lo) as uint8;
+
+        $out->push($decoded);
+        $i = $i + 3;
+    }
+
+    return $out;
+}
+
+internal function parseQuery(const string& $raw) : Query
+{
+    Query $q = Query();
+
+    if ($raw->empty()) {
+        return $q;
+    }
+
+    str::parts $pairs = str::split($raw, '&');
+    usize $count = $pairs->count();
+    usize $i = 0;
+
+    while ($i < $count) {
+        $item = str::from($pairs->at($i));
+
+        $i = $i + 1;
+
+        if ($item->empty()) {
+            continue;
+        }
+
+        usize $eq = $item->find('=');
+
+        if ($eq >= $item->size()) {
+            $q->add(unescape($item), '');
+            continue;
+        }
+
+        $name = unescape($item->sub(0, $eq));
+        $value = unescape($item->sub($eq + 1, $item->size() - $eq - 1));
+
+        $q->add($name, $value);
+    }
+
+    return $q;
+}

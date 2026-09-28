@@ -1,0 +1,257 @@
+/**
+ * Chunked transfer coding, decoded as it arrives.
+ *
+ * `feed` is resumable: one pass over whatever has arrived. Framing is
+ * strict (CRLF, hex size). Trailers are checked, then dropped. Capped
+ * at maxBody.
+ */
+
+namespace http;
+
+internal const usize CHUNK_LINE_CAP = 1024;
+internal const usize CHUNK_SLACK = 65536;
+
+internal enum Chunking
+{
+    case needMore;
+    case done;
+    case fail(WireError $e);
+}
+
+internal enum ChunkState
+{
+    case size;
+    case data;
+    case dataEnd;
+    case trailers;
+}
+
+/**
+ * One state's answer: go on to the next state, or stop and tell the caller.
+ */
+internal enum Turn
+{
+    case next;
+    case stop(Chunking $c);
+}
+
+internal struct Dechunk
+{
+    public string $body;
+    private usize $cursor;
+    private ChunkState $state;
+    private uint64 $left;
+    private usize $wire;
+
+    /**
+     * A decoder whose first chunk starts at byte `$at` of the buffer.
+     */
+    public constructor(usize $at)
+    {
+        $this->body = '';
+        $this->cursor = $at;
+        $this->state = ChunkState::size;
+        $this->left = 0;
+        $this->wire = 0;
+    }
+
+    /**
+     * Decodes as far as `$buf` goes. On `done` the buffer holds only the bytes
+     * past the body; on `needMore` it holds only what is not decoded yet.
+     */
+    public function feed(string& $buf, usize $maxBody) : Chunking
+    {
+        Turn $t = Turn::next;
+        bool $going = true;
+
+        while ($going) {
+            ChunkState $at = $this->state;
+
+            $t = match ($at) {
+                ChunkState::size => $this->size($buf, $maxBody),
+                ChunkState::data => $this->data($buf),
+                ChunkState::dataEnd => $this->dataEnd($buf),
+                ChunkState::trailers => $this->trailers($buf),
+            };
+
+            $going = match ($t) {
+                Turn::next => true,
+                else => false,
+            };
+        }
+
+        Chunking $c = match ($t) {
+            Turn::stop($c) => $c,
+            else => Chunking::needMore,
+        };
+
+        bool $waiting = match ($c) {
+            Chunking::needMore => true,
+            else => false,
+        };
+
+        // what is decoded is in $body now: the wire bytes behind it can go
+        $this->wire = $this->wire + $this->cursor;
+        $buf = $buf->sub($this->cursor, $buf->size() - $this->cursor);
+        $this->cursor = 0;
+
+        if ($waiting && $this->wire + $buf->size() > $maxBody * 2 + CHUNK_SLACK) {
+            return .fail(.tooLarge);
+        }
+
+        return $c;
+    }
+
+    private function size(const string& $buf, usize $maxBody) : Turn
+    {
+        usize $lf = $buf->find('\n', $this->cursor);
+
+        if ($lf >= $buf->size()) {
+            if ($buf->size() - $this->cursor > CHUNK_LINE_CAP) {
+                return .stop(.fail(.badRequest));
+            }
+
+            return .stop(.needMore);
+        }
+
+        if ($lf == $this->cursor || $buf->byte($lf - 1) != CH_CR) {
+            return .stop(.fail(.badRequest));
+        }
+
+        usize $end = $lf - 1;
+
+        if ($end - $this->cursor > CHUNK_LINE_CAP) {
+            return .stop(.fail(.badRequest));
+        }
+
+        usize $i = $this->cursor;
+        usize $digits = 0;
+        uint64 $n = 0;
+
+        while ($i < $end) {
+            int32 $v = hexValue($buf->byte($i));
+
+            if ($v < 0) {
+                break;
+            }
+
+            if ($digits == 16) {
+                return .stop(.fail(.badRequest));
+            }
+
+            $n = $n * 16 + ($v as uint64);
+            $digits = $digits + 1;
+            $i = $i + 1;
+        }
+
+        if ($digits == 0) {
+            return .stop(.fail(.badRequest));
+        }
+
+        while ($i < $end && ($buf->byte($i) == CH_SPACE || $buf->byte($i) == CH_TAB)) {
+            $i = $i + 1;
+        }
+
+        if ($i < $end && $buf->byte($i) != CH_SEMI) {
+            return .stop(.fail(.badRequest));
+        }
+
+        // an extension is ignored, but it is still one line
+        while ($i < $end) {
+            if ($buf->byte($i) == CH_CR) {
+                return .stop(.fail(.badRequest));
+            }
+
+            $i = $i + 1;
+        }
+
+        $this->cursor = $lf + 1;
+
+        if ($n == 0) {
+            $this->state = ChunkState::trailers;
+            return .next;
+        }
+
+        if ($n > ($maxBody as uint64) || ($this->body->size() as uint64) + $n > ($maxBody as uint64)) {
+            return .stop(.fail(.tooLarge));
+        }
+
+        $this->left = $n;
+        $this->state = ChunkState::data;
+        return .next;
+    }
+
+    private function data(const string& $buf) : Turn
+    {
+        usize $avail = $buf->size() - $this->cursor;
+
+        if ($avail == 0) {
+            return .stop(.needMore);
+        }
+
+        usize $take = $avail;
+
+        if (($take as uint64) > $this->left) {
+            $take = $this->left as usize;
+        }
+
+        $this->body->append($buf->sub($this->cursor, $take));
+        $this->cursor = $this->cursor + $take;
+        $this->left = $this->left - ($take as uint64);
+
+        if ($this->left > 0) {
+            return .stop(.needMore);
+        }
+
+        $this->state = ChunkState::dataEnd;
+        return .next;
+    }
+
+    private function dataEnd(const string& $buf) : Turn
+    {
+        if ($buf->size() - $this->cursor < 2) {
+            return .stop(.needMore);
+        }
+
+        if ($buf->byte($this->cursor) != CH_CR || $buf->byte($this->cursor + 1) != CH_LF) {
+            return .stop(.fail(.badRequest));
+        }
+
+        $this->cursor = $this->cursor + 2;
+        $this->state = ChunkState::size;
+        return .next;
+    }
+
+    private function trailers(const string& $buf) : Turn
+    {
+        if ($buf->size() - $this->cursor < 2) {
+            return .stop(.needMore);
+        }
+
+        if ($buf->byte($this->cursor) == CH_CR && $buf->byte($this->cursor + 1) == CH_LF) {
+            $this->cursor = $this->cursor + 2;
+            return .stop(.done);
+        }
+
+        usize $at = $buf->find('\r\n\r\n', $this->cursor);
+
+        if ($at >= $buf->size()) {
+            if ($buf->size() - $this->cursor > HEADER_CAP) {
+                return .stop(.fail(.tooLarge));
+            }
+
+            return .stop(.needMore);
+        }
+
+        if ($at - $this->cursor > HEADER_CAP) {
+            return .stop(.fail(.tooLarge));
+        }
+
+        Headers $dropped = guard parseHeaderBlock($buf->sub($this->cursor, $at - $this->cursor)) else {
+            return .stop(.fail(.badRequest));
+        }
+
+        $this->cursor = $at + 4;
+        return .stop(.done);
+    }
+}

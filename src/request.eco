@@ -1,0 +1,70 @@
+/**
+ * One incoming request, as a value.
+ *
+ * Parsed once, handed to one handler by value. A class would be a
+ * refcount for nothing. `$params` is filled by the router, just before
+ * the handler runs.
+ */
+
+namespace http;
+
+public struct Request
+{
+    public Method $method;
+    public string $target;
+    public string $path;
+    public string $queryString;
+    public Query $query;
+    public string $version;
+    public Headers $headers;
+    public string $body;
+    public string $peer;
+    public map<string, string> $params;
+
+    public constructor(
+        Method $method,
+        const string& $target,
+        const string& $path,
+        const string& $queryString,
+        Query $query,
+        const string& $version,
+        Headers $headers,
+        const string& $body,
+        const string& $peer
+    )
+    {
+        $this->method = $method;
+        $this->target = $target;
+        $this->path = $path;
+        $this->queryString = $queryString;
+        $this->query = $query;
+        $this->version = $version;
+        $this->headers = $headers;
+        $this->body = $body;
+        $this->peer = $peer;
+        $this->params = map<string, string>();
+    }
+
+    /**
+     * The first header of this name, or nothing. Case-insensitive.
+     */
+    public const function header(const string& $name) : string?
+    {
+        return $this->headers->get($name);
+    }
+
+    /**
+     * A param captured from the matched route, or nothing. A `{name?}` the
+     * path left out is nothing; a `{name*}` is always there, `''` when the
+     * path ended at it.
+     */
+    public const function param(const string& $name) : string?
+    {
+        if (!$this->params->has($name)) {
+            return null;
+        }
+
+        return $this->params->get($name);
+    }
+
+}

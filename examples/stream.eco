@@ -1,0 +1,51 @@
+use http::{Server, Request, Response};
+use std::thread;
+use std::time;
+
+Server $app = Server();
+
+$app->wrap(function(Request $req, http::Next $next) : Response {
+    time::instant $start = time::instant::now();
+    Response $res = $next->run($req);
+
+    echo "{$req->method} {$req->path} {$res->status} {$start->elapsed()}";
+    return $res;
+});
+
+$app->get('/events', function(Request $req) : Response {
+    Response $res = Response(stream: function(http::Writer $w) : void {
+        int32 $tick = 0;
+
+        while ($w->open() && $tick < 5) {
+            $w->write("data: {$tick}\n\n");
+            $w->flush();
+            thread::sleep(1000);
+            $tick = $tick + 1;
+        }
+    });
+
+    $res->header('Content-Type', 'text/event-stream');
+    $res->header('Cache-Control', 'no-cache');
+    return $res;
+});
+
+$app->get('/count', function(Request $req) : Response {
+    return Response(stream: function(http::Writer $w) : void {
+        int32 $i = 0;
+
+        while ($i < 1000 && $w->open()) {
+            $w->write("{$i}\n");
+            $i = $i + 1;
+        }
+    });
+});
+
+$app->get('/readme', function(Request $req) : Response {
+    return Response(file: 'README.md');
+});
+
+echo 'listening on 127.0.0.1:8080';
+
+int32 $port = guard $app->listen('127.0.0.1', 8080) else ($e) {
+    die("listen failed: {$e}");
+}

@@ -1,0 +1,15 @@
+use http::{Server, Request, Response};
+
+Server $app = Server();
+
+$app->get('/', function(Request $req) : Response {
+    return Response(text: 'hello');
+});
+
+echo "listening on 127.0.0.1:8080 with {$app->workers()} workers";
+
+int32 $port = guard $app->listen('127.0.0.1', 8080) else ($e) {
+    die("listen failed: {$e}");
+}
+
+echo $port;

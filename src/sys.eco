@@ -1,0 +1,43 @@
+/**
+ * The C symbols in c/posix.c. One block: a C symbol may only appear
+ * once per module.
+ */
+
+namespace http;
+
+internal extern {
+    function http_listen(ptr<const uint8> $host, int32 $port) : int32;
+    function http_port(int32 $fd) : int32;
+    function http_pipe_open(ptr<int32> $rd, ptr<int32> $wr) : int32;
+    function http_wake(int32 $wr) : int32;
+    function http_drain(int32 $rd) : int32;
+    function http_accept_one(int32 $listenFd, ptr<uint8> $peer, int32 $peerLen) : int32;
+    function http_connect(ptr<const uint8> $host, int32 $port) : int32;
+    function http_recv(int32 $fd, ptr<uint8> $buf, usize $n) : isize;
+    function http_send(int32 $fd, ptr<const uint8> $buf, usize $n) : isize;
+    function http_recv_now(int32 $fd, ptr<uint8> $buf, usize $n) : isize;
+    function http_send_now(int32 $fd, ptr<const uint8> $buf, usize $n) : isize;
+    function http_ev_open() : int32;
+    function http_ev_arm(int32 $ev, int32 $fd, int32 $oneshot) : int32;
+    function http_ev_drop(int32 $ev, int32 $fd) : int32;
+    function http_ev_wait(int32 $ev, ptr<int32> $fds, int32 $max, int32 $ms) : int32;
+    function http_close(int32 $fd) : int32;
+    function http_finish(int32 $fd) : int32;
+    function http_is_fd_limit() : int32;
+    function http_is_badfd() : int32;
+    function http_errstr() : ptr<uint8>;
+}
+
+internal const isize RECV_AGAIN = -3;
+internal const int32 ACCEPT_AGAIN = -3;
+
+internal function lastError() : string
+{
+    $p = http_errstr();
+
+    if ($p:$ == null) {
+        return 'unknown';
+    }
+
+    return str::from($p);
+}

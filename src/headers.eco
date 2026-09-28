@@ -1,0 +1,217 @@
+/**
+ * Case-insensitive header list. Duplicates kept, arrival order.
+ *
+ * An array, not a map: HTTP repeats Set-Cookie, and lookup is
+ * case-insensitive.
+ */
+
+namespace http;
+
+public struct Header
+{
+    public string $name;
+    public string $value;
+}
+
+public struct Headers
+{
+    /**
+     * In arrival order, duplicates kept.
+     */
+    public array<Header> $items;
+
+    public constructor()
+    {
+        $this->items = array<Header>();
+    }
+
+    public const function count() : usize
+    {
+        return $this->items->count();
+    }
+
+    public const function empty() : bool
+    {
+        return $this->items->empty();
+    }
+
+    /**
+     * Appends, keeping any header of the same name that is already here.
+     */
+    public function add(const string& $name, const string& $value) : void
+    {
+        $this->items[] = Header($name, $value);
+    }
+
+    /**
+     * Replaces every header of this name, or appends when there is none.
+     */
+    public function set(const string& $name, const string& $value) : void
+    {
+        $this->remove($name);
+        $this->add($name, $value);
+    }
+
+    /**
+     * Drops every header of this name. Walked backwards so a remove does
+     * not skip the next one.
+     */
+    public function remove(const string& $name) : usize
+    {
+        usize $dropped = 0;
+        usize $i = $this->items->count();
+
+        while ($i > 0) {
+            $i = $i - 1;
+
+            if (str::iequals($this->items[$i]->name->view(), $name->view())) {
+                Header $gone = $this->items->remove($i);
+
+                $dropped = $dropped + 1;
+            }
+        }
+
+        return $dropped;
+    }
+
+    /**
+     * The first header of this name, or nothing. Case-insensitive, the way HTTP is.
+     */
+    public const function get(const string& $name) : string?
+    {
+        usize $count = $this->items->count();
+        usize $i = 0;
+
+        while ($i < $count) {
+            if (str::iequals($this->items[$i]->name->view(), $name->view())) {
+                string $value = $this->items[$i]->value;
+
+                return $value;
+            }
+
+            $i = $i + 1;
+        }
+
+        return null;
+    }
+
+    /**
+     * Every header of this name, in arrival order.
+     */
+    public const function all(const string& $name) : array<string>
+    {
+        array<string> $found = array<string>();
+        usize $count = $this->items->count();
+        usize $i = 0;
+
+        while ($i < $count) {
+            if (str::iequals($this->items[$i]->name->view(), $name->view())) {
+                $found[] = $this->items[$i]->value;
+            }
+
+            $i = $i + 1;
+        }
+
+        return $found;
+    }
+
+    public const function has(const string& $name) : bool
+    {
+        return $this->get($name) != null;
+    }
+
+    public function clear() : void
+    {
+        $this->items->clear();
+    }
+}
+
+/**
+ * A header name as it arrived before the colon. Empty, or holding a space or
+ * tab, is refused: `Host : x` is how one hop reads a header another skips.
+ */
+private function nameOk(const string& $name) : bool
+{
+    usize $n = $name->size();
+    usize $i = 0;
+
+    if ($n == 0) {
+        return false;
+    }
+
+    while ($i < $n) {
+        uint8 $b = $name->byte($i);
+
+        if ($b == CH_SPACE || $b == CH_TAB) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    return true;
+}
+
+/**
+ * Header lines from a request block. Folded continuations join onto the
+ * header above. A line with no colon is a 400, not something to guess.
+ */
+internal function parseHeaderBlock(const string& $raw) : result<Headers, WireError>
+{
+    Headers $out = Headers();
+    str::parts $lines = str::split($raw, '\n');
+    usize $count = $lines->count();
+
+    string $pendingName = '';
+    string $pendingValue = '';
+    bool $pending = false;
+    usize $i = 0;
+
+    while ($i < $count) {
+        $line = str::from(str::rtrim($lines->at($i)));
+
+        $i = $i + 1;
+
+        if ($line->empty()) {
+            continue;
+        }
+
+        uint8 $first = $line->byte(0);
+
+        if ($first == CH_SPACE || $first == CH_TAB) {
+            if ($pending) {
+                $folded = str::from(str::trim($line));
+
+                $pendingValue = "{$pendingValue} {$folded}";
+            }
+
+            continue;
+        }
+
+        if ($pending) {
+            $out->add($pendingName, $pendingValue);
+            $pending = false;
+        }
+
+        usize $at = $line->find(':');
+
+        if ($at >= $line->size()) {
+            return .error(.badRequest);
+        }
+
+        $pendingName = $line->sub(0, $at);
+
+        if (!nameOk($pendingName)) {
+            return .error(.badRequest);
+        }
+
+        $pendingValue = str::from(str::trim($line->sub($at + 1, $line->size() - $at - 1)));
+        $pending = true;
+    }
+
+    if ($pending) {
+        $out->add($pendingName, $pendingValue);
+    }
+
+    return .ok($out);
+}

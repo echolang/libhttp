@@ -1,0 +1,24 @@
+/**
+ * Header list: case-insensitive lookup, repeats kept.
+ */
+
+#[group: "unit"]
+test set_replaces_and_add_keeps {
+    http::Headers $h = http::Headers();
+
+    $h->add('X-A', '1');
+    $h->add('X-A', '2');
+    assert($h->all('x-a')->count() == 2, 'add keeps both');
+
+    $h->set('X-A', '3');
+    assert($h->all('x-a')->count() == 1, 'set leaves one');
+    assert(($h->get('x-a') ?? '') == '3', 'the new value');
+}
+
+#[group: "unit"]
+test missing_header_is_null {
+    http::Headers $h = http::Headers();
+
+    assert($h->get('Host') == null, 'nothing');
+    assert(!$h->has('Host'), 'has is false');
+}

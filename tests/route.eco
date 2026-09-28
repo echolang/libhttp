@@ -1,0 +1,415 @@
+/**
+ * Path matching, params, wildcards and constraints.
+ */
+
+internal function req(http::Method $method, const string& $path) : http::Request
+{
+    return http::Request($method, $path, $path, '', http::Query(), 'HTTP/1.1', http::Headers(), '', '');
+}
+
+internal function handler() : function<http::Response(http::Request)>
+{
+    return function(http::Request $req) : http::Response {
+        return http::Response(ok: 'x');
+    };
+}
+
+internal function find(const array<http::Route>& $table, http::Method $method, const string& $path) : usize?
+{
+    array<http::Route> $copy = $table;
+    http::Router $router = http::Router(mv $copy);
+
+    return $router->find($method, http::segments($path));
+}
+
+/**
+ * The request a handler would see: routed, params filled. A miss is a
+ * request with no params.
+ */
+internal function routed(const array<http::Route>& $table, http::Method $method, const string& $path) : http::Request
+{
+    array<http::Route> $copy = $table;
+    http::Router $router = http::Router(mv $copy);
+    array<string> $segs = http::segments($path);
+    http::Request $hit = req($method, $path);
+
+    usize $at = guard $router->find($method, $segs) else {
+        return $hit;
+    }
+
+    http::applyParams($hit, $router->routes[$at], $segs);
+    return $hit;
+}
+
+internal function allow(const array<http::Route>& $table, const string& $path) : string
+{
+    array<http::Route> $copy = $table;
+    http::Router $router = http::Router(mv $copy);
+
+    return $router->allow(http::segments($path));
+}
+
+internal function refused(const string& $pattern) : bool
+{
+    result<array<http::Part>, http::PatternError> $r = http::parsePattern($pattern);
+
+    guard $r else ($e) {
+        return true;
+    }
+
+    return false;
+}
+
+#[group: "unit"]
+test exact_path_match {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/hello', handler());
+
+    assert((find($table, http::Method::get, '/hello') ?? 99) == 0, 'hit');
+    assert(find($table, http::Method::get, '/other') == null, 'miss');
+}
+
+#[group: "unit"]
+test param_segment {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/users/{id}', handler());
+
+    assert((find($table, http::Method::get, '/users/7') ?? 99) == 0, 'one segment');
+    assert(find($table, http::Method::get, '/users/7/edit') == null, 'too many segments');
+    assert((routed($table, http::Method::get, '/users/7')->param('id') ?? '') == '7', 'captured');
+}
+
+#[group: "unit"]
+test empty_segment_is_not_a_param {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/users/{id}', handler());
+
+    assert(find($table, http::Method::get, '/users/') == null, 'an empty id is no id');
+}
+
+#[group: "unit"]
+test params_are_percent_decoded {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/files/{name}', handler());
+
+    assert((find($table, http::Method::get, '/files/a%20b+c%2Fd') ?? 99) == 0, 'encoded slash stays in one segment');
+    assert((routed($table, http::Method::get, '/files/a%20b+c%2Fd')->param('name') ?? '') == 'a b+c/d', 'decoded, plus kept');
+}
+
+#[group: "unit"]
+test segments_split_then_decode {
+    array<string> $segs = http::segments('/a/b%20c//d/');
+
+    assert($segs->count() == 5, 'empty segments count');
+    assert($segs[0] == 'a', 'plain');
+    assert($segs[1] == 'b c', 'decoded');
+    assert($segs[2]->empty(), 'double slash');
+    assert($segs[3] == 'd', 'after the gap');
+    assert($segs[4]->empty(), 'trailing slash');
+    assert(http::segments('/')->count() == 0, 'root has none');
+    assert(http::segments('')->count() == 0, 'empty has none');
+}
+
+#[group: "unit"]
+test long_paths_route_and_join {
+    string $path = '';
+    int32 $i = 0;
+
+    while ($i < 40) {
+        $path->append("/s{$i}");
+        $i = $i + 1;
+    }
+
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/s0/{rest*}', handler());
+
+    assert(http::segments($path)->count() == 40, 'forty');
+    assert((routed($table, http::Method::get, $path)->param('rest') ?? '')->size() == $path->size() - 4, 'rest spans them all');
+}
+
+#[group: "unit"]
+test literal_segment_matches_decoded {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/café', handler());
+
+    assert((find($table, http::Method::get, '/caf%C3%A9') ?? 99) == 0, 'percent-encoded utf-8');
+}
+
+#[group: "unit"]
+test first_match_wins {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/users/{id}', handler());
+    $table[] = http::Route(http::Method::get, '/users/me', handler());
+
+    assert((find($table, http::Method::get, '/users/me') ?? 99) == 0, 'the param route was registered first');
+}
+
+#[group: "unit"]
+test head_falls_back_to_get {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/hello', handler());
+
+    assert((find($table, http::Method::head, '/hello') ?? 99) == 0, 'GET serves HEAD');
+}
+
+#[group: "unit"]
+test head_route_beats_an_earlier_get {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/hello', handler());
+    $table[] = http::Route(http::Method::get, '/other', handler());
+    $table[] = http::Route(http::Method::head, '/hello', handler());
+
+    assert((find($table, http::Method::head, '/hello') ?? 99) == 2, 'a HEAD route is not a fallback');
+    assert((find($table, http::Method::head, '/other') ?? 99) == 1, 'the GET is');
+}
+
+#[group: "unit"]
+test other_named_like_a_verb_is_that_verb {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::other('GET'), '/hello', handler());
+
+    assert((find($table, http::Method::get, '/hello') ?? 99) == 0, 'same spelling, same method');
+    assert(find($table, http::Method::post, '/hello') == null, 'different verb');
+}
+
+#[group: "unit"]
+test unnamed_verbs_compare_by_spelling {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::other('MOVE'), '/file', handler());
+    $table[] = http::Route(http::Method::other('COPY'), '/file', handler());
+
+    assert((find($table, http::Method::other('COPY'), '/file') ?? 99) == 1, 'COPY is not MOVE');
+    assert(find($table, http::Method::other('LOCK'), '/file') == null, 'nor LOCK');
+}
+
+#[group: "unit"]
+test method_mismatch_is_not_a_path_miss {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/hello', handler());
+
+    assert(find($table, http::Method::post, '/hello') == null, 'no POST route');
+    assert(allow($table, '/hello') == 'GET, HEAD', 'Allow lists GET and HEAD');
+    assert(allow($table, '/missing')->empty(), 'unknown path has no Allow');
+}
+
+#[group: "unit"]
+test root_path {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/', handler());
+
+    assert((find($table, http::Method::get, '/') ?? 99) == 0, 'root');
+}
+
+#[group: "unit"]
+test rest_matches_zero_or_more {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/files/{path*}', handler());
+
+    assert((find($table, http::Method::get, '/files') ?? 99) == 0, 'none');
+    assert((find($table, http::Method::get, '/files/a') ?? 99) == 0, 'one');
+    assert((find($table, http::Method::get, '/files/a/b/c') ?? 99) == 0, 'three');
+    assert(find($table, http::Method::get, '/other/a') == null, 'the prefix still has to match');
+
+    assert((routed($table, http::Method::get, '/files')->param('path') ?? 'unset') == '', 'set, and empty');
+    assert((routed($table, http::Method::get, '/files/a')->param('path') ?? '') == 'a', 'one segment');
+    assert((routed($table, http::Method::get, '/files/a/b/c')->param('path') ?? '') == 'a/b/c', 'joined');
+}
+
+#[group: "unit"]
+test rest_at_root {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/{path*}', handler());
+
+    assert((find($table, http::Method::get, '/') ?? 99) == 0, 'root');
+    assert((routed($table, http::Method::get, '/')->param('path') ?? 'unset') == '', 'nothing left');
+    assert((routed($table, http::Method::get, '/x/y')->param('path') ?? '') == 'x/y', 'everything');
+}
+
+#[group: "unit"]
+test rest_is_decoded_and_keeps_trailing_slash {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/files/{path*}', handler());
+
+    assert((routed($table, http::Method::get, '/files/a%20b/')->param('path') ?? '') == 'a b/', 'decoded, slash kept');
+    assert((routed($table, http::Method::get, '/files/a//b')->param('path') ?? '') == 'a//b', 'empty segment kept');
+}
+
+#[group: "unit"]
+test optional_present_and_absent {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/users/{id?}', handler());
+
+    assert((find($table, http::Method::get, '/users') ?? 99) == 0, 'absent');
+    assert((find($table, http::Method::get, '/users/7') ?? 99) == 0, 'present');
+    assert(find($table, http::Method::get, '/users/') == null, 'an empty segment is not an absent one');
+    assert(find($table, http::Method::get, '/users/7/edit') == null, 'one at most');
+
+    assert(routed($table, http::Method::get, '/users')->param('id') == null, 'unset when absent');
+    assert((routed($table, http::Method::get, '/users/7')->param('id') ?? '') == '7', 'captured');
+}
+
+#[group: "unit"]
+test number_constraint {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/users/{id:number}', handler());
+    $table[] = http::Route(http::Method::get, '/users/me', handler());
+
+    assert((find($table, http::Method::get, '/users/42') ?? 99) == 0, 'digits');
+    assert((find($table, http::Method::get, '/users/me') ?? 99) == 1, 'the literal gets its turn');
+    assert(find($table, http::Method::get, '/users/4x2') == null, 'one bad byte');
+    assert(find($table, http::Method::get, '/users/-1') == null, 'no sign');
+    assert((routed($table, http::Method::get, '/users/42')->param('id') ?? '') == '42', 'captured');
+}
+
+#[group: "unit"]
+test alpha_and_alphanum {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/a/{x:alpha}', handler());
+    $table[] = http::Route(http::Method::get, '/n/{x:alphanum}', handler());
+
+    assert((find($table, http::Method::get, '/a/HelloWorld') ?? 99) == 0, 'letters');
+    assert(find($table, http::Method::get, '/a/hello1') == null, 'a digit is not a letter');
+    assert(find($table, http::Method::get, '/a/caf%C3%A9') == null, 'ascii only');
+    assert((find($table, http::Method::get, '/n/abc123') ?? 99) == 1, 'letters and digits');
+    assert(find($table, http::Method::get, '/n/abc-123') == null, 'no dash');
+}
+
+#[group: "unit"]
+test uuid_constraint {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/o/{id:uuid}', handler());
+
+    assert((find($table, http::Method::get, '/o/123e4567-e89b-12d3-a456-426614174000') ?? 99) == 0, 'lowercase');
+    assert((find($table, http::Method::get, '/o/123E4567-E89B-12D3-A456-426614174000') ?? 99) == 0, 'uppercase');
+    assert(find($table, http::Method::get, '/o/123e4567-e89b-12d3-a456-42661417400g') == null, 'one bad byte');
+    assert(find($table, http::Method::get, '/o/123e4567e89b-12d3-a456-4266141740000') == null, 'dash moved');
+    assert(find($table, http::Method::get, '/o/123e4567-e89b-12d3-a456-42661417400') == null, 'short');
+}
+
+#[group: "unit"]
+test ulid_constraint {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/o/{id:ulid}', handler());
+
+    assert((find($table, http::Method::get, '/o/01ARZ3NDEKTSV4RRFFQ69G5FAV') ?? 99) == 0, 'uppercase');
+    assert((find($table, http::Method::get, '/o/01arz3ndektsv4rrffq69g5fav') ?? 99) == 0, 'lowercase');
+    assert(find($table, http::Method::get, '/o/81ARZ3NDEKTSV4RRFFQ69G5FAV') == null, 'first digit past 7');
+    assert(find($table, http::Method::get, '/o/01ARZ3NDEKTSV4RRFFQ69G5FAU') == null, 'U is not crockford');
+    assert(find($table, http::Method::get, '/o/01ARZ3NDEKTSV4RRFFQ69G5FA') == null, 'short');
+}
+
+#[group: "unit"]
+test one_of_constraint {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/posts/{state:draft|live}', handler());
+
+    assert((find($table, http::Method::get, '/posts/draft') ?? 99) == 0, 'first');
+    assert((find($table, http::Method::get, '/posts/live') ?? 99) == 0, 'second');
+    assert(find($table, http::Method::get, '/posts/liv') == null, 'a prefix is not a choice');
+    assert(find($table, http::Method::get, '/posts/Draft') == null, 'case-sensitive');
+}
+
+#[group: "unit"]
+test optional_with_constraint {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/list/{page?:number}', handler());
+
+    assert((find($table, http::Method::get, '/list') ?? 99) == 0, 'absent');
+    assert((find($table, http::Method::get, '/list/3') ?? 99) == 0, 'a number');
+    assert(find($table, http::Method::get, '/list/three') == null, 'not a number');
+}
+
+#[group: "unit"]
+test order_is_registration_order_across_buckets {
+    array<http::Route> $early = array<http::Route>();
+
+    $early[] = http::Route(http::Method::get, '/a/{rest*}', handler());
+    $early[] = http::Route(http::Method::get, '/a/b', handler());
+
+    assert((find($early, http::Method::get, '/a/b') ?? 99) == 0, 'an earlier catch-all wins');
+
+    array<http::Route> $late = array<http::Route>();
+
+    $late[] = http::Route(http::Method::get, '/x', handler());
+    $late[] = http::Route(http::Method::get, '/a/b', handler());
+    $late[] = http::Route(http::Method::get, '/a/{id?}', handler());
+    $late[] = http::Route(http::Method::get, '/{rest*}', handler());
+
+    assert((find($late, http::Method::get, '/a/b') ?? 99) == 1, 'the exact route came first');
+    assert((find($late, http::Method::get, '/a/c') ?? 99) == 2, 'then the optional');
+    assert((find($late, http::Method::get, '/a') ?? 99) == 2, 'the optional without its segment');
+    assert((find($late, http::Method::get, '/a/b/c') ?? 99) == 3, 'then the catch-all');
+    assert((find($late, http::Method::get, '/') ?? 99) == 3, 'root falls through too');
+}
+
+#[group: "unit"]
+test head_falls_back_through_a_wildcard {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/files/{path*}', handler());
+    $table[] = http::Route(http::Method::head, '/files/special', handler());
+
+    assert((find($table, http::Method::head, '/files/a/b') ?? 99) == 0, 'GET serves HEAD');
+    assert((find($table, http::Method::head, '/files/special') ?? 99) == 1, 'the HEAD route wins');
+}
+
+#[group: "unit"]
+test allow_sees_wildcards {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/files/{path*}', handler());
+    $table[] = http::Route(http::Method::put, '/files/{name}', handler());
+    $table[] = http::Route(http::Method::delete, '/files/{id:number}', handler());
+
+    assert(allow($table, '/files/a/b') == 'GET, HEAD', 'only the catch-all takes two');
+    assert(allow($table, '/files/a') == 'GET, PUT, HEAD', 'both take one');
+    assert(allow($table, '/files/7') == 'GET, PUT, DELETE, HEAD', 'a number passes all three');
+}
+
+#[group: "unit"]
+test bad_patterns_are_refused {
+    assert(refused('/a/{rest*}/b'), 'a catch-all has to be last');
+    assert(refused('/a/{id?}/b'), 'so does an optional');
+    assert(refused('/a/{?}'), 'no name, optional');
+    assert(refused('/a/{:number}'), 'no name, checked');
+    assert(refused('/a/{id}/{id}'), 'named twice');
+    assert(refused('/a/{id:numbr}'), 'a typo is not a one-of');
+    assert(refused('/a/{id:}'), 'an empty kind');
+    assert(refused('/a/{rest*:number}'), 'a catch-all has no one segment');
+    assert(refused('/a/{x:a||b}'), 'an empty choice');
+    assert(refused('/a/{x:a|}'), 'a trailing empty choice');
+
+    assert(!refused('/a/{id}/{page?:number}'), 'fine');
+    assert(!refused('/a/{x:a|b}/{rest*}'), 'also fine');
+    assert(!refused('/a/{id'), 'an unclosed brace is a literal');
+    assert(!refused('/a/{}'), 'so are empty braces: too short to be a param');
+}
+
+#[group: "unit"]
+#[tests: expects death]
+test registering_a_bad_pattern_dies {
+    http::Route $r = http::Route(http::Method::get, '/a/{rest*}/b', handler());
+}

@@ -1,0 +1,642 @@
+/**
+ * HTTP/1.1 request bytes into a Request.
+ *
+ * `Framer` holds unread bytes and is advanced as they arrive, so the
+ * reactor never waits on a client. `parse` is the same Framer with no
+ * socket, for tests. Bytes past one request stay in the buffer: they
+ * are the next one on a kept connection.
+ */
+
+use std::time;
+
+namespace http;
+
+/**
+ * What one connection may cost the server. Snapshotted from the Server at
+ * `listen`. The defaults are the Server's defaults.
+ */
+internal struct Limits
+{
+    public usize $maxBody = DEFAULT_BODY_CAP;
+    public time::duration $headerTimeout = time::duration::secs(HEADER_TIMEOUT_SECS);
+    public time::duration $bodyTimeout = time::duration::secs(BODY_TIMEOUT_SECS);
+    public time::duration $idleTimeout = time::duration::secs(IDLE_TIMEOUT_SECS);
+    public int32 $maxRequests = DEFAULT_MAX_REQUESTS;
+}
+
+internal struct HeadEnd
+{
+    public usize $at;
+    public usize $sep;
+}
+
+/**
+ * Where the head stops: the earliest blank line, CRLF or bare LF. Earliest,
+ * because a bare LF head followed by a body holding CRLF CRLF must not end at
+ * the body's.
+ */
+internal function findHeadEnd(const string& $raw) : HeadEnd?
+{
+    usize $crlf = $raw->find('\r\n\r\n');
+    usize $lf = $raw->find('\n\n');
+
+    if ($lf < $crlf) {
+        return HeadEnd($lf, 2);
+    }
+
+    if ($crlf < $raw->size()) {
+        return HeadEnd($crlf, 4);
+    }
+
+    return null;
+}
+
+internal function checkVersion(const string& $version) : status<WireError>
+{
+    if ($version == 'HTTP/1.0' || $version == 'HTTP/1.1') {
+        return .ok();
+    }
+
+    if ($version->starts('HTTP/')) {
+        return .error(.unsupportedVersion);
+    }
+
+    return .error(.badRequest);
+}
+
+internal function hostOk(const string& $version, const Headers& $headers) : bool
+{
+    if ($version != 'HTTP/1.1') {
+        return true;
+    }
+
+    return $headers->all('Host')->count() == 1;
+}
+
+/**
+ * ASCII digits and nothing else. `str::int` takes a sign, and a
+ * Content-Length may not have one.
+ */
+private function digitsOnly(const string& $s) : bool
+{
+    usize $n = $s->size();
+    usize $i = 0;
+
+    if ($n == 0) {
+        return false;
+    }
+
+    while ($i < $n) {
+        uint8 $b = $s->byte($i);
+
+        if ($b < CH_ZERO || $b > CH_NINE) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    return true;
+}
+
+/**
+ * How the request says its body ends: a length, or the chunked coding.
+ */
+internal enum Framing
+{
+    case length(usize $n);
+    case chunked;
+}
+
+/**
+ * The body framing the headers declare. Transfer-Encoding plus
+ * Content-Length is a 400: two hops could each believe a different one.
+ * Only `chunked`, last, once. Anything else is 501. HTTP/1.0 has no TE.
+ */
+internal function framing(const Request& $req) : result<Framing, WireError>
+{
+    array<string> $tes = $req->headers->all('Transfer-Encoding');
+
+    if ($tes->count() == 0) {
+        usize $n = guard bodyLength($req->headers) else ($e) {
+            return .error($e);
+        }
+
+        return .ok(.length($n));
+    }
+
+    if ($req->version != 'HTTP/1.1' || $req->headers->has('Content-Length')) {
+        return .error(.badRequest);
+    }
+
+    string $chunked = 'chunked';
+    usize $codings = 0;
+    usize $chunkedAt = 0;
+    usize $chunkedSeen = 0;
+    usize $i = 0;
+
+    while ($i < $tes->count()) {
+        str::parts $parts = str::split($tes[$i], ',');
+        usize $pn = $parts->count();
+        usize $pi = 0;
+
+        while ($pi < $pn) {
+            string::view $coding = str::trim($parts->at($pi));
+
+            $pi = $pi + 1;
+
+            // an empty list element is allowed and means nothing
+            if ($coding->size == 0) {
+                continue;
+            }
+
+            $codings = $codings + 1;
+
+            if (!str::iequals($coding, $chunked->view())) {
+                return .error(.unsupportedCoding);
+            }
+
+            $chunkedSeen = $chunkedSeen + 1;
+            $chunkedAt = $codings;
+        }
+
+        $i = $i + 1;
+    }
+
+    if ($codings == 0 || $chunkedSeen != 1 || $chunkedAt != $codings) {
+        return .error(.badRequest);
+    }
+
+    return .ok(.chunked);
+}
+
+/**
+ * The Content-Length of a request with no Transfer-Encoding, or 0.
+ */
+internal function bodyLength(const Headers& $headers) : result<usize, WireError>
+{
+    array<string> $cls = $headers->all('Content-Length');
+    usize $n = $cls->count();
+
+    if ($n == 0) {
+        return .ok(0);
+    }
+
+    bool $have = false;
+    int64 $agreed = 0;
+    usize $i = 0;
+
+    while ($i < $n) {
+        str::parts $parts = str::split($cls[$i], ',');
+        usize $pn = $parts->count();
+        usize $pi = 0;
+
+        while ($pi < $pn) {
+            $piece = str::from(str::trim($parts->at($pi)));
+
+            $pi = $pi + 1;
+
+            if (!digitsOnly($piece)) {
+                return .error(.badRequest);
+            }
+
+            int64 $v = guard str::int($piece) else {
+                return .error(.badRequest);
+            }
+
+            if (!$have) {
+                $agreed = $v;
+                $have = true;
+            } else if ($agreed != $v) {
+                return .error(.badRequest);
+            }
+        }
+
+        $i = $i + 1;
+    }
+
+    if (!$have) {
+        return .error(.badRequest);
+    }
+
+    return .ok($agreed as usize);
+}
+
+/**
+ * Whether the client is waiting for a 100 before it sends the body. HTTP/1.0
+ * has no 100, so its Expect is ignored. `100-continue` is the one expectation
+ * this server meets; anything else is 417.
+ */
+internal function expectation(const Request& $req) : result<bool, WireError>
+{
+    if ($req->version != 'HTTP/1.1') {
+        return .ok(false);
+    }
+
+    array<string> $all = $req->headers->all('Expect');
+    usize $n = $all->count();
+
+    if ($n == 0) {
+        return .ok(false);
+    }
+
+    string $want = '100-continue';
+    usize $i = 0;
+
+    while ($i < $n) {
+        if (!str::iequals(str::trim($all[$i]), $want->view())) {
+            return .error(.expectationFailed);
+        }
+
+        $i = $i + 1;
+    }
+
+    return .ok(true);
+}
+
+/**
+ * The request line and headers, without the blank line that ends them. The
+ * answer is a Request with an empty body; the caller knows where the body is.
+ */
+internal function parseHead(const string& $head) : result<Request, WireError>
+{
+    usize $lineEnd = $head->find('\r\n');
+    usize $skip = 2;
+
+    if ($lineEnd >= $head->size()) {
+        $lineEnd = $head->find('\n');
+        $skip = 1;
+    }
+
+    if ($lineEnd >= $head->size()) {
+        $lineEnd = $head->size();
+        $skip = 0;
+    }
+
+    $line = $head->sub(0, $lineEnd);
+    string $headerBlock = '';
+
+    if ($skip > 0 && $lineEnd + $skip < $head->size()) {
+        $headerBlock = $head->sub($lineEnd + $skip, $head->size() - $lineEnd - $skip);
+    }
+
+    usize $sp1 = $line->find(' ');
+
+    if ($sp1 >= $line->size()) {
+        return .error(.badRequest);
+    }
+
+    usize $sp2 = $line->find(' ', $sp1 + 1);
+
+    if ($sp2 >= $line->size()) {
+        return .error(.badRequest);
+    }
+
+    $methodRaw = $line->sub(0, $sp1);
+    $target = $line->sub($sp1 + 1, $sp2 - $sp1 - 1);
+    $version = str::from(str::trim($line->sub($sp2 + 1, $line->size() - $sp2 - 1)));
+
+    if ($methodRaw->empty() || $target->empty()) {
+        return .error(.badRequest);
+    }
+
+    guard checkVersion($version) else ($e) {
+        return .error($e);
+    }
+
+    string $path = $target;
+    string $qs = '';
+    usize $qat = $target->find('?');
+
+    if ($qat < $target->size()) {
+        $path = $target->sub(0, $qat);
+        $qs = $target->sub($qat + 1, $target->size() - $qat - 1);
+    }
+
+    if ($path->empty()) {
+        $path = '/';
+    }
+
+    Headers $headers = guard parseHeaderBlock($headerBlock) else ($e) {
+        return .error($e);
+    }
+
+    if (!hostOk($version, $headers)) {
+        return .error(.badRequest);
+    }
+
+    Request $req = Request(
+        methodOf($methodRaw),
+        $target,
+        $path,
+        $qs,
+        parseQuery($qs),
+        $version,
+        $headers,
+        '',
+        ''
+    );
+
+    return .ok($req);
+}
+
+/**
+ * Whether the client wants the connection kept after this request. HTTP/1.1
+ * keeps it unless `Connection` says `close`. HTTP/1.0 drops it unless
+ * `Connection` says `keep-alive`.
+ */
+internal function persistent(const Request& $req) : bool
+{
+    if ($req->version == 'HTTP/1.1') {
+        return !hasToken($req->headers, 'Connection', 'close');
+    }
+
+    return hasToken($req->headers, 'Connection', 'keep-alive');
+}
+
+/**
+ * Whether any header of this name lists `$token` among its comma-separated
+ * values. Case-insensitive, both the name and the token.
+ */
+internal function hasToken(const Headers& $headers, const string& $name, const string& $token) : bool
+{
+    array<string> $all = $headers->all($name);
+    usize $n = $all->count();
+    usize $i = 0;
+
+    while ($i < $n) {
+        str::parts $parts = str::split($all[$i], ',');
+        usize $pn = $parts->count();
+        usize $pi = 0;
+
+        while ($pi < $pn) {
+            if (str::iequals(str::trim($parts->at($pi)), $token->view())) {
+                return true;
+            }
+
+            $pi = $pi + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    return false;
+}
+
+internal enum Phase
+{
+    case idle;
+    case head;
+    case body;
+    case chunked;
+}
+
+/**
+ * What one `advance` found. `sendContinue` asks the caller to send the
+ * interim 100 and advance again.
+ */
+internal enum Step
+{
+    case needMore;
+    case sendContinue;
+    case ready(Request $req);
+    case fail(WireError $e);
+}
+
+/**
+ * Which deadline a connection has run past. `idle` closes without an answer;
+ * `timeout` is a 408.
+ */
+internal enum Expiry
+{
+    case none;
+    case idle;
+    case timeout;
+}
+
+/**
+ * One connection's request in progress. The caller appends to `$buffer`
+ * and calls `advance`. Nothing here touches a socket.
+ */
+internal struct Framer
+{
+    public string $buffer;
+    private Phase $phase = Phase::idle;
+    private Request? $pending = null;
+    private usize $bodyAt = 0;
+    private usize $need = 0;
+    private Dechunk $chunks = Dechunk(0);
+    private time::instant $since = time::instant::now();
+
+    public constructor()
+    {
+        $this->buffer = '';
+    }
+
+    /**
+     * A Framer that starts from bytes a previous request left behind.
+     */
+    public constructor(const string& $rest)
+    {
+        $this->buffer = $rest;
+    }
+
+    public function advance(const Limits& $limits) : Step
+    {
+        Phase $at = $this->phase;
+
+        return match ($at) {
+            Phase::idle => $this->start($limits),
+            Phase::head => $this->head($limits),
+            Phase::body => $this->body(),
+            Phase::chunked => $this->chunkedBody($limits),
+        };
+    }
+
+    /**
+     * Which deadline, if any, this connection is past. The clock is the one
+     * for the phase it is in.
+     */
+    public const function expired(const Limits& $limits) : Expiry
+    {
+        time::duration $age = $this->since->elapsed();
+        Phase $at = $this->phase;
+        time::duration $cap = match ($at) {
+            Phase::idle => $limits->idleTimeout,
+            Phase::head => $limits->headerTimeout,
+            else => $limits->bodyTimeout,
+        };
+
+        if ($age < $cap) {
+            return .none;
+        }
+
+        return match ($at) {
+            Phase::idle => Expiry::idle,
+            else => Expiry::timeout,
+        };
+    }
+
+    private function start(const Limits& $limits) : Step
+    {
+        if ($this->buffer->empty()) {
+            return .needMore;
+        }
+
+        $this->phase = Phase::head;
+        $this->since = time::instant::now();
+        return $this->head($limits);
+    }
+
+    private function head(const Limits& $limits) : Step
+    {
+        HeadEnd $end = guard findHeadEnd($this->buffer) else {
+            if ($this->buffer->size() >= HEADER_CAP) {
+                return .fail(.tooLarge);
+            }
+
+            return .needMore;
+        }
+
+        if ($end->at + $end->sep > HEADER_CAP) {
+            return .fail(.tooLarge);
+        }
+
+        // head problems answer before a byte of body is read
+        Request $req = guard parseHead($this->buffer->sub(0, $end->at)) else ($e) {
+            return .fail($e);
+        }
+
+        Framing $framing = guard framing($req) else ($e) {
+            return .fail($e);
+        }
+
+        bool $wantsContinue = guard expectation($req) else ($e) {
+            return .fail($e);
+        }
+
+        $this->bodyAt = $end->at + $end->sep;
+
+        bool $isChunked = match ($framing) {
+            Framing::chunked => true,
+            else => false,
+        };
+
+        if ($isChunked) {
+            $this->chunks = Dechunk($this->bodyAt);
+            $this->pending = $req;
+            $this->phase = Phase::chunked;
+            $this->since = time::instant::now();
+
+            if ($wantsContinue && $this->buffer->size() == $this->bodyAt) {
+                return .sendContinue;
+            }
+
+            return $this->chunkedBody($limits);
+        }
+
+        usize $need = match ($framing) {
+            Framing::length($n) => $n,
+            else => 0,
+        };
+
+        // a 413 is the answer to an Expect as well, so this comes before the 100
+        if ($need > $limits->maxBody) {
+            return .fail(.tooLarge);
+        }
+
+        $this->need = $need;
+        $this->pending = $req;
+        $this->phase = Phase::body;
+        $this->since = time::instant::now();
+
+        usize $want = $this->bodyAt + $need;
+
+        if ($this->buffer->size() < $want) {
+            $this->buffer->reserve($want);
+
+            if ($wantsContinue && $need > 0) {
+                return .sendContinue;
+            }
+        }
+
+        return $this->body();
+    }
+
+    private function body() : Step
+    {
+        usize $want = $this->bodyAt + $this->need;
+
+        if ($this->buffer->size() < $want) {
+            return .needMore;
+        }
+
+        Request $req = guard $this->pending else {
+            return .fail(.badRequest);
+        }
+
+        $req->body = $this->buffer->sub($this->bodyAt, $this->need);
+        $this->buffer = $this->buffer->sub($want, $this->buffer->size() - $want);
+        $this->pending = null;
+        $this->phase = Phase::idle;
+        $this->since = time::instant::now();
+        return .ready($req);
+    }
+
+    private function chunkedBody(const Limits& $limits) : Step
+    {
+        Chunking $c = $this->chunks->feed($this->buffer, $limits->maxBody);
+
+        match ($c) {
+            Chunking::needMore => {
+                return .needMore;
+            },
+            Chunking::fail($e) => {
+                return .fail($e);
+            },
+            Chunking::done => {
+            },
+        }
+
+        Request $req = guard $this->pending else {
+            return .fail(.badRequest);
+        }
+
+        $req->body = $this->chunks->body;
+        $this->chunks = Dechunk(0);
+        $this->pending = null;
+        $this->phase = Phase::idle;
+        $this->since = time::instant::now();
+        return .ready($req);
+    }
+}
+
+internal function parse(const string& $raw) : result<Request, WireError>
+{
+    Framer $f = Framer($raw);
+    Limits $limits = Limits();
+
+    $limits->maxBody = std::math::MAX_USIZE;
+
+    Step $s = $f->advance($limits);
+    bool $again = match ($s) {
+        Step::sendContinue => true,
+        else => false,
+    };
+
+    if ($again) {
+        $s = $f->advance($limits);
+    }
+
+    match ($s) {
+        Step::ready($req) => {
+            return .ok($req);
+        },
+        Step::fail($e) => {
+            return .error($e);
+        },
+        else => {
+            return .error(.badRequest);
+        },
+    }
+}

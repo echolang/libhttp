@@ -1,0 +1,179 @@
+/**
+ * The body of a streamed response, written while the stream callback runs.
+ *
+ * `write` buffers 4 KiB; `flush` sends now. HTTP/1.1 with no length is
+ * chunked. `open()` is false once the client is gone or the server is
+ * stopping. Keep no copy of the Writer past the callback.
+ */
+
+namespace http;
+
+internal const usize STREAM_BUF = 4096;
+
+internal enum Mode
+{
+    case chunked;
+    case raw;
+    case sized;
+}
+
+public class Writer
+{
+    private Conn $conn;
+    private Shared $shared;
+    private Mode $mode;
+    private string $buf;
+    private bool $ok;
+    private bool $done;
+
+    // a sized stream's declared length, and how much of it has been written
+    private uint64 $length;
+    private uint64 $written;
+
+    internal constructor(Conn $conn, Shared $shared, Mode $mode, uint64 $length)
+    {
+        $this->conn = $conn;
+        $this->shared = $shared;
+        $this->mode = $mode;
+        $this->buf = '';
+        $this->ok = true;
+        $this->done = false;
+        $this->length = $length;
+        $this->written = 0;
+    }
+
+    /**
+     * Queues `$bytes`, sending once the buffer fills. False when nothing more
+     * will reach the client: it is gone, or a sized stream is already at its
+     * length, in which case the bytes past it are dropped.
+     */
+    public function write(const string& $bytes) : bool
+    {
+        if (!$this->ok || $this->done) {
+            return false;
+        }
+
+        if ($bytes->empty()) {
+            return true;
+        }
+
+        bool $sized = match ($this->mode) {
+            Mode::sized => true,
+            else => false,
+        };
+
+        string $take = $bytes;
+        bool $clipped = false;
+
+        if ($sized) {
+            uint64 $room = $this->length - $this->written;
+
+            if (($take->size() as uint64) > $room) {
+                $take = $take->sub(0, $room as usize);
+                $clipped = true;
+            }
+        }
+
+        $this->written = $this->written + ($take->size() as uint64);
+
+        if ($this->buf->size() + $take->size() < STREAM_BUF) {
+            $this->buf->append($take);
+            return !$clipped;
+        }
+
+        // big enough to go on its own: no copy into the buffer first
+        if (!$this->flush()) {
+            return false;
+        }
+
+        if (!$this->send($take)) {
+            return false;
+        }
+
+        return !$clipped;
+    }
+
+    /**
+     * Sends whatever `write` has buffered. False when the client is gone.
+     */
+    public function flush() : bool
+    {
+        if (!$this->ok) {
+            return false;
+        }
+
+        if ($this->buf->empty()) {
+            return true;
+        }
+
+        string $out = $this->buf;
+
+        $this->buf = '';
+        return $this->send($out);
+    }
+
+    /**
+     * Whether writing still reaches anyone: the client is there and the
+     * server is not stopping.
+     */
+    public const function open() : bool
+    {
+        return $this->ok && !$this->done && !$this->shared->stopping->load();
+    }
+
+    /**
+     * Ends the body once the callback has returned: flushes, writes the last
+     * chunk, and answers whether the response went out whole. A sized stream
+     * that fell short did not, and its connection cannot be kept.
+     */
+    internal function finish() : bool
+    {
+        if ($this->done) {
+            return $this->ok;
+        }
+
+        bool $flushed = $this->flush();
+
+        $this->done = true;
+
+        if (!$flushed) {
+            return false;
+        }
+
+        return match ($this->mode) {
+            Mode::chunked => $this->sendRaw('0\r\n\r\n'),
+            Mode::sized => $this->written == $this->length,
+            Mode::raw => true,
+        };
+    }
+
+    private function send(const string& $bytes) : bool
+    {
+        bool $chunked = match ($this->mode) {
+            Mode::chunked => true,
+            else => false,
+        };
+
+        if (!$chunked) {
+            return $this->sendRaw($bytes);
+        }
+
+        usize $n = $bytes->size();
+        string $frame = '';
+
+        $frame->reserve($n + 24);
+        $frame->append("{$n:x}\r\n");
+        $frame->append($bytes);
+        $frame->append('\r\n');
+        return $this->sendRaw($frame);
+    }
+
+    private function sendRaw(const string& $bytes) : bool
+    {
+        if (!$this->conn->writeAll($bytes)) {
+            $this->ok = false;
+        }
+
+        return $this->ok;
+    }
+}

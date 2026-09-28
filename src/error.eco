@@ -1,0 +1,88 @@
+/**
+ * Why the server did not start, or why a loopback connect failed.
+ *
+ * A malformed client request is not this type: that is a 400 on that
+ * connection. `"{$e}"` is the sentence.
+ */
+
+namespace http;
+
+public enum Error
+{
+    case bind(string $message);
+    case accept(string $message);
+    case connect(string $message);
+    case closed;
+    case badPort;
+    case tooFewWorkers;
+    case spawn(string $message);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            Error::bind($m) => $m,
+            Error::accept($m) => $m,
+            Error::connect($m) => $m,
+            Error::closed => 'server closed',
+            Error::badPort => 'port must be 0..65535',
+            Error::tooFewWorkers => 'need at least one worker',
+            Error::spawn($m) => $m,
+        };
+    }
+}
+
+/**
+ * Why a connection's bytes were not a request. Internal: the worker turns
+ * these into status codes, they never cross `listen`.
+ */
+internal enum WireError
+{
+    case closed;
+    case badRequest;
+    case tooLarge;
+    case timeout;
+
+    /**
+     * A Transfer-Encoding this server does not decode: anything but
+     * `chunked`. 501, the answer the spec gives for a coding it does not know.
+     */
+    case unsupportedCoding;
+
+    /**
+     * An `HTTP/x.y` that is not 1.0 or 1.1. 505. A version line that is not
+     * `HTTP/` at all is a badRequest.
+     */
+    case unsupportedVersion;
+
+    /**
+     * An `Expect` this server cannot meet, which is anything but
+     * `100-continue`. 417.
+     */
+    case expectationFailed;
+
+    internal const function status() : int32
+    {
+        return match ($this) {
+            WireError::closed => 400,
+            WireError::badRequest => 400,
+            WireError::tooLarge => 413,
+            WireError::timeout => 408,
+            WireError::unsupportedCoding => 501,
+            WireError::unsupportedVersion => 505,
+            WireError::expectationFailed => 417,
+        };
+    }
+
+    internal const function body() : string
+    {
+        return match ($this) {
+            WireError::closed => 'Bad Request',
+            WireError::badRequest => 'Bad Request',
+            WireError::tooLarge => 'Payload Too Large',
+            WireError::timeout => 'Request Timeout',
+            WireError::unsupportedCoding => 'Not Implemented',
+            WireError::unsupportedVersion => 'HTTP Version Not Supported',
+            WireError::expectationFailed => 'Expectation Failed',
+        };
+    }
+}

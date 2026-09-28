@@ -1,0 +1,20 @@
+/*
+ * libhttp: an HTTP/1.1 server for Echo.
+ *
+ * Sockets are C. Parsing, routing, and the worker pool are Echo.
+ * No libcurl, no TLS.
+ */
+
+#[module: "libhttp"]
+#[version: "0.2.0"]
+#[epm::license: "MIT"]
+#[epm::description: "an http/1.1 server for echolang"]
+
+#[if: os != windows]
+#[cc: sources "c/posix.c"]
+#[end]
+#[sources: "src/*.eco"]
+
+#[target: test] {
+    #[sources: "tests/*.eco"]
+}

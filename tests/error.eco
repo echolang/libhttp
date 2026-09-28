@@ -1,0 +1,42 @@
+/**
+ * Error as an enum: a named case, interpolation.
+ */
+
+internal function isBind(const http::Error& $e) : bool
+{
+    return match ($e) {
+        http::Error::bind($m) => true,
+        else => false,
+    };
+}
+
+#[group: "unit"]
+test error_sentence {
+    http::Error $e = http::Error::badPort;
+
+    assert($e->message() == 'port must be 0..65535', 'sentence');
+    assert("{$e}" == 'port must be 0..65535', 'str::from');
+}
+
+#[group: "unit"]
+test bind_carries_the_message {
+    http::Error $e = http::Error::bind('address already in use');
+
+    assert(isBind($e), 'case');
+    assert($e->message() == 'address already in use', 'payload');
+}
+
+#[group: "unit"]
+test workers_zero_refuses_listen {
+    http::Server $app = http::Server();
+
+    $app->workers(0);
+
+    result<int32, http::Error> $r = $app->listen('127.0.0.1', 0);
+
+    assert($r->failed(), 'refused');
+
+    http::Error $e = $r->failure();
+
+    assert($e->message() == 'need at least one worker', 'sentence');
+}

@@ -1,0 +1,38 @@
+use http::{Server, Request, Response};
+
+Server $app = Server();
+
+$app->get('/users/{id:number}', function(Request $req) : Response {
+    string $id = $req->param('id') ?? '';
+
+    return Response(text: "user {$id}");
+});
+
+$app->get('/users/me', function(Request $req) : Response {
+    return Response(text: 'you');
+});
+
+$app->get('/posts/{page?:number}', function(Request $req) : Response {
+    string $page = $req->param('page') ?? '1';
+
+    return Response(text: "page {$page}");
+});
+
+$app->post('/echo', function(Request $req) : Response {
+    return Response(ok: $req->body);
+});
+
+// last, so every route above gets its turn first
+$app->get('/{path*}', function(Request $req) : Response {
+    string $path = $req->param('path') ?? '';
+
+    return Response(404, "nothing at /{$path}");
+});
+
+echo 'listening on 127.0.0.1:8080';
+
+int32 $port = guard $app->listen('127.0.0.1', 8080) else ($e) {
+    die("listen failed: {$e}");
+}
+
+echo $port;

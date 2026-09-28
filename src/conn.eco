@@ -1,0 +1,132 @@
+/**
+ * An owned socket. Closes on drop.
+ *
+ * A class so `result<Conn, Error>` can hand one back without a move.
+ */
+
+namespace http;
+
+internal class Conn
+{
+    private int32 $fd;
+
+    public constructor(int32 $fd)
+    {
+        $this->fd = $fd;
+    }
+
+    destructor()
+    {
+        if ($this->fd >= 0) {
+            http_close($this->fd);
+            $this->fd = -1;
+        }
+    }
+
+    internal static function dial(const string& $host, int32 $port) : result<Conn, Error>
+    {
+        $name = cstrOf($host);
+        int32 $fd = http_connect($name->cstr(), $port);
+
+        if ($fd < 0) {
+            return .error(.connect(lastError()));
+        }
+
+        return .ok(Conn($fd));
+    }
+
+    /**
+     * Hands the fd to someone else. This Conn no longer closes it.
+     */
+    internal function release() : int32
+    {
+        int32 $fd = $this->fd;
+
+        $this->fd = -1;
+        return $fd;
+    }
+
+    /**
+     * Ends the connection with a lingering close: the write side shuts, what
+     * the client is still sending is drained for a moment, then the fd closes.
+     * The response survives a client that had more to say.
+     */
+    internal function finish() : void
+    {
+        if ($this->fd >= 0) {
+            http_finish($this->fd);
+            $this->fd = -1;
+        }
+    }
+
+    internal function recv(ptr<uint8> $buf, usize $n) : isize
+    {
+        if ($this->fd < 0) {
+            return -1;
+        }
+
+        return http_recv($this->fd, $buf, $n);
+    }
+
+    internal function send(ptr<const uint8> $buf, usize $n) : isize
+    {
+        if ($this->fd < 0) {
+            return -1;
+        }
+
+        return http_send($this->fd, $buf, $n);
+    }
+
+    internal function writeAll(const string& $bytes) : bool
+    {
+        usize $off = 0;
+        usize $n = $bytes->size();
+        $p = $bytes->data();
+
+        while ($off < $n) {
+            isize $put = $this->send($p:$ + $off, $n - $off);
+
+            if ($put <= 0) {
+                return false;
+            }
+
+            $off = $off + ($put as usize);
+        }
+
+        return true;
+    }
+
+    internal function readAll(usize $cap) : string
+    {
+        string $out = '';
+
+        $out->reserve($cap);
+
+        while ($out->size() < $cap) {
+            if ($out->room() == 0) {
+                $out->reserve($out->size() + 4096);
+            }
+
+            usize $room = $out->room();
+            ptr<uint8> $dst = $out->spare();
+            isize $got = $this->recv($dst, $room);
+
+            if ($got <= 0) {
+                return $out;
+            }
+
+            $out->commit($got as usize);
+        }
+
+        return $out;
+    }
+}
+
+internal function cstrOf(const string& $s) : string
+{
+    if ($s->terminated()) {
+        return $s;
+    }
+
+    return $s->clone();
+}
