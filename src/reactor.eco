@@ -5,6 +5,10 @@
  * half-read connection. A whole request goes to a worker. Everything
  * else costs a slot in the map. The reactor never waits on a client.
  *
+ * So do connections a worker has answered for the last time: their write
+ * side is shut, and what the client still sends is read and dropped until
+ * it hangs up, so the answer is never lost to a reset.
+ *
  * Open websockets live here too, in their own map. Their bytes are decoded
  * as they arrive, and a whole message, a ping, a close, or a broken frame
  * goes to a worker the same way a request does. A pong only resets the
@@ -36,6 +40,16 @@ internal struct Slot
     public int32 $served;
 }
 
+/**
+ * A connection in its lingering close: since when, and how much has been
+ * dropped.
+ */
+internal struct Linger
+{
+    public time::instant $since;
+    public int64 $drained;
+}
+
 internal class Reactor
 {
     private int32 $ev;
@@ -54,6 +68,7 @@ internal class Reactor
 
     private map<int32, Slot> $slots;
     private map<int32, WsConn> $sockets;
+    private map<int32, Linger> $lingering;
     private time::instant $swept;
 
     // out of descriptors: the listen socket is disarmed until PAUSE_MS passes
@@ -85,6 +100,7 @@ internal class Reactor
         $this->back = $back;
         $this->slots = map<int32, Slot>();
         $this->sockets = map<int32, WsConn>();
+        $this->lingering = map<int32, Linger>();
         $this->swept = time::instant::now();
         $this->paused = false;
         $this->pausedAt = time::instant::now();
@@ -106,7 +122,7 @@ internal class Reactor
             int32 $wait = -1;
 
             // deadlines need a sweep even when nothing is readable
-            if (!$this->slots->empty() || !$this->sockets->empty() || $this->paused) {
+            if (!$this->slots->empty() || !$this->sockets->empty() || !$this->lingering->empty() || $this->paused) {
                 $wait = SWEEP_MS;
             }
 
@@ -177,6 +193,16 @@ internal class Reactor
 
         while ($i < $n) {
             $this->hand($open[$i], WsEvent::goingAway);
+            $i = $i + 1;
+        }
+
+        array<int32> $closing = $this->lingering->keys();
+
+        $n = $closing->count();
+        $i = 0;
+
+        while ($i < $n) {
+            $this->unlinger($closing[$i]);
             $i = $i + 1;
         }
     }
@@ -252,6 +278,8 @@ internal class Reactor
         if (!$this->slots->has($fd)) {
             if ($this->sockets->has($fd)) {
                 $this->socketReadable($fd);
+            } else if ($this->lingering->has($fd)) {
+                $this->lingerReadable($fd);
             }
 
             return;
@@ -310,7 +338,7 @@ internal class Reactor
                 Step::fail($e) => {
                     Slot $gone = $this->slots->take($fd);
 
-                    $this->jobs->send(Job::fail($fd, $e));
+                    $this->jobs->send(Job::fail($fd, $this->home, $e));
                 },
             }
         }
@@ -330,6 +358,13 @@ internal class Reactor
                         Back::socket($ws) => {
                             $this->adoptSocket($ws);
                         },
+                        Back::linger($fd) => {
+                            $this->lingering[$fd] = Linger(time::instant::now(), 0);
+
+                            if (http_ev_arm($this->ev, $fd, 1) != 0) {
+                                $this->unlinger($fd);
+                            }
+                        },
                     }
                 },
                 else => {
@@ -337,6 +372,39 @@ internal class Reactor
                 },
             }
         }
+    }
+
+    /**
+     * Drops what a lingering connection sent. It closes once the client
+     * hangs up, or once it has sent more than a client with nothing left to
+     * say would.
+     */
+    private function lingerReadable(int32 $fd) : void
+    {
+        int64 $got = http_drain_now($fd);
+
+        if ($got < 0) {
+            $this->unlinger($fd);
+            return;
+        }
+
+        Linger& $l = $this->lingering->at($fd);
+
+        $l->drained = $l->drained + $got;
+
+        if ($l->drained > LINGER_CAP || http_ev_arm($this->ev, $fd, 1) != 0) {
+            $this->unlinger($fd);
+        }
+    }
+
+    private function unlinger(int32 $fd) : void
+    {
+        if (!$this->lingering->remove($fd)) {
+            return;
+        }
+
+        http_close($fd);
+        $this->shared->live->sub(1);
     }
 
     private function adopt(Parked $parked) : void
@@ -488,8 +556,23 @@ internal class Reactor
 
                     // armed while it was waiting: it must not report to the reactor on a worker
                     http_ev_drop($this->ev, $fd);
-                    $this->jobs->send(Job::fail($fd, .timeout));
+                    $this->jobs->send(Job::fail($fd, $this->home, .timeout));
                 },
+            }
+        }
+
+        array<int32> $closing = $this->lingering->keys();
+
+        $n = $closing->count();
+        $i = 0;
+
+        while ($i < $n) {
+            int32 $fd = $closing[$i];
+
+            $i = $i + 1;
+
+            if ($this->lingering->at($fd)->since->elapsed() >= time::duration::millis(LINGER_MS)) {
+                $this->unlinger($fd);
             }
         }
 
@@ -521,8 +604,8 @@ internal class Reactor
     }
 
     /**
-     * A plain close: the reactor never lingers. Closing also takes the fd
-     * out of the readiness set.
+     * A plain close, for a connection with no answer owed: nothing to
+     * linger for. Closing also takes the fd out of the readiness set.
      */
     private function drop(int32 $fd) : void
     {
@@ -549,6 +632,10 @@ internal function drainReturned(thread::receiver<Back> $back, Shared $shared) : 
                 match ($returned) {
                     Back::kept($parked) => {
                         http_close($parked->fd);
+                        $shared->live->sub(1);
+                    },
+                    Back::linger($fd) => {
+                        http_close($fd);
                         $shared->live->sub(1);
                     },
                     Back::socket($ws) => {

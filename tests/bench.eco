@@ -1,5 +1,5 @@
 /**
- * Router throughput. Not a correctness test: it asserts nothing, since a
+ * Router and byte-scan throughput. Not a correctness test: it asserts nothing, since a
  * release build drops `assert`. Compiled only with the `bench` flag:
  *
  *     echoc test --release --optimize whole --define bench --filter group:bench --verbose
@@ -143,6 +143,95 @@ test router_throughput {
     benchShape($table, 'catch-all 4      GET /assets/img/icons/x/logo.svg', http::Method::get, '/assets/img/icons/x/logo.svg');
     benchShape($table, 'miss 404         GET /nope/nothing/here', http::Method::get, '/nope/nothing/here');
     benchShape($table, 'miss 405         POST /api/v1/tags', http::Method::post, '/api/v1/tags');
+}
+
+internal const usize SCAN_ROUNDS = 20000;
+internal const usize SCAN_SIZE = 65536;
+
+/**
+ * `$size` bytes of `$unit` over and over, cut to the exact length.
+ */
+internal function benchFill(const string& $unit, usize $size) : string
+{
+    string $out = '';
+
+    $out->reserve($size + $unit->size());
+
+    while ($out->size() < $size) {
+        $out->append($unit);
+    }
+
+    return $out->sub(0, $size);
+}
+
+/**
+ * Nanoseconds per call of `$work`, after a warmup, printed with its label.
+ */
+internal function benchScan(const string& $label, usize $rounds, function<usize()> $work) : void
+{
+    usize $sink = 0;
+    usize $i = 0;
+
+    while ($i < $rounds / 10) {
+        $sink = $sink + $work();
+        $i = $i + 1;
+    }
+
+    time::instant $start = time::instant::now();
+
+    $i = 0;
+
+    while ($i < $rounds) {
+        $sink = $sink + $work();
+        $i = $i + 1;
+    }
+
+    int64 $ns = $start->elapsed()->as_nanos();
+    int64 $per = $ns / ($rounds as int64);
+
+    echo "{$label}: {$per} ns/op  (sink {$sink})";
+}
+
+#[group: "bench"]
+test scan_throughput {
+    $ascii = benchFill('the quick brown fox jumps over the lazy dog. ', SCAN_SIZE);
+    $mixed = benchFill('grüße aus zürich, ça va? 日本語 ', SCAN_SIZE);
+    $json = benchFill('{"user":"zoë","text":"see you at the café around eight, bring the maps"},', SCAN_SIZE);
+    $body = benchFill('x', 4096);
+    $head = "POST /api/v1/users/42/posts HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15\r\nAccept: application/json, text/plain, */*\r\nAccept-Language: de-CH,de;q=0.9,en;q=0.8\r\nAccept-Encoding: gzip, deflate, br\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nCookie: session=0123456789abcdef0123456789abcdef; theme=dark\r\nConnection: keep-alive\r\n\r\n{$body}";
+    $partial = $head->sub(0, 380);
+
+    benchScan('unmask 64 KiB           ', SCAN_ROUNDS, function() : usize {
+        return http::unmask($ascii, 0x37FA213D)->size();
+    });
+
+    benchScan('utf8Valid 64 KiB ascii  ', SCAN_ROUNDS, function() : usize {
+        return http::utf8Valid($ascii) as usize;
+    });
+
+    benchScan('utf8Valid 64 KiB mixed  ', SCAN_ROUNDS, function() : usize {
+        return http::utf8Valid($mixed) as usize;
+    });
+
+    benchScan('utf8Valid 64 KiB json   ', SCAN_ROUNDS, function() : usize {
+        return http::utf8Valid($json) as usize;
+    });
+
+    benchScan('findHeadEnd head + body ', BENCH_ROUNDS, function() : usize {
+        http::HeadEnd $end = guard http::findHeadEnd($head) else {
+            return 0;
+        }
+
+        return $end->at;
+    });
+
+    benchScan('findHeadEnd partial head', BENCH_ROUNDS, function() : usize {
+        http::HeadEnd $end = guard http::findHeadEnd($partial) else {
+            return 1;
+        }
+
+        return $end->at;
+    });
 }
 
 #[end]

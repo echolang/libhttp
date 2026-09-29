@@ -107,3 +107,51 @@ test utf8_refuses_malformed {
     assert(!http::utf8Valid(bytes([0xE2, 0x82])), 'cut short');
     assert(!http::utf8Valid(bytes([0xE2, 0x28, 0xA1])), 'bad continuation');
 }
+
+/**
+ * `$count` bytes of `a`, the ASCII the fast path skips sixteen at a time.
+ */
+internal function pad(usize $count) : string
+{
+    string $out = '';
+    usize $i = 0;
+
+    while ($i < $count) {
+        $out->push(97 as uint8);
+        $i = $i + 1;
+    }
+
+    return $out;
+}
+
+#[group: "unit"]
+test utf8_across_block_edges {
+    array<int32> $offsets = [0, 1, 13, 14, 15, 16, 17, 31, 32, 33];
+    usize $k = 0;
+
+    while ($k < $offsets->count()) {
+        usize $at = $offsets[$k] as usize;
+        string $euro = bytes([0xE2, 0x82, 0xAC]);
+        string $emoji = bytes([0xF0, 0x9F, 0x98, 0x80]);
+        string $lone = bytes([0x80]);
+        string $cut = bytes([0xE2, 0x82]);
+        string $before = pad($at);
+        string $after = pad(20);
+
+        assert(http::utf8Valid("{$before}{$euro}{$after}"), 'three bytes');
+        assert(http::utf8Valid("{$before}{$emoji}{$after}"), 'four bytes');
+        assert(!http::utf8Valid("{$before}{$lone}{$after}"), 'lone continuation');
+        assert(!http::utf8Valid("{$before}{$cut}"), 'cut short at the end');
+        assert(!http::utf8Valid("{$before}{$cut}{$after}"), 'cut short by ascii');
+        $k = $k + 1;
+    }
+
+    assert(http::utf8Valid(pad(15)), '15 ascii');
+    assert(http::utf8Valid(pad(16)), '16 ascii');
+    assert(http::utf8Valid(pad(17)), '17 ascii');
+    assert(http::utf8Valid(pad(32)), '32 ascii');
+    string $bad = pad(47);
+
+    $bad->push(0xFF as uint8);
+    assert(!http::utf8Valid($bad), 'bad lead as the 48th byte');
+}

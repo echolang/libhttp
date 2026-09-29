@@ -563,3 +563,283 @@ test chunked_expect_asks_for_the_100 {
 
     assert($wantsContinue, 'no body bytes yet: the 100 comes first');
 }
+
+internal function headAt(const string& $raw) : usize
+{
+    http::HeadEnd $end = guard http::findHeadEnd($raw) else {
+        return $raw->size();
+    }
+
+    return $end->at;
+}
+
+internal function sepAt(const string& $raw) : usize
+{
+    http::HeadEnd $end = guard http::findHeadEnd($raw) else {
+        return 0;
+    }
+
+    return $end->sep;
+}
+
+#[group: "unit"]
+test head_end_across_block_edges {
+    usize $lead = 0;
+
+    while ($lead < 40) {
+        string $head = '';
+        usize $i = 0;
+
+        while ($i < $lead) {
+            $head->push(97 as uint8);
+            $i = $i + 1;
+        }
+
+        string $crlf = "{$head}\r\n\r\nbody\n\n";
+        string $lf = "{$head}\n\nbody\r\n\r\n";
+        string $mixed = "{$head}\r\n\nbody";
+
+        assert(headAt($crlf) == $lead && sepAt($crlf) == 4, 'crlf');
+        assert(headAt($lf) == $lead && sepAt($lf) == 2, 'lf');
+        assert(headAt($mixed) == $lead + 1 && sepAt($mixed) == 2, 'cr lf lf');
+        assert(headAt("{$head}\r\n\r") == $lead + 3, 'cut short');
+        assert(headAt("{$head}\n\r\n") == $lead + 3, 'lf cr lf is no blank line');
+        $lead = $lead + 1;
+    }
+
+    assert(headAt('') == 0, 'empty');
+    assert(headAt("\n\n") == 0, 'blank line first');
+    assert(headAt("\r\n\r\n") == 0, 'crlf blank line first');
+}
+
+// the status a parse failed with, or 0 when it parsed
+internal function parseStatus(const string& $raw) : int32
+{
+    result<http::Request, http::WireError> $r = http::parse($raw);
+
+    if (!$r->failed()) {
+        return 0;
+    }
+
+    return $r->failure()->status();
+}
+
+#[group: "unit"]
+test host_must_be_there_once {
+    int32 $two = parseStatus("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n");
+    int32 $empty = parseStatus("GET / HTTP/1.1\r\nHost:\r\n\r\n");
+
+    assert($two == 400, 'two Host headers');
+    assert($empty == 0, 'an empty Host is allowed');
+}
+
+#[group: "unit"]
+test content_length_edges {
+    int32 $huge = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999\r\n\r\n");
+    int32 $empty = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length:\r\n\r\n");
+    int32 $trailing = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5,\r\n\r\nhello");
+    int32 $space = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5 5\r\n\r\nhello");
+    http::Request $zero = mustParse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+
+    assert($huge == 400, 'a length past int64');
+    assert($empty == 400, 'an empty length');
+    assert($trailing == 400, 'an empty list element');
+    assert($space == 400, 'two numbers without a comma');
+    assert($zero->body->empty(), 'zero is an empty body');
+}
+
+#[group: "unit"]
+test blank_lines_before_the_request_line_are_ignored {
+    http::Request $crlf = mustParse("\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    http::Request $lf = mustParse("\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    // a stray CRLF after a body, then the next request on the same connection
+    $f->buffer->append("POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    http::Step $first = $f->advance($limits);
+    http::Step $second = $f->advance($limits);
+    http::Request $next = guard $f->request() else {
+        die('no second request');
+    }
+
+    assert($crlf->path == '/a', 'CRLF lines before');
+    assert($lf->path == '/b', 'a bare LF before');
+    assert(isReady($first) && isReady($second), 'both requests');
+    assert($next->path == '/next', 'the stray CRLF is not the next request line');
+}
+
+#[group: "unit"]
+test blank_lines_alone_stay_idle {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $limits->idleTimeout = std::time::duration::zero();
+    $f->buffer->append("\r\n\r\n");
+
+    http::Step $s = $f->advance($limits);
+    bool $idle = match ($f->expired($limits)) {
+        http::Expiry::idle => true,
+        else => false,
+    };
+
+    assert(isNeedMore($s), 'nothing to parse yet');
+    assert($idle, 'still idle, so it closes quietly');
+    assert($f->buffer->empty(), 'the empty lines are gone');
+}
+
+#[group: "unit"]
+test malformed_request_lines {
+    assert(parseStatus("GET  / HTTP/1.1\r\nHost: x\r\n\r\n") == 400, 'two spaces');
+    assert(parseStatus("GET /\r\nHost: x\r\n\r\n") == 400, 'no version');
+    assert(parseStatus(" / HTTP/1.1\r\nHost: x\r\n\r\n") == 400, 'no method');
+    assert(parseStatus("GET / http/1.1\r\nHost: x\r\n\r\n") == 400, 'the version is case-sensitive');
+}
+
+#[group: "unit"]
+test transfer_coding_lists {
+    int32 $twice = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n");
+    int32 $notLast = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n");
+    int32 $emptyFirst = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: , chunked\r\n\r\n0\r\n\r\n");
+    int32 $blank = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding:\r\n\r\n");
+    int32 $teFirst = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n");
+
+    assert($twice == 400, 'chunked twice in one header');
+    assert($notLast == 501, 'a coding this server does not know');
+    assert($emptyFirst == 0, 'an empty element means nothing');
+    assert($blank == 400, 'a Transfer-Encoding naming no coding');
+    assert($teFirst == 400, 'TE and CL in either order');
+}
+
+#[group: "unit"]
+test every_expectation_must_be_100_continue {
+    int32 $mixed = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nExpect: 200-ok\r\nContent-Length: 0\r\n\r\n");
+    int32 $listed = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue, foo\r\nContent-Length: 0\r\n\r\n");
+
+    assert($mixed == 417, 'two Expect headers, one unmet');
+    assert($listed == 417, 'an Expect list is not 100-continue');
+}
+
+// whether one advance over `$raw` asked for the 100
+internal function asksContinue(const string& $raw) : bool
+{
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $f->buffer->append($raw);
+
+    return match ($f->advance($limits)) {
+        http::Step::sendContinue => true,
+        else => false,
+    };
+}
+
+#[group: "unit"]
+test no_100_when_nothing_is_waited_for {
+    bool $empty = asksContinue("POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n");
+    bool $sent = asksContinue("POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
+    bool $waiting = asksContinue("POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n");
+
+    assert(!$empty, 'no body to wait for');
+    assert(!$sent, 'the body is already here');
+    assert($waiting, 'the body is not');
+}
+
+#[group: "unit"]
+test framer_refuses_a_long_body_before_it_arrives {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $limits->maxBody = 4;
+    $f->buffer->append("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n");
+
+    assert(stepStatus($f->advance($limits)) == 413, 'a 413 instead of the 100');
+}
+
+// a head of exactly `$size` bytes, blank line included
+internal function headOf(usize $size) : string
+{
+    string $head = 'GET / HTTP/1.1\r\nHost: x\r\nX-Pad: ';
+
+    while ($head->size() + 4 < $size) {
+        $head->append('a');
+    }
+
+    $head->append('\r\n\r\n');
+    return $head;
+}
+
+#[group: "unit"]
+test head_cap_boundary {
+    string $at = headOf(8192);
+    string $over = headOf(8193);
+
+    assert($at->size() == 8192 && $over->size() == 8193, 'sizes');
+    assert(parseStatus($at) == 0, 'a head of exactly 8 KiB');
+    assert(parseStatus($over) == 413, 'one byte more');
+}
+
+#[group: "unit"]
+test body_phase_has_its_own_clock {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $limits->headerTimeout = std::time::duration::secs(60);
+    $limits->bodyTimeout = std::time::duration::zero();
+
+    bool $before = $f->request() == null;
+
+    $f->buffer->append("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhe");
+
+    http::Step $s = $f->advance($limits);
+    bool $timedOut = match ($f->expired($limits)) {
+        http::Expiry::timeout => true,
+        else => false,
+    };
+
+    assert($before, 'no request before the first ready');
+    assert(isNeedMore($s), 'the body is short');
+    assert($timedOut, 'the body clock ran out: a 408');
+}
+
+#[group: "unit"]
+test announced_body_does_not_reserve_it {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $limits->maxBody = 1073741824;
+    $f->buffer->append("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1073741824\r\n\r\n");
+
+    http::Step $s = $f->advance($limits);
+    usize $reserved = $f->buffer->capacity();
+
+    // the body comes in; the buffer grows with it
+    string $kib = '';
+
+    while ($kib->size() < 1024) {
+        $kib->append('0123456789abcdef');
+    }
+
+    int32 $i = 0;
+
+    while ($i < 512) {
+        $f->buffer->append($kib);
+        $i = $i + 1;
+    }
+
+    http::Step $more = $f->advance($limits);
+
+    assert(isNeedMore($s) && isNeedMore($more), 'waiting for the body');
+    assert($reserved < 1048576, 'a gigabyte announced is not a gigabyte reserved');
+    assert($f->buffer->capacity() < 4194304, 'room grows with what arrived');
+}
+
+#[group: "unit"]
+test announced_body_near_the_top_is_safe {
+    // parse() takes any length; a length near int64's top must not reserve it
+    int32 $s = parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 9223372036854775807\r\n\r\nhi");
+
+    assert($s == 400, 'a body that stops short');
+}

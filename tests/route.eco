@@ -413,3 +413,81 @@ test bad_patterns_are_refused {
 test registering_a_bad_pattern_dies {
     http::Route $r = http::Route(http::Method::get, '/a/{rest*}/b', handler());
 }
+
+// which way a pattern was refused, or 'ok'
+internal function refusalOf(const string& $pattern) : string
+{
+    result<array<http::Part>, http::PatternError> $r = http::parsePattern($pattern);
+
+    guard $r else ($e) {
+        return match ($e) {
+            http::PatternError::misplaced($n) => "misplaced {$n}",
+            http::PatternError::emptyName => 'emptyName',
+            http::PatternError::duplicate($n) => "duplicate {$n}",
+            http::PatternError::unknownKind($k) => "unknownKind {$k}",
+            http::PatternError::checkedRest($n) => "checkedRest {$n}",
+            http::PatternError::emptyChoice($n) => "emptyChoice {$n}",
+        };
+    }
+
+    return 'ok';
+}
+
+#[group: "unit"]
+test pattern_refusals_say_why {
+    assert(refusalOf('/a/{rest*}/b') == 'misplaced rest', 'catch-all not last');
+    assert(refusalOf('/a/{id?}/b') == 'misplaced id', 'optional not last');
+    assert(refusalOf('/a/{?}') == 'emptyName', 'no name');
+    assert(refusalOf('/a/{id}/{id}') == 'duplicate id', 'twice');
+    assert(refusalOf('/a/{id}/{id*}') == 'duplicate id', 'twice, as a catch-all');
+    assert(refusalOf('/a/{id:numbr}') == 'unknownKind numbr', 'typo');
+    assert(refusalOf('/a/{rest*:number}') == 'checkedRest rest', 'checked catch-all');
+    assert(refusalOf('/a/{x:a||b}') == 'emptyChoice x', 'empty choice');
+}
+
+#[group: "unit"]
+test empty_router_finds_nothing {
+    array<http::Route> $table = array<http::Route>();
+
+    assert(find($table, http::Method::get, '/') == null, 'no route');
+    assert(allow($table, '/') == '', 'no methods');
+}
+
+#[group: "unit"]
+test allow_lists_each_method_once {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/x', handler());
+    $table[] = http::Route(http::Method::head, '/x', handler());
+    $table[] = http::Route(http::Method::other('GET'), '/x', handler());
+    $table[] = http::Route(http::Method::other('PROPFIND'), '/x', handler());
+
+    assert(allow($table, '/x') == 'GET, HEAD, PROPFIND', 'HEAD once, other verbs by name');
+}
+
+#[group: "unit"]
+test trailing_slash_in_a_pattern {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/users/', handler());
+
+    bool $slash = find($table, http::Method::get, '/users/') != null;
+    bool $bare = find($table, http::Method::get, '/users') != null;
+
+    assert($slash, 'the path as registered');
+    assert(!$bare, 'a trailing slash is a different path');
+}
+
+#[group: "unit"]
+test rest_params_pass_dot_segments_through {
+    array<http::Route> $table = array<http::Route>();
+
+    $table[] = http::Route(http::Method::get, '/static/{path*}', handler());
+
+    http::Request $dots = routed($table, http::Method::get, '/static/../secret');
+    http::Request $encoded = routed($table, http::Method::get, '/static/a%2F..%2Fb');
+
+    // Response(file:) takes the path as given: keeping `..` out is the handler's
+    assert(($dots->param('path') ?? '') == '../secret', 'dot segments are not resolved');
+    assert(($encoded->param('path') ?? '') == 'a/../b', 'an encoded slash becomes a real one');
+}

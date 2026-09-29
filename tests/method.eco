@@ -1,0 +1,64 @@
+/**
+ * Methods: the named verbs, and the leftover.
+ */
+
+#[group: "unit"]
+test every_named_verb_round_trips {
+    array<string> $verbs = array<string>();
+
+    $verbs[] = 'GET';
+    $verbs[] = 'POST';
+    $verbs[] = 'PUT';
+    $verbs[] = 'PATCH';
+    $verbs[] = 'DELETE';
+    $verbs[] = 'HEAD';
+    $verbs[] = 'OPTIONS';
+
+    bool $allBack = true;
+    bool $allNamed = true;
+    usize $i = 0;
+
+    while ($i < $verbs->count()) {
+        http::Method $m = http::methodOf($verbs[$i]);
+
+        if (http::methodName($m) != $verbs[$i]) {
+            $allBack = false;
+        }
+
+        if (http::methodCode($m) == http::VERB_OTHER) {
+            $allNamed = false;
+        }
+
+        $i = $i + 1;
+    }
+
+    assert($allBack, 'the spelling comes back');
+    assert($allNamed, 'each is a named case, not other');
+}
+
+#[group: "unit"]
+test verbs_are_case_sensitive {
+    http::Method $lower = http::methodOf('get');
+
+    assert(http::methodCode($lower) == http::VERB_OTHER, 'get is not GET');
+    assert(http::methodName($lower) == 'get', 'kept as sent');
+    assert(!http::methodEq($lower, http::Method::get), 'and not equal to it');
+}
+
+#[group: "unit"]
+test other_methods_compare_by_spelling {
+    assert(http::methodEq(http::Method::other('COPY'), http::Method::other('COPY')), 'same spelling');
+    assert(!http::methodEq(http::Method::other('COPY'), http::Method::other('MOVE')), 'different spelling');
+    assert(http::methodEq(http::Method::other('HEAD'), http::Method::head), 'an other spelled HEAD is HEAD');
+    assert(http::verbCode(http::Method::other('PATCH')) == http::methodCode(http::Method::patch), 'and has its code');
+    assert(!http::methodEq(http::Method::patch, http::Method::put), 'two named verbs');
+}
+
+#[group: "unit"]
+test methods_interpolate {
+    http::Method $m = http::Method::options;
+    http::Method $o = http::Method::other('PROPFIND');
+
+    assert("{$m}" == 'OPTIONS', 'named');
+    assert("{$o}" == 'PROPFIND', 'other');
+}

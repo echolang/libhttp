@@ -40,6 +40,7 @@ internal const uint8 CH_RCURLY = 125;
 
 internal const usize HEADER_CAP = 8192;
 internal const usize DEFAULT_BODY_CAP = 1048576;
+internal const usize GROW_AHEAD = 65536;
 internal const int64 HEADER_TIMEOUT_SECS = 10;
 internal const int64 BODY_TIMEOUT_SECS = 60;
 internal const int64 IDLE_TIMEOUT_SECS = 5;
@@ -49,3 +50,8 @@ internal const int32 DEFAULT_MAX_CONNECTIONS = 1024;
 internal const usize DEFAULT_MESSAGE_CAP = 1048576;
 internal const int64 PING_INTERVAL_SECS = 30;
 internal const int64 CLOSE_WAIT_SECS = 5;
+
+// the lingering close: how long, and how much, a client may still send
+// after its last response before the reactor gives up on it
+internal const int64 LINGER_MS = 2000;
+internal const int64 LINGER_CAP = 4194304;

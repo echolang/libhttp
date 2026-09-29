@@ -249,16 +249,12 @@ internal function headerSafe(const string& $s) : bool
 }
 
 /**
- * A name that cannot turn into a different header on the wire: non-empty,
- * no colon, and `headerSafe`.
+ * A name that cannot turn into a different header on the wire: a token,
+ * so no colon, space, or control byte.
  */
 internal function nameSafe(const string& $s) : bool
 {
-    if ($s->empty() || $s->find(':') < $s->size()) {
-        return false;
-    }
-
-    return headerSafe($s);
+    return isToken($s);
 }
 
 /**

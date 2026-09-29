@@ -1,0 +1,626 @@
+/**
+ * The server over loopback: limits, timeouts, clients that go away, and
+ * starting and stopping. Same helpers as net.eco.
+ */
+
+use std::thread;
+use std::time;
+
+/**
+ * The first request that gets a 200, retried for up to three seconds while
+ * the server catches up on connections that went away. The last answer
+ * otherwise.
+ */
+internal function eventually(int32 $port, const string& $req) : string
+{
+    string $last = '';
+    int32 $tries = 0;
+
+    while ($tries < 60) {
+        $last = exchange($port, $req);
+
+        if ($last->starts('HTTP/1.1 200 ')) {
+            return $last;
+        }
+
+        thread::sleep(50);
+        $tries = $tries + 1;
+    }
+
+    return $last;
+}
+
+// dials, sends `$bytes`, and hangs up without reading a thing
+internal function hangUp(int32 $port, const string& $bytes) : bool
+{
+    http::Conn $c = dialOrDie($port);
+
+    return $c->writeAll($bytes);
+}
+
+internal const string PLAIN_GET = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+
+internal function plainServer() : http::Server
+{
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->get('/', function(http::Request $req) : http::Response {
+        return http::Response(text: 'up');
+    });
+
+    return $app;
+}
+
+#[group: "net"]
+test max_connections_refuses_then_recovers {
+    http::Server $app = plainServer();
+
+    $app->maxConnections(2);
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    string $third = '';
+
+    {
+        // two idle connections are the whole allowance
+        Client $a = Client($port);
+        Client $b = Client($port);
+
+        // the reactor has counted both once one has been answered
+        bool $sent = $a->send(PLAIN_GET);
+        string $first = $a->response();
+
+        $third = exchange($port, PLAIN_GET);
+
+        assert($sent && $first->starts('HTTP/1.1 200 '), 'the first is served');
+    }
+
+    // both hung up at the end of the block: their slots come back
+    string $after = eventually($port, PLAIN_GET);
+
+    $app->stop();
+    $srv->join();
+
+    assert($third->starts('HTTP/1.1 503 '), 'past the cap is 503');
+    assert($third->contains('Retry-After: 1\r\n'), 'with a hint to retry');
+    assert($after->starts('HTTP/1.1 200 '), 'served again once the others left');
+}
+
+#[group: "net"]
+test clients_that_vanish_give_their_slot_back {
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->maxConnections(1);
+    $app->get('/', function(http::Request $req) : http::Response {
+        return http::Response(text: 'up');
+    });
+    $app->post('/', function(http::Request $req) : http::Response {
+        return http::Response(text: 'posted');
+    });
+    $app->get('/slow', function(http::Request $req) : http::Response {
+        return http::Response(stream: function(http::Writer $w) : void {
+            int32 $i = 0;
+
+            while ($i < 100 && $w->write('tick\n')) {
+                $w->flush();
+                thread::sleep(10);
+                $i = $i + 1;
+            }
+        });
+    });
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+
+    bool $midHead = hangUp($port, 'GET / HTTP/1.1\r\nHo');
+    string $afterHead = eventually($port, PLAIN_GET);
+
+    bool $midBody = hangUp($port, 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc');
+    string $afterBody = eventually($port, PLAIN_GET);
+
+    string $afterStream = '';
+
+    {
+        Client $c = Client($port);
+        bool $sent = $c->send('GET /slow HTTP/1.1\r\nHost: x\r\n\r\n');
+        string $some = readSome($c->conn);
+
+        assert($sent && $some->starts('HTTP/1.1 200 '), 'the stream started');
+    }
+
+    $afterStream = eventually($port, PLAIN_GET);
+
+    $app->stop();
+    $srv->join();
+
+    assert($midHead && $midBody, 'sent the halves');
+    assert($afterHead->starts('HTTP/1.1 200 '), 'a hang-up mid-head frees its slot');
+    assert($afterBody->starts('HTTP/1.1 200 '), 'a hang-up mid-body frees its slot');
+    assert($afterStream->starts('HTTP/1.1 200 '), 'a hang-up mid-stream frees its slot and its worker');
+}
+
+#[group: "net"]
+test stalled_body_gets_408 {
+    http::Server $app = plainServer();
+
+    $app->bodyTimeout(time::duration::secs(1));
+    $app->post('/', function(http::Request $req) : http::Response {
+        return http::Response(text: 'posted');
+    });
+
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+    time::instant $start = time::instant::now();
+
+    bool $sent = $c->send('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc');
+    string $got = $c->response();
+    time::duration $took = $start->elapsed();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent, 'sent a short body');
+    assert($got->starts('HTTP/1.1 408 '), 'the body clock ran out');
+    assert($got->contains('Connection: close\r\n'), 'and the connection ends');
+    assert($took < time::duration::secs(4), 'about a second, not the header timeout');
+}
+
+#[group: "net"]
+test trickled_head_still_times_out {
+    http::Server $app = plainServer();
+
+    $app->headerTimeout(time::duration::secs(1));
+
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+    string $head = 'GET / HTTP/1.1\r\nX-Slow: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    time::instant $start = time::instant::now();
+    usize $i = 0;
+
+    // a byte every 150 ms: each read is quick, the head as a whole is not
+    while ($i < $head->size() && $start->elapsed() < time::duration::secs(4)) {
+        if (!$c->send($head->sub($i, 1))) {
+            break;
+        }
+
+        thread::sleep(150);
+        $i = $i + 1;
+    }
+
+    string $got = $c->response();
+    time::duration $took = $start->elapsed();
+
+    $app->stop();
+    $srv->join();
+
+    assert($got->starts('HTTP/1.1 408 '), 'the deadline is for the whole head');
+    assert($took < time::duration::secs(6), 'not reset by each byte');
+}
+
+#[group: "net"]
+test a_closing_client_does_not_hold_the_worker {
+    http::Server $app = plainServer();
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+
+    // both read their answer and keep the socket open
+    Client $closer = Client($port);
+    bool $sent = $closer->send('GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+    string $closed = $closer->response();
+
+    Client $bad = Client($port);
+    bool $sentBad = $bad->send('NOT HTTP\r\n\r\n');
+    string $refused = $bad->response();
+
+    time::instant $start = time::instant::now();
+    string $next = exchange($port, PLAIN_GET);
+    time::duration $took = $start->elapsed();
+
+    bool $ended = $closer->closed() && $bad->closed();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $closed->starts('HTTP/1.1 200 '), 'served and told close');
+    assert($sentBad && $refused->starts('HTTP/1.1 400 '), 'a bad request is answered');
+    assert($next->starts('HTTP/1.1 200 '), 'the next client');
+    assert($took < time::duration::millis(1000), 'is served without waiting out either close');
+    assert($ended, 'both connections still end');
+}
+
+#[group: "net"]
+test the_413_still_arrives_while_the_body_does {
+    http::Server $app = plainServer();
+
+    $app->maxBody(16);
+    $app->post('/', function(http::Request $req) : http::Response {
+        return http::Response(text: 'posted');
+    });
+
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+    string $body = '';
+
+    while ($body->size() < 262144) {
+        $body->append('0123456789abcdef');
+    }
+
+    // the body goes out in pieces after the answer is already on its way
+    bool $sentHead = $c->send('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 262144\r\n\r\n');
+    usize $at = 0;
+    bool $sending = true;
+
+    while ($sending && $at < $body->size()) {
+        $sending = $c->send($body->sub($at, 16384));
+        $at = $at + 16384;
+    }
+
+    string $got = $c->response();
+    string $next = exchange($app->port(), PLAIN_GET);
+
+    $app->stop();
+    $srv->join();
+
+    assert($sentHead, 'sent the head');
+    assert($got->starts('HTTP/1.1 413 '), 'the answer, not a reset');
+    assert($next->starts('HTTP/1.1 200 '), 'and the worker is free meanwhile');
+}
+
+/**
+ * Whether `listen` returned, set from its thread.
+ */
+#[atomic]
+internal class Done
+{
+    public atomic<bool> $returned;
+    public atomic<int32> $port;
+
+    public constructor()
+    {
+        $this->returned = atomic<bool>(false);
+        $this->port = atomic<int32>(0);
+    }
+}
+
+internal function listenInBackground(http::Server $app, Done $done) : thread::handle
+{
+    thread::handle $t = guard thread::spawn(function() : void {
+        result<int32, http::Error> $r = $app->listen('127.0.0.1', 0);
+        int32 $port = guard $r else ($e) {
+            $done->returned->store(true);
+            return;
+        }
+
+        $done->port->store($port);
+        $done->returned->store(true);
+    }) else ($e) {
+        die($e->message());
+    }
+
+    return $t;
+}
+
+internal function waitReturned(Done $done, int32 $ms) : bool
+{
+    int32 $waited = 0;
+
+    while ($waited < $ms) {
+        if ($done->returned->load()) {
+            return true;
+        }
+
+        thread::sleep(5);
+        $waited = $waited + 5;
+    }
+
+    return $done->returned->load();
+}
+
+#[group: "net"]
+test stop_before_listen_is_not_lost {
+    http::Server $app = plainServer();
+    Done $done = Done();
+
+    // asked to stop before listen has a pipe to be woken through
+    $app->stop();
+
+    thread::handle $t = listenInBackground($app, $done);
+    bool $returned = waitReturned($done, 2000);
+
+    if (!$returned) {
+        // unblock it so the test ends, then fail
+        waitPort($app);
+        $app->stop();
+    }
+
+    $t->join();
+
+    assert($returned, 'listen returned on its own');
+    assert($done->port->load() > 0, 'after binding, with the port');
+}
+
+#[group: "net"]
+test stop_twice_and_from_a_handler {
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->get('/stop', function(http::Request $req) : http::Response {
+        $app->stop();
+        return http::Response(text: 'stopping');
+    });
+
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+    bool $sent = $c->send('GET /stop HTTP/1.1\r\nHost: x\r\n\r\n');
+    string $got = $c->response();
+    bool $ended = $c->closed();
+
+    $srv->join();
+    $app->stop();
+
+    assert($sent && $got->ends('stopping'), 'the handler answered');
+    assert($got->contains('Connection: close\r\n'), 'a stopping server closes');
+    assert($ended, 'and hangs up');
+    assert($app->port() == 0, 'no port once it has returned');
+}
+
+#[group: "net"]
+test a_stopped_server_listens_again {
+    http::Server $app = plainServer();
+
+    thread::handle $first = serve($app);
+    string $one = exchange($app->port(), PLAIN_GET);
+
+    $app->stop();
+    $first->join();
+
+    thread::handle $second = serve($app);
+    string $two = exchange($app->port(), PLAIN_GET);
+
+    $app->stop();
+    $second->join();
+
+    assert($one->starts('HTTP/1.1 200 '), 'the first run');
+    assert($two->starts('HTTP/1.1 200 '), 'the second run');
+}
+
+#[group: "net"]
+test stop_lets_a_running_request_finish {
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->get('/slow', function(http::Request $req) : http::Response {
+        thread::sleep(300);
+        return http::Response(text: 'done');
+    });
+
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+    bool $sent = $c->send('GET /slow HTTP/1.1\r\nHost: x\r\n\r\n');
+
+    thread::sleep(100);
+    $app->stop();
+
+    string $got = $c->response();
+
+    $srv->join();
+
+    assert($sent, 'sent');
+    assert($got->starts('HTTP/1.1 200 ') && $got->ends('done'), 'the answer still comes');
+    assert($got->contains('Connection: close\r\n'), 'and says the connection ends');
+}
+
+#[group: "net"]
+test listen_refuses_what_it_cannot_bind {
+    http::Server $app = plainServer();
+    http::Server $other = plainServer();
+
+    result<int32, http::Error> $negative = $other->listen('127.0.0.1', -1);
+    result<int32, http::Error> $tooBig = $other->listen('127.0.0.1', 70000);
+    result<int32, http::Error> $badHost = $other->listen('999.1.1.1', 0);
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    result<int32, http::Error> $taken = $other->listen('127.0.0.1', $port);
+
+    $app->stop();
+    $srv->join();
+
+    result<http::Conn, http::Error> $dialed = http::Conn::dial('127.0.0.1', $port);
+
+    assert($negative->failed() && "{$negative->failure()}" == 'port must be 0..65535', 'a negative port');
+    assert($tooBig->failed(), 'a port past 65535');
+    assert($badHost->failed() && isBind($badHost->failure()), 'a host that is not one');
+    assert($taken->failed() && isBind($taken->failure()), 'a port in use');
+    assert($dialed->failed(), 'nothing listens once it stopped');
+}
+
+// the status line of a raw exchange, and whether the server then hung up
+internal function closedWith(int32 $port, const string& $req) : string
+{
+    Client $c = Client($port);
+    bool $sent = $c->send($req);
+    string $got = $c->response();
+
+    if (!$sent || !$got->contains('Connection: close\r\n') || !$c->closed()) {
+        return '(kept open)';
+    }
+
+    usize $end = $got->find('\r\n');
+
+    return $got->sub(0, $end);
+}
+
+#[group: "net"]
+test every_error_response_closes {
+    http::Server $app = plainServer();
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    string $pad = '';
+
+    while ($pad->size() < 9000) {
+        $pad->append('aaaaaaaaaa');
+    }
+
+    string $bad = closedWith($port, 'NOT HTTP\r\n\r\n');
+    string $huge = closedWith($port, "GET / HTTP/1.1\r\nHost: x\r\nX-Pad: {$pad}\r\n\r\n");
+    string $expect = closedWith($port, 'POST / HTTP/1.1\r\nHost: x\r\nExpect: 200-ok\r\nContent-Length: 1\r\n\r\nx');
+    string $coding = closedWith($port, 'POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n');
+    string $smuggle = closedWith($port, 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n');
+    string $version = closedWith($port, 'GET / HTTP/1.2\r\nHost: x\r\n\r\n');
+    string $noHost = closedWith($port, 'GET / HTTP/1.1\r\n\r\n');
+
+    $app->stop();
+    $srv->join();
+
+    assert($bad == 'HTTP/1.1 400 Bad Request', 'not a request line');
+    assert($huge == 'HTTP/1.1 413 Payload Too Large', 'a head past 8 KiB');
+    assert($expect == 'HTTP/1.1 417 Expectation Failed', 'an unmet expectation');
+    assert($coding == 'HTTP/1.1 501 Not Implemented', 'an unknown coding');
+    assert($smuggle == 'HTTP/1.1 400 Bad Request', 'CL and TE together');
+    assert($version == 'HTTP/1.1 505 HTTP Version Not Supported', 'an unknown version');
+    assert($noHost == 'HTTP/1.1 400 Bad Request', 'no Host');
+}
+
+#[group: "net"]
+test requests_as_the_handler_sees_them {
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->get('/peer', function(http::Request $req) : http::Response {
+        return http::Response(text: $req->peer);
+    });
+    $app->get('/plain', function(http::Request $req) : http::Response {
+        return http::Response(text: 'body');
+    });
+    $app->on(http::Method::other('COPY'), '/file', function(http::Request $req) : http::Response {
+        return http::Response(text: http::methodName($req->method));
+    });
+
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+
+    bool $sent = $c->send('GET /peer HTTP/1.1\r\nHost: x\r\n\r\n');
+    string $peer = $c->response();
+    bool $sentHead = $c->send('HEAD /plain HTTP/1.1\r\nHost: x\r\n\r\n');
+    string $head = $c->headResponse();
+    bool $sentCopy = $c->send('COPY /file HTTP/1.1\r\nHost: x\r\n\r\n');
+    string $copy = $c->response();
+    bool $sentMove = $c->send('MOVE /file HTTP/1.1\r\nHost: x\r\n\r\n');
+    string $move = $c->response();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $sentHead && $sentCopy && $sentMove, 'sent');
+    assert($peer->contains('\r\n\r\n127.0.0.1:'), 'the peer is an address and a port');
+    assert($head->contains('Content-Length: 4\r\n') && $head->ends('\r\n\r\n'), 'HEAD keeps the length, drops the body');
+    assert($copy->ends('\r\n\r\nCOPY'), 'a verb this library does not name');
+    assert($move->starts('HTTP/1.1 405 ') && $move->contains('Allow: COPY\r\n'), 'and one no route takes');
+}
+
+/**
+ * What a middleware saw, for the test thread.
+ */
+#[atomic]
+internal class Layered
+{
+    public atomic<int32> $calls;
+    public atomic<int32> $paramsSeen;
+    public atomic<int32> $lastStatus;
+
+    public constructor()
+    {
+        $this->calls = atomic<int32>(0);
+        $this->paramsSeen = atomic<int32>(0);
+        $this->lastStatus = atomic<int32>(0);
+    }
+}
+
+#[group: "net"]
+test middleware_over_the_wire {
+    http::Server $app = http::Server();
+    Layered $seen = Layered();
+
+    $app->workers(1);
+    $app->wrap(function(http::Request $req, http::Next $next) : http::Response {
+        $seen->calls->add(1);
+
+        if ($req->param('id') != null) {
+            $seen->paramsSeen->add(1);
+        }
+
+        // a rewrite before routing picks the route
+        if ($req->path == '/old') {
+            $req->path = '/new';
+        }
+
+        http::Response $res = $next->run($req);
+
+        $seen->lastStatus->store($res->status);
+        return $res;
+    });
+    $app->get('/new', function(http::Request $req) : http::Response {
+        return http::Response(text: 'new');
+    });
+    $app->get('/item/{id}', function(http::Request $req) : http::Response {
+        return http::Response(text: $req->param('id') ?? '(none)');
+    });
+
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+
+    bool $a = $c->send('GET /old HTTP/1.1\r\nHost: x\r\n\r\n');
+    string $rewritten = $c->response();
+    bool $b = $c->send('GET /item/7 HTTP/1.1\r\nHost: x\r\n\r\n');
+    string $item = $c->response();
+    bool $d = $c->send('DELETE /item/7 HTTP/1.1\r\nHost: x\r\n\r\n');
+    string $notAllowed = $c->response();
+    int32 $status405 = $seen->lastStatus->load();
+    int32 $before = $seen->calls->load();
+
+    string $garbage = exchange($app->port(), 'NOT HTTP\r\n\r\n');
+    int32 $after = $seen->calls->load();
+
+    $app->stop();
+    $srv->join();
+
+    assert($a && $b && $d, 'sent');
+    assert($rewritten->ends('\r\n\r\nnew'), 'the rewritten path is the one routed');
+    assert($item->ends('\r\n\r\n7') && $seen->paramsSeen->load() == 0, 'params are filled for the handler, not the middleware');
+    assert($notAllowed->starts('HTTP/1.1 405 ') && $status405 == 405, 'a middleware sees the 405');
+    assert($garbage->starts('HTTP/1.1 400 ') && $after == $before, 'a request that never parsed skips the middleware');
+}
+
+#[group: "net"]
+test big_chunked_writes_go_out_whole {
+    http::Server $app = http::Server();
+    string $big = '';
+
+    while ($big->size() < 5000) {
+        $big->append('0123456789');
+    }
+
+    $app->workers(1);
+    $app->get('/big', function(http::Request $req) : http::Response {
+        return http::Response(stream: function(http::Writer $w) : void {
+            $w->write('small');
+            $w->write($big);
+            $w->write('');
+        });
+    });
+
+    thread::handle $srv = serve($app);
+    string $got = exchange($app->port(), 'GET /big HTTP/1.1\r\nHost: x\r\n\r\n');
+
+    $app->stop();
+    $srv->join();
+
+    assert($got->contains('Transfer-Encoding: chunked\r\n'), 'chunked');
+    assert($got->contains("\r\n1388\r\n{$big}\r\n"), 'a write past the buffer is its own chunk, sized in hex');
+    assert($got->ends('\r\n0\r\n\r\n'), 'then the last chunk');
+}

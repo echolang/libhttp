@@ -148,3 +148,55 @@ test protocol_only_when_offered {
     assert($res->upgrades(), 'a websocket response upgrades');
     assert(!http::Response(text: 'hi')->upgrades(), 'a text one does not');
 }
+
+#[group: "unit"]
+test version_must_be_there_once {
+    string $noVersion = 'Sec-WebSocket-Key: ';
+
+    $noVersion->append(SAMPLE_KEY);
+    $noVersion->append('\r\n');
+
+    http::Request $missing = upgradeRequest($noVersion);
+    http::Request $twice = valid('Sec-WebSocket-Version: 13\r\n');
+    http::Response $r = http::refusal(http::upgradeKey($missing)->failure());
+
+    assert(refusedWith($missing) == 426, 'no version is 426');
+    assert(($r->headers->get('Sec-WebSocket-Version') ?? '') == '13', 'naming the one to use');
+    assert(refusedWith($twice) == 426, 'two versions');
+}
+
+#[group: "unit"]
+test other_upgrades_are_not_attempts {
+    http::Request $h2c = mustParse('GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n');
+    http::Response $r = http::refusal(http::upgradeKey($h2c)->failure());
+
+    assert(refusedWith($h2c) == 426, 'an h2c upgrade is 426');
+    assert(!$r->headers->has('Sec-WebSocket-Version'), 'with no version to retry, it was never an attempt');
+    assert(!$h2c->websocket(), 'Request::websocket agrees');
+}
+
+#[group: "unit"]
+test key_whitespace_is_trimmed {
+    string $raw = 'GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key:    ';
+
+    $raw->append(SAMPLE_KEY);
+    $raw->append('   \r\nSec-WebSocket-Version:  13 \r\n\r\n');
+
+    assert(http::upgradeKey(mustParse($raw))->unwrap() == SAMPLE_KEY, 'the key without its padding');
+}
+
+#[group: "unit"]
+test the_101_drops_body_headers {
+    http::Channel $c = http::Channel();
+    http::Response $res = http::Response(websocket: $c);
+
+    $res->header('Content-Type', 'text/html');
+    $res->header('Sec-WebSocket-Extensions', 'permessage-deflate');
+    $res->header('Sec-WebSocket-Protocol', 'forged');
+
+    http::Response $out = http::switching($res, SAMPLE_KEY, '');
+
+    assert(!$out->headers->has('Content-Type'), 'a 101 has no body to type');
+    assert(!$out->headers->has('Sec-WebSocket-Extensions'), 'no extension was agreed');
+    assert(!$out->headers->has('Sec-WebSocket-Protocol'), 'nor a protocol');
+}

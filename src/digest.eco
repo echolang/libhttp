@@ -224,6 +224,10 @@ internal function keyShape(const string& $key) : bool
     return true;
 }
 
+// how far `utf8Valid` decodes a byte at a time after a block that is not all
+// ASCII, before it probes sixteen bytes again
+internal const usize UTF8_WINDOW = 64;
+
 /**
  * Whether `$s` is well-formed UTF-8: no overlong forms, no surrogates, nothing
  * past U+10FFFF, and no sequence cut short.
@@ -235,68 +239,85 @@ internal function utf8Valid(const string& $s) : bool
 
     // raw reads: a byte() per byte is a stdlib call each under --optimize module
     ptr<const uint8> $p = $s->data();
+    simd<uint8, 16> $high = simd::splat<uint8, 16>(0x80 as uint8);
 
     while ($i < $n) {
-        uint8 $b = $p:$[$i];
-
-        if ($b < 0x80) {
-            $i = $i + 1;
-            continue;
+        // sixteen ASCII bytes at a time, until a block has a high bit
+        while ($i + 16 <= $n && !simd::any(simd::load<uint8, 16>($p:$ + $i) >= $high)) {
+            $i = $i + 16;
         }
 
-        usize $need = 0;
+        // then a window a byte at a time. A sequence across a block's edge is
+        // fine, and text that is mostly not ASCII probes once per window, not
+        // once per character
+        usize $stop = $i + UTF8_WINDOW;
 
-        // the first continuation byte's range is what rules out overlongs,
-        // surrogates, and code points past U+10FFFF
-        uint8 $lo = 0x80;
-        uint8 $hi = 0xBF;
-
-        if ($b >= 0xC2 && $b <= 0xDF) {
-            $need = 1;
-        } else if ($b == 0xE0) {
-            $need = 2;
-            $lo = 0xA0;
-        } else if ($b == 0xED) {
-            $need = 2;
-            $hi = 0x9F;
-        } else if ($b >= 0xE1 && $b <= 0xEF) {
-            $need = 2;
-        } else if ($b == 0xF0) {
-            $need = 3;
-            $lo = 0x90;
-        } else if ($b >= 0xF1 && $b <= 0xF3) {
-            $need = 3;
-        } else if ($b == 0xF4) {
-            $need = 3;
-            $hi = 0x8F;
-        } else {
-            return false;
+        if ($stop > $n) {
+            $stop = $n;
         }
 
-        // a sequence cut short by the end of the string
-        if ($i + $need >= $n) {
-            return false;
-        }
+        while ($i < $stop) {
+            uint8 $b = $p:$[$i];
 
-        uint8 $first = $p:$[$i + 1];
+            if ($b < 0x80) {
+                $i = $i + 1;
+                continue;
+            }
 
-        if ($first < $lo || $first > $hi) {
-            return false;
-        }
+            usize $need = 0;
 
-        usize $k = 2;
+            // the first continuation byte's range is what rules out overlongs,
+            // surrogates, and code points past U+10FFFF
+            uint8 $lo = 0x80;
+            uint8 $hi = 0xBF;
 
-        while ($k <= $need) {
-            uint8 $c = $p:$[$i + $k];
-
-            if ($c < 0x80 || $c > 0xBF) {
+            if ($b >= 0xC2 && $b <= 0xDF) {
+                $need = 1;
+            } else if ($b == 0xE0) {
+                $need = 2;
+                $lo = 0xA0;
+            } else if ($b == 0xED) {
+                $need = 2;
+                $hi = 0x9F;
+            } else if ($b >= 0xE1 && $b <= 0xEF) {
+                $need = 2;
+            } else if ($b == 0xF0) {
+                $need = 3;
+                $lo = 0x90;
+            } else if ($b >= 0xF1 && $b <= 0xF3) {
+                $need = 3;
+            } else if ($b == 0xF4) {
+                $need = 3;
+                $hi = 0x8F;
+            } else {
                 return false;
             }
 
-            $k = $k + 1;
-        }
+            // a sequence cut short by the end of the string
+            if ($i + $need >= $n) {
+                return false;
+            }
 
-        $i = $i + $need + 1;
+            uint8 $first = $p:$[$i + 1];
+
+            if ($first < $lo || $first > $hi) {
+                return false;
+            }
+
+            usize $k = 2;
+
+            while ($k <= $need) {
+                uint8 $c = $p:$[$i + $k];
+
+                if ($c < 0x80 || $c > 0xBF) {
+                    return false;
+                }
+
+                $k = $k + 1;
+            }
+
+            $i = $i + $need + 1;
+        }
     }
 
     return true;

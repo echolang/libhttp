@@ -1,0 +1,250 @@
+/**
+ * The job queue between reactors and workers. No network: a `fail` job's
+ * fd is a tag the tests read back.
+ */
+
+use std::thread;
+use std::time;
+
+internal function tagged(int32 $n) : http::Job
+{
+    return http::Job::fail($n, 0, http::WireError::badRequest);
+}
+
+// the tag of a job, or -1 for nothing
+internal function tagOf(http::Job? $job) : int32
+{
+    http::Job $j = guard $job else {
+        return -1;
+    }
+
+    return match ($j) {
+        http::Job::fail($fd, $home, $e) => $fd,
+        else => -2,
+    };
+}
+
+/**
+ * Counts what the consumers took, and flags any tag taken twice.
+ */
+#[atomic]
+internal class Tally
+{
+    public atomic<int32> $taken;
+    public atomic<int32> $sum;
+    public atomic<int32> $woken;
+
+    public constructor()
+    {
+        $this->taken = atomic<int32>(0);
+        $this->sum = atomic<int32>(0);
+        $this->woken = atomic<int32>(0);
+    }
+}
+
+#[group: "unit"]
+test queue_is_first_in_first_out {
+    http::JobQueue $q = http::JobQueue();
+
+    $q->send(tagged(1));
+    $q->send(tagged(2));
+    $q->send(tagged(3));
+
+    int32 $a = tagOf($q->recv());
+
+    // lands behind the refill: 2 and 3 are already in the ready list
+    $q->send(tagged(4));
+
+    int32 $b = tagOf($q->recv());
+    int32 $c = tagOf($q->recv());
+    int32 $d = tagOf($q->recv());
+
+    assert($a == 1 && $b == 2 && $c == 3, 'queued order');
+    assert($d == 4, 'a send between receives waits its turn');
+}
+
+#[group: "unit"]
+test oldest_wait_follows_the_oldest_job {
+    http::JobQueue $q = http::JobQueue();
+
+    time::duration $empty = $q->oldestWait();
+
+    $q->send(tagged(1));
+    thread::sleep(40);
+    $q->send(tagged(2));
+
+    time::duration $both = $q->oldestWait();
+
+    // the take refills the ready list: job 2 is now the oldest
+    int32 $first = tagOf($q->recv());
+    time::duration $second = $q->oldestWait();
+
+    int32 $last = tagOf($q->recv());
+    time::duration $drained = $q->oldestWait();
+
+    assert($empty->as_nanos() == 0, 'zero when empty');
+    assert($both->as_millis() >= 40, 'measured from the first job');
+    assert($first == 1 && $last == 2, 'order');
+    assert($second->as_millis() < 40, 'the wait resets as the oldest is taken');
+    assert($drained->as_nanos() == 0, 'zero once drained');
+}
+
+#[group: "unit"]
+test oldest_wait_sees_the_ready_list_first {
+    http::JobQueue $q = http::JobQueue();
+
+    $q->send(tagged(1));
+    $q->send(tagged(2));
+    thread::sleep(40);
+
+    // the take moves 2 into the ready list; then 3 is queued behind it
+    int32 $first = tagOf($q->recv());
+
+    $q->send(tagged(3));
+
+    time::duration $wait = $q->oldestWait();
+
+    assert($first == 1, 'first');
+    assert($wait->as_millis() >= 40, 'the ready job is older than the new one');
+}
+
+#[group: "unit"]
+test closed_queue_drains_then_ends {
+    http::JobQueue $q = http::JobQueue();
+
+    $q->send(tagged(7));
+    $q->send(tagged(8));
+    $q->close();
+
+    int32 $a = tagOf($q->recv());
+    int32 $b = tagOf($q->recv());
+    int32 $end = tagOf($q->recv());
+    int32 $again = tagOf($q->recv());
+
+    assert($a == 7 && $b == 8, 'queued jobs still come out');
+    assert($end == -1 && $again == -1, 'then nothing, every time');
+}
+
+#[group: "unit"]
+test blocked_recv_wakes_on_send {
+    http::JobQueue $q = http::JobQueue();
+    Tally $t = Tally();
+
+    thread::handle $worker = guard thread::spawn(function() : void {
+        int32 $tag = tagOf($q->recv());
+        $t->sum->store($tag);
+        $t->woken->add(1);
+    }) else ($e) {
+        die($e->message());
+    }
+
+    // let the worker fall asleep on the empty queue
+    thread::sleep(50);
+    int32 $before = $t->woken->load();
+
+    $q->send(tagged(42));
+    $worker->join();
+
+    assert($before == 0, 'recv waited on the empty queue');
+    assert($t->sum->load() == 42, 'woke with the job');
+}
+
+#[group: "unit"]
+test close_wakes_every_waiter {
+    http::JobQueue $q = http::JobQueue();
+    Tally $t = Tally();
+    array<thread::handle> $workers = array<thread::handle>();
+    int32 $i = 0;
+
+    while ($i < 4) {
+        thread::handle $w = guard thread::spawn(function() : void {
+            int32 $tag = tagOf($q->recv());
+
+            if ($tag == -1) {
+                $t->woken->add(1);
+            }
+        }) else ($e) {
+            die($e->message());
+        }
+
+        $workers[] = mv $w;
+        $i = $i + 1;
+    }
+
+    thread::sleep(50);
+    $q->close();
+
+    while (!$workers->empty()) {
+        thread::handle $w = $workers->pop();
+        $w->join();
+    }
+
+    assert($t->woken->load() == 4, 'every sleeper saw the end');
+}
+
+#[group: "unit"]
+test many_producers_many_consumers_lose_nothing {
+    http::JobQueue $q = http::JobQueue();
+    Tally $t = Tally();
+    array<thread::handle> $consumers = array<thread::handle>();
+    array<thread::handle> $producers = array<thread::handle>();
+    int32 $perProducer = 500;
+    int32 $i = 0;
+
+    while ($i < 3) {
+        thread::handle $c = guard thread::spawn(function() : void {
+            while (true) {
+                int32 $tag = tagOf($q->recv());
+
+                if ($tag < 0) {
+                    return;
+                }
+
+                $t->taken->add(1);
+                $t->sum->add($tag);
+            }
+        }) else ($e) {
+            die($e->message());
+        }
+
+        $consumers[] = mv $c;
+        $i = $i + 1;
+    }
+
+    $i = 0;
+
+    while ($i < 4) {
+        int32 $base = $i * $perProducer;
+        thread::handle $p = guard thread::spawn(function() : void {
+            int32 $k = 1;
+
+            while ($k <= $perProducer) {
+                $q->send(tagged($base + $k));
+                $k = $k + 1;
+            }
+        }) else ($e) {
+            die($e->message());
+        }
+
+        $producers[] = mv $p;
+        $i = $i + 1;
+    }
+
+    while (!$producers->empty()) {
+        thread::handle $p = $producers->pop();
+        $p->join();
+    }
+
+    // every send is in before the close, so the consumers drain all of it
+    $q->close();
+
+    while (!$consumers->empty()) {
+        thread::handle $c = $consumers->pop();
+        $c->join();
+    }
+
+    int32 $total = 4 * $perProducer;
+
+    assert($t->taken->load() == $total, 'every job taken once');
+    assert($t->sum->load() == $total * ($total + 1) / 2, 'no job lost or duplicated');
+}

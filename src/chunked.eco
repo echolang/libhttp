@@ -11,6 +11,20 @@ namespace http;
 internal const usize CHUNK_LINE_CAP = 1024;
 internal const usize CHUNK_SLACK = 65536;
 
+/**
+ * How many wire bytes a body still arriving may take: twice maxBody plus
+ * slack for the framing. Held at the top rather than wrapping, since a
+ * maxBody near the top is how a caller says there is no cap.
+ */
+internal function wireCap(usize $maxBody) : usize
+{
+    if ($maxBody > (std::math::MAX_USIZE - CHUNK_SLACK) / 2) {
+        return std::math::MAX_USIZE;
+    }
+
+    return $maxBody * 2 + CHUNK_SLACK;
+}
+
 internal enum Chunking
 {
     case needMore;
@@ -95,7 +109,7 @@ internal struct Dechunk
         $buf = $buf->sub($this->cursor, $buf->size() - $this->cursor);
         $this->cursor = 0;
 
-        if ($waiting && $this->wire + $buf->size() > $maxBody * 2 + CHUNK_SLACK) {
+        if ($waiting && $this->wire + $buf->size() > wireCap($maxBody)) {
             return .fail(.tooLarge);
         }
 
@@ -172,7 +186,8 @@ internal struct Dechunk
             return .next;
         }
 
-        if ($n > ($maxBody as uint64) || ($this->body->size() as uint64) + $n > ($maxBody as uint64)) {
+        // the body never passes maxBody, so what is left of it cannot wrap
+        if ($n > (($maxBody - $this->body->size()) as uint64)) {
             return .stop(.fail(.tooLarge));
         }
 

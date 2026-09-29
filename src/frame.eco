@@ -283,7 +283,7 @@ internal struct Reader
         usize $end = $at + $size;
 
         if ($have < $end) {
-            $this->buffer->reserve($end);
+            growToward($this->buffer, $end);
             return .needMore;
         }
 
@@ -370,6 +370,16 @@ internal function unmask(const string& $data, uint32 $key) : string
     // raw reads and writes: every payload comes through here
     ptr<const uint8> $src = $data->data();
     ptr<uint8> $dst = $out->spare();
+
+    // sixteen bytes a step: sixteen is a multiple of four, so the key lines up
+    // with every block and the loops below pick up in phase
+    uint8[16] $pattern = [$k0, $k1, $k2, $k3, $k0, $k1, $k2, $k3, $k0, $k1, $k2, $k3, $k0, $k1, $k2, $k3];
+    simd<uint8, 16> $wide = simd::from_array<uint8, 16>($pattern);
+
+    while ($i + 16 <= $n) {
+        simd::store<uint8, 16>($dst:$ + $i, simd::load<uint8, 16>($src:$ + $i) ^ $wide);
+        $i = $i + 16;
+    }
 
     while ($i + 4 <= $n) {
         $dst:$[$i] = $src:$[$i] ^ $k0;

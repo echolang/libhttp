@@ -40,3 +40,16 @@ test workers_zero_refuses_listen {
 
     assert($e->message() == 'need at least one worker', 'sentence');
 }
+
+#[group: "unit"]
+test every_error_has_a_sentence {
+    http::Error $accept = http::Error::accept('too many open files');
+    http::Error $connect = http::Error::connect('connection refused');
+    http::Error $closed = http::Error::closed;
+    http::Error $spawn = http::Error::spawn('no threads');
+
+    assert("{$accept}" == 'too many open files', 'accept');
+    assert("{$connect}" == 'connection refused', 'connect');
+    assert("{$closed}" == 'server closed', 'closed');
+    assert("{$spawn}" == 'no threads', 'spawn');
+}

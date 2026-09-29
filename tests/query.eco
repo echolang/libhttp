@@ -30,3 +30,32 @@ test parse_query_without_equals {
 
     assert(($q->get('flag') ?? 'missing') == '', 'bare name, empty value');
 }
+
+#[group: "unit"]
+test unescape_edges {
+    assert(http::unescape('100%') == '100%', 'a trailing percent is kept');
+    assert(http::unescape('a%2') == 'a%2', 'one hex digit is kept');
+    assert(http::unescape('%2z') == '%2z', 'a bad second digit is kept');
+    assert(http::unescape('%2f%2F') == '//', 'either case of hex');
+    assert(http::unescape('%2541') == '%41', 'decoded once, not twice');
+    assert(http::unescape('%e2%82%ac') == '€', 'bytes of a multi-byte character');
+    assert(http::unescape('a%00b')->size() == 3, 'a NUL decodes to one byte, as sent');
+    assert(http::unescape('') == '', 'nothing');
+}
+
+#[group: "unit"]
+test parse_query_odd_shapes {
+    http::Query $gaps = http::parseQuery('&&a=1&&');
+    http::Query $noName = http::parseQuery('=v');
+    http::Query $twoEquals = http::parseQuery('a=b=c');
+    http::Query $encoded = http::parseQuery('first%20name=Ada+L&x%3Dy=1');
+    http::Query $none = http::parseQuery('');
+
+    assert($gaps->count() == 1 && ($gaps->get('a') ?? '') == '1', 'empty pieces are skipped');
+    assert($noName->count() == 1 && ($noName->get('') ?? '') == 'v', 'an empty name is still a pair');
+    assert(($twoEquals->get('a') ?? '') == 'b=c', 'the first equals splits');
+    assert(($encoded->get('first name') ?? '') == 'Ada L', 'names are decoded too');
+    assert(($encoded->get('x=y') ?? '') == '1', 'an encoded equals is part of the name');
+    assert($none->empty(), 'an empty string is no pairs');
+    assert($encoded->get('First name') == null, 'names are case-sensitive');
+}

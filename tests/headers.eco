@@ -22,3 +22,71 @@ test missing_header_is_null {
     assert($h->get('Host') == null, 'nothing');
     assert(!$h->has('Host'), 'has is false');
 }
+
+#[group: "unit"]
+test remove_counts_what_it_dropped {
+    http::Headers $h = http::Headers();
+
+    $h->add('A', '1');
+    $h->add('Set-Cookie', 'x');
+    $h->add('B', '2');
+    $h->add('set-cookie', 'y');
+    $h->add('C', '3');
+
+    usize $gone = $h->remove('SET-COOKIE');
+    usize $none = $h->remove('Missing');
+
+    assert($gone == 2, 'every match, any case');
+    assert($none == 0, 'nothing to drop');
+    assert($h->count() == 3, 'the rest stay');
+    assert($h->items[0]->name == 'A' && $h->items[1]->name == 'B' && $h->items[2]->name == 'C', 'in order');
+}
+
+#[group: "unit"]
+test count_empty_and_clear {
+    http::Headers $h = http::Headers();
+    bool $emptyAtFirst = $h->empty();
+
+    $h->add('A', '1');
+    $h->add('A', '2');
+
+    usize $two = $h->count();
+    array<string> $both = $h->all('a');
+
+    $h->clear();
+
+    assert($emptyAtFirst, 'a new list is empty');
+    assert($two == 2, 'repeats count');
+    assert($both[0] == '1' && $both[1] == '2', 'all keeps arrival order');
+    assert($h->empty() && $h->count() == 0, 'clear empties it');
+}
+
+// the status a header block fails with, or 0
+internal function blockStatus(const string& $raw) : int32
+{
+    result<http::Headers, http::WireError> $r = http::parseHeaderBlock($raw);
+
+    if (!$r->failed()) {
+        return 0;
+    }
+
+    return $r->failure()->status();
+}
+
+#[group: "unit"]
+test header_block_edges {
+    result<http::Headers, http::WireError> $folded = http::parseHeaderBlock("X: a\r\n  b\r\n\tc\r\nY: d");
+    http::Headers $h = $folded->unwrap();
+    result<http::Headers, http::WireError> $emptyValue = http::parseHeaderBlock("X:\r\nY:   \r\n");
+
+    assert(($h->get('X') ?? '') == 'a b c', 'several folded lines join');
+    assert(($h->get('Y') ?? '') == 'd', 'the next header after a fold');
+    assert(($emptyValue->unwrap()->get('Y') ?? 'missing') == '', 'an empty value is a value');
+    assert(blockStatus(" X: a\r\nY: b") == 400, 'whitespace before the first header');
+    assert(blockStatus("X\t: a") == 400, 'a tab before the colon');
+    assert(blockStatus("X: a\rb") == 400, 'a bare CR inside a value');
+    assert(blockStatus("X: a\u{0}b") == 400, 'a NUL inside a value');
+    assert(blockStatus("X(y): a") == 400, 'a name must be a token');
+    assert(blockStatus("X\u{1}: a") == 400, 'a control byte in a name');
+    assert(blockStatus("x-Ok_1.2~!#$%&'*+^`|: a") == 0, 'every token character');
+}

@@ -6,8 +6,10 @@
  * under SO_SNDTIMEO). The reactor reads with MSG_DONTWAIT. Listen and
  * the wake pipe are non-blocking.
  *
- * http_finish is the lingering close: shut write, drain, then close.
- * A plain close with unread bytes is a RST.
+ * The lingering close: shut write, drain, then close. A plain close with
+ * unread bytes is a RST. The reactor does it without blocking, with
+ * http_shut_write and http_drain_now; http_finish is the blocking one, for
+ * when there is no reactor left to hand the fd to.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -39,6 +41,7 @@
 #define IO_TIMEOUT_SECS 10
 #define RECV_AGAIN (-3)
 #define DRAIN_CAP (4 * 1024 * 1024)
+#define DRAIN_STEP (256 * 1024)
 
 static __thread char g_err[128];
 
@@ -631,6 +634,42 @@ int http_finish(int fd)
     }
 
     return close(fd);
+}
+
+int http_shut_write(int fd)
+{
+    return shutdown(fd, SHUT_WR);
+}
+
+/*
+ * Reads and drops what has arrived, without waiting. The count dropped
+ * while the peer is still there, or -1 once it has hung up or the socket
+ * broke. Stops after DRAIN_STEP so one sender cannot hold the reactor.
+ */
+long http_drain_now(int fd)
+{
+    char buf[16384];
+    long drained = 0;
+
+    while (drained < DRAIN_STEP) {
+        ssize_t got = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (got < 0 && would_block()) {
+            return drained;
+        }
+
+        if (got <= 0) {
+            return -1;
+        }
+
+        drained += (long)got;
+    }
+
+    return drained;
 }
 
 int http_is_fd_limit(void)

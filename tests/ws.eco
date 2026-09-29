@@ -584,3 +584,161 @@ test ws_across_reactors {
     assert($seen->closes->load() == 6, 'onClose once each, on stop');
     assert($seen->closedCode->load() == 1001, 'going away');
 }
+
+// waits up to two seconds for `$n` sockets to have opened
+internal function waitOpened(Seen $seen, int32 $n) : bool
+{
+    int32 $tries = 0;
+
+    while ($tries < 400) {
+        if ($seen->opened->load() >= $n) {
+            return true;
+        }
+
+        thread::sleep(5);
+        $tries = $tries + 1;
+    }
+
+    return false;
+}
+
+#[group: "net"]
+test ws_broadcast_reaches_every_socket {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+    thread::handle $srv = serve($app);
+    Peer $a = Peer($app->port(), '/echo');
+    Peer $b = Peer($app->port(), '/echo');
+    int32 $toThree = 0;
+
+    {
+        Peer $c = Peer($app->port(), '/echo');
+        bool $allOpen = waitOpened($seen, 3);
+
+        $toThree = $seen->group->broadcast(text: 'all');
+
+        assert($allOpen, 'three sockets opened');
+        assert($c->nextText() == 'all', 'the third got it');
+    }
+
+    // the third hung up without a close frame
+    bool $closed = waitCloses($seen, 1);
+    int32 $vanishedCode = $seen->closedCode->load();
+    bool $vanishedClean = $seen->clean->load();
+    int32 $toTwo = $seen->group->broadcast(binary: bytes([1, 2]));
+    usize $left = $seen->group->count();
+
+    string $gotA = $a->nextText();
+    string $gotB = $b->nextText();
+    string $binA = binaryOf($a->next()) ?? '(none)';
+
+    $app->stop();
+    $srv->join();
+
+    assert($toThree == 3, 'a broadcast answers how many it reached');
+    assert($gotA == 'all' && $gotB == 'all', 'every socket got it');
+    assert($closed && $vanishedCode == 1006 && !$vanishedClean, 'a vanished peer is 1006, not clean');
+    assert($toTwo == 2 && $left == 2, 'the group goes on without it');
+    assert($binA == bytes([1, 2]), 'binary broadcast');
+}
+
+#[group: "net"]
+test ws_server_ping_and_close_codes {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+    thread::handle $srv = serve($app);
+    Peer $p = Peer($app->port(), '/echo');
+    bool $opened = waitOpened($seen, 1);
+
+    http::Socket $ws = guard $seen->first() else {
+        die('onOpen never ran');
+    }
+
+    string $big = str::lpad('', 126, 97);
+    bool $pinged = $ws->ping('are you there');
+    bool $tooBig = $ws->ping($big);
+    string $ping = match ($p->next()) {
+        http::WsStep::ping($payload) => $payload,
+        else => '(not a ping)',
+    };
+
+    // 1006 is for onClose to report, never for the wire
+    $ws->close(1006, 'nope');
+
+    int32 $code = closeCodeOf($p->next());
+    bool $sendAfter = $ws->send(text: 'late');
+    bool $openAfter = $ws->open();
+    bool $answered = $p->frame(http::OP_CLOSE, http::closePayload(1000, ''));
+    bool $ended = $p->ended();
+
+    $app->stop();
+    $srv->join();
+
+    assert($opened, 'opened');
+    assert($pinged && $ping == 'are you there', 'a hook ping arrives with its payload');
+    assert(!$tooBig, 'a ping payload past 125 bytes is refused');
+    assert($code == 1000, 'a code a server may not send goes out as 1000');
+    assert(!$sendAfter && !$openAfter, 'nothing is sent after a close');
+    assert($answered && $ended, 'the answer ends it');
+}
+
+#[group: "net"]
+test ws_subprotocol_over_the_wire {
+    Seen $seen = Seen();
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->get('/proto', function(http::Request $req) : http::Response {
+        return http::Response(websocket: echoChannel($seen), protocol: 'chat.v2');
+    });
+
+    thread::handle $srv = serve($app);
+    Peer $offered = Peer($app->port(), '/proto', 'Sec-WebSocket-Protocol: chat.v1, chat.v2\r\n');
+    Peer $other = Peer($app->port(), '/proto', 'Sec-WebSocket-Protocol: chat.v1\r\n');
+    bool $both = waitOpened($seen, 2);
+    array<http::Socket> $open = $seen->group->members();
+    usize $agreed = 0;
+    usize $i = 0;
+
+    while ($i < $open->count()) {
+        if ($open[$i]->protocol == 'chat.v2') {
+            $agreed = $agreed + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    $app->stop();
+    $srv->join();
+
+    assert($offered->upgraded() && $other->upgraded(), 'both upgraded');
+    assert($offered->head->contains('Sec-WebSocket-Protocol: chat.v2\r\n'), 'the offered one is agreed');
+    assert(!$other->head->contains('Sec-WebSocket-Protocol'), 'one not offered is not named');
+    assert($both && $agreed == 1, 'the Socket knows which it got');
+}
+
+#[group: "net"]
+test ws_unanswered_close_is_dropped {
+    Seen $seen = Seen();
+    http::Server $app = echoServer($seen);
+    thread::handle $srv = serve($app);
+    Peer $p = Peer($app->port(), '/echo');
+    time::instant $start = time::instant::now();
+
+    // the server closes; this client reads it and never answers
+    bool $sent = $p->text('quit');
+    int32 $code = closeCodeOf($p->next());
+    bool $ended = $p->ended();
+    time::duration $took = $start->elapsed();
+    bool $ran = waitCloses($seen, 1);
+    int32 $closedCode = $seen->closedCode->load();
+    bool $clean = $seen->clean->load();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $code == 4000, 'the close went out');
+    assert($ended, 'the connection ends anyway');
+    assert($took >= time::duration::secs(4) && $took < time::duration::secs(9), 'after the five second close wait');
+    assert($ran && $closedCode == 1006 && !$clean, 'onClose sees it was not clean');
+}

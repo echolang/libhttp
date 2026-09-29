@@ -145,6 +145,10 @@ public class Server
     private Shared $shared;
     private atomic<int32> $boundPort;
 
+    // a stop() that found no listen to wake, kept for the next one to see.
+    // Read and written under the wakeWrites lock
+    private atomic<bool> $stopAsked;
+
     public constructor()
     {
         $this->routes = array<Route>();
@@ -166,6 +170,7 @@ public class Server
         $this->wakeWrites = thread::mutex<array<int32>>(array<int32>());
         $this->shared = Shared();
         $this->boundPort = atomic<int32>(0);
+        $this->stopAsked = atomic<bool>(false);
     }
 
     destructor()
@@ -297,6 +302,9 @@ public class Server
         $this->limits->pingInterval = $d;
     }
 
+    /**
+     * The port the running `listen` bound, or 0 while none is running.
+     */
     public const function port() : int32
     {
         return $this->boundPort->load();
@@ -370,11 +378,15 @@ public class Server
 
     /**
      * Unblocks `listen`. Safe from another thread. Idle connections close
-     * at once. A request a worker already has still finishes.
+     * at once. A request a worker already has still finishes. A stop that
+     * comes while no listen is running, even one that is only starting, is
+     * kept: the next `listen` binds, then returns at once.
      */
     public function stop() : void
     {
         thread::locked<array<int32>> $wr = $this->wakeWrites->lock();
+
+        $this->stopAsked->store(true);
 
         if (!$wr->value->empty()) {
             $this->shared->stopping->store(true);
@@ -460,6 +472,12 @@ public class Server
 
             $held->value = $wrs;
             $this->shared = $shared;
+
+            // stop() ran before there was a pipe to wake: the reactors see it first thing
+            if ($this->stopAsked->load()) {
+                $shared->stopping->store(true);
+                wakeAll($wrs);
+            }
         }
 
         $this->boundPort->store($bound);
@@ -570,5 +588,7 @@ public class Server
         thread::locked<array<int32>> $wr = $this->wakeWrites->lock();
 
         closeAll($wr->value);
+        $this->stopAsked->store(false);
+        $this->boundPort->store(0);
     }
 }

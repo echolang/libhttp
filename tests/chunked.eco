@@ -1,0 +1,168 @@
+/**
+ * The chunked decoder, driven through a Framer. No network.
+ */
+
+internal const string CHUNKED_HEAD = "POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+// the status a step failed with, 0 for ready, 1 for anything still waiting
+internal function stepStatus(const http::Step& $s) : int32
+{
+    return match ($s) {
+        http::Step::fail($e) => $e->status(),
+        http::Step::ready => 0,
+        else => 1,
+    };
+}
+
+// one advance over a whole chunked request whose body is `$chunks`
+internal function chunkedStep(const string& $chunks, usize $maxBody) : int32
+{
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $limits->maxBody = $maxBody;
+    $f->buffer->append(CHUNKED_HEAD);
+    $f->buffer->append($chunks);
+
+    return stepStatus($f->advance($limits));
+}
+
+#[group: "unit"]
+test empty_chunked_body_is_ready {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $f->buffer->append(CHUNKED_HEAD);
+    $f->buffer->append("0\r\n\r\nGET /next");
+
+    http::Step $s = $f->advance($limits);
+
+    assert(isReady($s), 'the last chunk alone is a body');
+    assert(readyBody($s, $f) == '', 'and it is empty');
+    assert($f->buffer == 'GET /next', 'the next request stays');
+}
+
+#[group: "unit"]
+test chunked_body_exactly_at_the_cap {
+    int32 $at = chunkedStep("5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n", 10);
+    int32 $over = chunkedStep("5\r\nhello\r\n5\r\nworld\r\n1\r\n!\r\n0\r\n\r\n", 10);
+    int32 $oneBig = chunkedStep("b\r\nhello world\r\n0\r\n\r\n", 10);
+
+    assert($at == 0, 'a body of exactly maxBody is accepted');
+    assert($over == 413, 'one byte more is 413');
+    assert($oneBig == 413, 'a single chunk past the cap is 413 before its data');
+}
+
+#[group: "unit"]
+test chunk_size_case_and_junk {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    $f->buffer->append(CHUNKED_HEAD);
+    $f->buffer->append("A\r\n0123456789\r\nf\r\n0123456789abcde\r\n0\r\n\r\n");
+
+    http::Step $s = $f->advance($limits);
+
+    assert(readyBody($s, $f)->size() == 25, 'upper and lower hex');
+    assert(chunkedStep("5 x\r\nhello\r\n0\r\n\r\n", 64) == 400, 'junk after the size');
+    assert(chunkedStep("5 ;a=b\r\nhello\r\n0\r\n\r\n", 64) == 0, 'whitespace before an extension');
+    assert(chunkedStep("5;a\rb\r\nhello\r\n0\r\n\r\n", 64) == 400, 'a bare CR in an extension');
+    assert(chunkedStep("5\r\nhello\n0\r\n\r\n", 64) == 400, 'a bare LF after the data');
+    assert(chunkedStep("-5\r\nhello\r\n0\r\n\r\n", 64) == 400, 'a sign');
+    assert(chunkedStep(" 5\r\nhello\r\n0\r\n\r\n", 64) == 400, 'leading space');
+    assert(chunkedStep("\r\nhello\r\n0\r\n\r\n", 64) == 400, 'an empty size line');
+}
+
+#[group: "unit"]
+test chunk_size_line_is_capped {
+    string $ext = '';
+
+    while ($ext->size() < 1100) {
+        $ext->append('abcdefghij');
+    }
+
+    int32 $long = chunkedStep("5;{$ext}\r\nhello\r\n0\r\n\r\n", 64);
+    int32 $endless = chunkedStep("5;{$ext}", 64);
+    int32 $fits = chunkedStep("5;{$ext->sub(0, 1000)}\r\nhello\r\n0\r\n\r\n", 64);
+
+    assert($long == 400, 'a size line past 1 KiB');
+    assert($endless == 400, 'no line feed and past 1 KiB already');
+    assert($fits == 0, 'a long extension under the cap is ignored');
+}
+
+#[group: "unit"]
+test chunk_overhead_is_capped {
+    string $ext = '';
+
+    while ($ext->size() < 1000) {
+        $ext->append('abcdefghij');
+    }
+
+    // each chunk is one byte of body behind a kilobyte of extension
+    string $chunks = '';
+    int32 $i = 0;
+
+    while ($i < 70) {
+        $chunks->append("1;{$ext}\r\nx\r\n");
+        $i = $i + 1;
+    }
+
+    // still going: the wire bytes, not the body, pass maxBody * 2 plus slack
+    int32 $going = chunkedStep($chunks, 1000);
+
+    $chunks->append("0\r\n\r\n");
+
+    // the same bytes, finished in one read, are a body of 70
+    int32 $finished = chunkedStep($chunks, 1000);
+
+    assert($going == 413, 'overhead past the wire cap is 413');
+    assert($finished == 0, 'a finished body is measured by what it decodes to');
+}
+
+#[group: "unit"]
+test chunked_trailers_are_checked {
+    string $pad = '';
+
+    while ($pad->size() < 9000) {
+        $pad->append('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    }
+
+    int32 $noColon = chunkedStep("0\r\nnot a header\r\n\r\n", 64);
+    int32 $bigDone = chunkedStep("0\r\nX-Pad: {$pad}\r\n\r\n", 64);
+    int32 $bigGoing = chunkedStep("0\r\nX-Pad: {$pad}", 64);
+    int32 $two = chunkedStep("0\r\nA: 1\r\nB: 2\r\n\r\n", 64);
+
+    assert($noColon == 400, 'a trailer without a colon');
+    assert($bigDone == 413, 'trailers past 8 KiB');
+    assert($bigGoing == 413, 'trailers past 8 KiB and not ended yet');
+    assert($two == 0, 'several trailers');
+}
+
+#[group: "unit"]
+test chunked_upload_under_an_unbounded_cap {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = http::Limits();
+
+    // the parse() helper's cap, and what Server::maxBody takes unclamped
+    $limits->maxBody = std::math::MAX_USIZE;
+
+    string $data = '';
+
+    while ($data->size() < 200000) {
+        $data->append('0123456789');
+    }
+
+    $f->buffer->append(CHUNKED_HEAD);
+    $f->buffer->append("30d40\r\n");
+    $f->buffer->append($data->sub(0, 100000));
+
+    http::Step $half = $f->advance($limits);
+
+    $f->buffer->append($data->sub(100000, 100000));
+    $f->buffer->append("\r\n0\r\n\r\n");
+
+    http::Step $whole = $f->advance($limits);
+
+    assert(stepStatus($half) == 1, 'half the chunk waits for the rest');
+    assert(readyBody($whole, $f)->size() == 200000, 'and the rest completes it');
+}

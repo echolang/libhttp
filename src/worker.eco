@@ -38,21 +38,24 @@ internal struct Parked
 }
 
 /**
- * A connection on its way back to the reactor: a kept HTTP one, or an open
- * websocket.
+ * A connection on its way back to the reactor: a kept HTTP one, an open
+ * websocket, or one whose last response is out and whose write side is
+ * shut, for the reactor to drain until the client hangs up.
  */
 internal enum Back
 {
     case kept(Parked $p);
     case socket(WsConn $ws);
+    case linger(int32 $fd);
 }
 
 internal enum Job
 {
     case serve(Visit $visit);
 
-    // the reactor could not make a request of the bytes: answer, then close
-    case fail(int32 $fd, WireError $e);
+    // the reactor could not make a request of the bytes: answer, then close.
+    // `$home` is the reactor that lingers on the close
+    case fail(int32 $fd, int32 $home, WireError $e);
 
     // something for an open websocket's worker to do
     case ws(WsConn $ws, WsEvent $event);
@@ -105,14 +108,56 @@ internal struct Home
 }
 
 /**
- * Writes one response and ends the connection with a lingering close, so a
- * client still sending (a 413 body, a pipelined request) reads the answer
- * instead of a reset.
+ * Writes one response and ends the connection, which `linger` closes.
  */
-internal function respond(Conn& $conn, const Response& $res, bool $sendBody) : void
+internal function respond(Conn& $conn, const Response& $res, bool $sendBody, array<Home>& $homes, int32 $home, Shared $shared) : void
 {
     $conn->writeAll(render($res, $sendBody));
-    $conn->finish();
+    linger($conn, $homes, $home, $shared);
+}
+
+/**
+ * Ends a connection after its last response with a lingering close, so a
+ * client still sending (a 413 body, a pipelined request) reads the answer
+ * instead of a reset. The write side shuts here and the reactor drains the
+ * rest, so the worker never waits on the client. The connection counts as
+ * live until the reactor closes it.
+ */
+internal function linger(Conn& $conn, array<Home>& $homes, int32 $home, Shared $shared) : void
+{
+    lingerOn($conn->release(), $homes, $home, $shared);
+}
+
+/**
+ * `linger` for a bare descriptor this worker owns. A server that is stopping
+ * may have no reactor left to drain it, and `listen` waits on the workers
+ * anyway, so the worker lingers itself then.
+ */
+internal function lingerOn(int32 $fd, array<Home>& $homes, int32 $home, Shared $shared) : void
+{
+    if ($fd < 0) {
+        $shared->live->sub(1);
+        return;
+    }
+
+    if ($shared->stopping->load()) {
+        http_finish($fd);
+        $shared->live->sub(1);
+        return;
+    }
+
+    // the client is gone already: nothing to drain
+    if (http_shut_write($fd) != 0) {
+        http_close($fd);
+        $shared->live->sub(1);
+        return;
+    }
+
+    if (!$homes[$home]->hand(Back::linger($fd))) {
+        // no reactor to take it: linger here, the one time a worker waits
+        http_finish($fd);
+        $shared->live->sub(1);
+    }
 }
 
 /**
@@ -263,8 +308,7 @@ internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<
     }
 
     if (closes($persist) || $shared->stopping->load()) {
-        $conn->finish();
-        $shared->live->sub(1);
+        linger($conn, $homes, $visit->home, $shared);
         return;
     }
 
@@ -288,11 +332,10 @@ internal function workerLoop(JobQueue $jobs, array<Home> $homes, function<Respon
             Job::serve($visit) => {
                 serveVisit($visit, $homes, $app, $limits, $shared);
             },
-            Job::fail($fd, $e) => {
+            Job::fail($fd, $home, $e) => {
                 Conn $conn = Conn($fd);
 
-                respond($conn, errorResponse($e->status(), $e->body()), true);
-                $shared->live->sub(1);
+                respond($conn, errorResponse($e->status(), $e->body()), true, $homes, $home, $shared);
             },
             Job::ws($ws, $event) => {
                 serveSocket($ws, $event, $homes, $shared);
@@ -312,8 +355,7 @@ internal function upgrade(Conn $conn, const Visit& $visit, const Request& $asked
     result<string, UpgradeError> $checked = upgradeKey($req);
 
     string $key = guard $checked else ($e) {
-        respond($conn, refusal($e), !methodEq($req->method, Method::head));
-        $shared->live->sub(1);
+        respond($conn, refusal($e), !methodEq($req->method, Method::head), $homes, $visit->home, $shared);
         return;
     }
 
@@ -364,16 +406,17 @@ internal function serveSocket(WsConn $ws, WsEvent $event, array<Home>& $homes, S
         WsEvent::close($code, $reason) => {
             // the answer to the client's close, unless this was the answer to ours
             $s->shut($code, '');
-            end($ws, Close($code, $reason, true), $shared);
+            finishClose($ws, Close($code, $reason, true), $homes, $shared);
             return;
         },
         WsEvent::fail($code) => {
             $s->shut($code, '');
-            end($ws, Close($code, '', false), $shared);
+            finishClose($ws, Close($code, '', false), $homes, $shared);
             return;
         },
         WsEvent::gone => {
-            end($ws, Close(CLOSE_ABNORMAL, '', false), $shared);
+            // gone includes a peer still connected that went quiet or never answered our close
+            finishClose($ws, Close(CLOSE_ABNORMAL, '', false), $homes, $shared);
             return;
         },
         WsEvent::goingAway => {
@@ -409,6 +452,16 @@ internal function goAway(WsConn $ws, Shared $shared) : void
 {
     $ws->socket->shut(CLOSE_GOING_AWAY, 'server stopping');
     end($ws, Close(CLOSE_GOING_AWAY, '', false), $shared);
+}
+
+/**
+ * The end of a socket whose close frame went out: the reactor lingers on
+ * the connection while the client finishes its side, then `onClose`, once.
+ */
+internal function finishClose(WsConn $ws, Close $c, array<Home>& $homes, Shared $shared) : void
+{
+    lingerOn($ws->socket->take(), $homes, $ws->home, $shared);
+    $ws->channel->runClose($ws->socket, $c);
 }
 
 /**

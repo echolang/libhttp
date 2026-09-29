@@ -236,3 +236,160 @@ test too_big_is_1009_from_the_header {
     assert(failCode(server($parts)->advance(1000)) == 1009, 'fragments over together');
     assert((binaryOf(server(http::encode(http::OP_BINARY, filled(1000, 0), mask: KEY))->advance(1000)) ?? '') == filled(1000, 0), 'exactly the cap is fine');
 }
+
+#[group: "unit"]
+test unmask_matches_bytewise_xor {
+    uint8[4] $key = [0x37 as uint8, 0xFA as uint8, 0x21 as uint8, 0x3D as uint8];
+    usize $n = 0;
+
+    while ($n <= 1000) {
+        string $data = '';
+        usize $i = 0;
+
+        while ($i < $n) {
+            $data->push((($i * 7 + 3) & 0xFF) as uint8);
+            $i = $i + 1;
+        }
+
+        string $masked = http::unmask($data, KEY);
+
+        assert($masked->size() == $n, 'length');
+
+        $i = 0;
+
+        while ($i < $n) {
+            assert($masked->byte($i) == ($data->byte($i) ^ $key[$i % 4]), 'byte');
+            $i = $i + 1;
+        }
+
+        assert(http::unmask($masked, KEY) == $data, 'round trip');
+
+        if ($n < 40) {
+            $n = $n + 1;
+        } else {
+            $n = $n + 320;
+        }
+    }
+}
+
+#[group: "unit"]
+test close_inside_a_fragmented_message {
+    string $wire = http::encode(http::OP_TEXT, 'Hel', mask: KEY, $fin: false);
+
+    $wire->append(http::encode(http::OP_CLOSE, http::closePayload(1000, ''), mask: KEY));
+
+    http::Reader $r = server($wire);
+
+    assert(closeCodeOf($r->advance(BIG)) == 1000, 'a control frame may come between fragments');
+}
+
+#[group: "unit"]
+test empty_messages_and_fragments {
+    string $empty = http::encode(http::OP_TEXT, '', mask: KEY);
+    string $parts = http::encode(http::OP_TEXT, '', mask: KEY, $fin: false);
+
+    $parts->append(http::encode(http::OP_CONTINUATION, 'a', mask: KEY, $fin: false));
+    $parts->append(http::encode(http::OP_CONTINUATION, '', mask: KEY));
+
+    string $emptyBinary = http::encode(http::OP_BINARY, '', mask: KEY);
+
+    assert((textOf(server($empty)->advance(BIG)) ?? '(none)') == '', 'an empty text message');
+    assert((textOf(server($parts)->advance(BIG)) ?? '(none)') == 'a', 'empty fragments add nothing');
+    assert((binaryOf(server($emptyBinary)->advance(BIG)) ?? '(none)') == '', 'an empty binary message');
+}
+
+#[group: "unit"]
+test mid_message_is_tracked {
+    http::Reader $r = server(http::encode(http::OP_TEXT, 'Hel', mask: KEY, $fin: false));
+    bool $before = $r->midMessage();
+    bool $waiting = needsMore($r->advance(BIG));
+    bool $during = $r->midMessage();
+
+    $r->buffer->append(http::encode(http::OP_CONTINUATION, 'lo', mask: KEY));
+
+    string $whole = textOf($r->advance(BIG)) ?? '';
+
+    assert(!$before && $waiting && $during, 'inside a message after its first fragment');
+    assert($whole == 'Hello' && !$r->midMessage(), 'and out of it once it ends');
+}
+
+#[group: "unit"]
+test close_code_boundaries {
+    assert(http::closeCodeOk(1003) && !http::closeCodeOk(1004), '1004 is reserved');
+    assert(!http::closeCodeOk(1005) && !http::closeCodeOk(1006), 'never on the wire');
+    assert(http::closeCodeOk(1007) && http::closeCodeOk(1011), '1007 to 1011');
+    assert(!http::closeCodeOk(1012) && !http::closeCodeOk(1015), 'not for a peer to send');
+    assert(!http::closeCodeOk(2999) && http::closeCodeOk(3000), 'the registered range starts at 3000');
+    assert(http::closeCodeOk(4999) && !http::closeCodeOk(5000), 'private use ends at 4999');
+    assert(closeCodeOf(server(http::encode(http::OP_CLOSE, http::closePayload(4999, 'x'), mask: KEY))->advance(BIG)) == 4999, 'a private code comes through');
+}
+
+#[group: "unit"]
+test length_encoding_edges {
+    string $at125 = http::encode(http::OP_BINARY, filled(125, 1));
+    string $at126 = http::encode(http::OP_BINARY, filled(126, 1));
+    string $at65535 = http::encode(http::OP_BINARY, filled(65535, 1));
+    string $at65536 = http::encode(http::OP_BINARY, filled(65536, 1));
+
+    assert($at125->byte(1) == 125 && $at125->size() == 127, '125 fits the first byte');
+    assert($at126->byte(1) == 126 && $at126->byte(3) == 126 && $at126->size() == 130, '126 takes 16 bits');
+    assert($at65535->byte(1) == 126 && $at65535->byte(2) == 0xFF && $at65535->byte(3) == 0xFF, '65535 still 16 bits');
+    assert($at65536->byte(1) == 127 && $at65536->size() == 65546, '65536 takes 64 bits');
+    assert((binaryOf(client($at125)->advance(BIG)) ?? '')->size() == 125, '125 back');
+    assert((binaryOf(client($at126)->advance(BIG)) ?? '')->size() == 126, '126 back');
+    assert((binaryOf(client($at65535)->advance(BIG)) ?? '')->size() == 65535, '65535 back');
+}
+
+#[group: "unit"]
+test wide_length_a_byte_at_a_time {
+    string $payload = filled(70000, 66);
+    string $wire = http::encode(http::OP_BINARY, $payload, mask: KEY);
+    http::Reader $r = server('');
+    usize $i = 0;
+    bool $waited = true;
+
+    while ($i + 1 < $wire->size()) {
+        $r->buffer->push($wire->byte($i));
+
+        if (!needsMore($r->advance(BIG))) {
+            $waited = false;
+        }
+
+        $i = $i + 1;
+    }
+
+    $r->buffer->push($wire->byte($i));
+
+    assert($waited, 'not whole before the last byte');
+    assert((binaryOf($r->advance(BIG)) ?? '') == $payload, 'whole at the last byte');
+}
+
+#[group: "unit"]
+test close_reason_edges {
+    string $fits = filled(123, 97);
+    string $cut = filled(124, 97);
+    string $emoji = '';
+    usize $i = 0;
+
+    while ($i < 40) {
+        $emoji->append('😀');
+        $i = $i + 1;
+    }
+
+    string $wide = http::closePayload(1000, $emoji);
+
+    assert(http::closePayload(1000, $fits)->size() == 125, '123 bytes of reason fit exactly');
+    assert(http::closePayload(1000, $cut)->size() == 125, 'one more is cut');
+    assert($wide->size() <= 125 && ($wide->size() - 2) % 4 == 0, 'four-byte characters are cut whole');
+    assert(http::utf8Valid($wide->sub(2, $wide->size() - 2)), 'still UTF-8');
+}
+
+#[group: "unit"]
+test announced_frame_does_not_reserve_it {
+    // a masked binary frame header claiming 16 MiB, and no payload yet
+    http::Reader $r = server(bytes([0x82, 0xFF, 0, 0, 0, 0, 1, 0, 0, 0, 0x37, 0xFA, 0x21, 0x3D]));
+    http::WsStep $s = $r->advance(BIG * 32);
+
+    assert(needsMore($s), 'waiting for the payload');
+    assert($r->buffer->capacity() < BIG, 'sixteen megabytes announced is not sixteen reserved');
+}

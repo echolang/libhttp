@@ -43,21 +43,97 @@ internal struct HeadEnd
  * Where the head stops: the earliest blank line, CRLF or bare LF. Earliest,
  * because a bare LF head followed by a body holding CRLF CRLF must not end at
  * the body's.
+ *
+ * One pass over the line feeds, sixteen bytes at a time. Every blank line
+ * has one at a fixed place, so checking around each LF in order finds the
+ * earliest of both kinds and never reads the body behind it.
  */
 internal function findHeadEnd(const string& $raw) : HeadEnd?
 {
-    usize $crlf = $raw->find('\r\n\r\n');
-    usize $lf = $raw->find('\n\n');
+    usize $n = $raw->size();
+    usize $i = 0;
 
-    if ($lf < $crlf) {
-        return HeadEnd($lf, 2);
+    // raw reads: a byte() per byte is a stdlib call each under --optimize module
+    ptr<const uint8> $p = $raw->data();
+    simd<uint8, 16> $lf = simd::splat<uint8, 16>(CH_LF);
+
+    while ($i + 16 <= $n) {
+        uint64 $hits = simd::bitmask(simd::load<uint8, 16>($p:$ + $i) == $lf);
+
+        while ($hits != 0) {
+            usize $at = $i + (bits::trailing_zeros($hits) as usize);
+
+            HeadEnd $end = guard blankLineAt($p, $n, $at) else {
+                $hits = $hits & ($hits - 1);
+                continue;
+            }
+
+            return $end;
+        }
+
+        $i = $i + 16;
     }
 
-    if ($crlf < $raw->size()) {
-        return HeadEnd($crlf, 4);
+    while ($i < $n) {
+        if ($p:$[$i] == CH_LF) {
+            HeadEnd $end = guard blankLineAt($p, $n, $i) else {
+                $i = $i + 1;
+                continue;
+            }
+
+            return $end;
+        }
+
+        $i = $i + 1;
     }
 
     return null;
+}
+
+/**
+ * The blank line the LF at `$at` belongs to, if it is one: LF LF starting
+ * there, or CR LF CR LF starting one byte before.
+ */
+private function blankLineAt(ptr<const uint8> $p, usize $n, usize $at) : HeadEnd?
+{
+    if ($at + 1 >= $n) {
+        return null;
+    }
+
+    uint8 $next = $p:$[$at + 1];
+
+    if ($next == CH_LF) {
+        return HeadEnd($at, 2);
+    }
+
+    if ($next == CH_CR && $at >= 1 && $at + 2 < $n && $p:$[$at - 1] == CH_CR && $p:$[$at + 2] == CH_LF) {
+        return HeadEnd($at - 1, 4);
+    }
+
+    return null;
+}
+
+/**
+ * Room toward `$want` bytes, grown only as fast as bytes arrive: at most
+ * double what is buffered, or `GROW_AHEAD` past it, and never past `$want`.
+ * A peer that only announces a large body or frame gets a small buffer.
+ */
+internal function growToward(string& $buf, usize $want) : void
+{
+    usize $have = $buf->size();
+    usize $ahead = $have + GROW_AHEAD;
+
+    if ($have > GROW_AHEAD) {
+        $ahead = $have * 2;
+    }
+
+    if ($ahead > $want) {
+        $ahead = $want;
+    }
+
+    if ($buf->capacity() < $ahead) {
+        $buf->reserve($ahead);
+    }
 }
 
 internal function checkVersion(const string& $version) : status<WireError>
@@ -513,6 +589,8 @@ internal struct Framer
 
     private function start(const Limits& $limits) : Step
     {
+        $this->skipBlankLines();
+
         if ($this->buffer->empty()) {
             return .needMore;
         }
@@ -520,6 +598,33 @@ internal struct Framer
         $this->phase = Phase::head;
         $this->since = time::instant::now();
         return $this->head($limits);
+    }
+
+    /**
+     * Drops empty lines before a request line, which a server should ignore:
+     * some clients end a body with an extra CRLF. A CR alone at the end waits
+     * for its LF.
+     */
+    private function skipBlankLines() : void
+    {
+        usize $n = $this->buffer->size();
+        usize $skip = 0;
+
+        while ($skip < $n) {
+            uint8 $b = $this->buffer->byte($skip);
+
+            if ($b == CH_LF) {
+                $skip = $skip + 1;
+            } else if ($b == CH_CR && $skip + 1 < $n && $this->buffer->byte($skip + 1) == CH_LF) {
+                $skip = $skip + 2;
+            } else {
+                break;
+            }
+        }
+
+        if ($skip > 0) {
+            $this->buffer = $this->buffer->sub($skip, $n - $skip);
+        }
     }
 
     private function head(const Limits& $limits) : Step
@@ -587,7 +692,7 @@ internal struct Framer
         usize $want = $this->bodyAt + $need;
 
         if ($this->buffer->size() < $want) {
-            $this->buffer->reserve($want);
+            growToward($this->buffer, $want);
 
             if ($wantsContinue && $need > 0) {
                 return .sendContinue;
@@ -602,6 +707,7 @@ internal struct Framer
         usize $want = $this->bodyAt + $this->need;
 
         if ($this->buffer->size() < $want) {
+            growToward($this->buffer, $want);
             return .needMore;
         }
 

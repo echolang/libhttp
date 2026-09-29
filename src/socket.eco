@@ -285,20 +285,27 @@ public class Socket
      */
     internal function release() : void
     {
-        int32 $fd = -1;
-
-        // the lingering close can wait seconds: take the descriptor out and
-        // close it outside the lock, so a broadcast never waits on it
-        {
-            thread::locked<int32> $held = $this->fd->lock();
-
-            $fd = $held->value;
-            $held->value = -1;
-        }
+        // the lingering close can wait seconds: it happens outside the lock,
+        // so a broadcast never waits on it
+        int32 $fd = $this->take();
 
         if ($fd >= 0) {
             http_finish($fd);
         }
+    }
+
+    /**
+     * Takes the descriptor for the caller to close. Only the connection's
+     * owner calls this, once; every send after it answers false. -1 when
+     * it was already taken.
+     */
+    internal function take() : int32
+    {
+        thread::locked<int32> $held = $this->fd->lock();
+        int32 $fd = $held->value;
+
+        $held->value = -1;
+        return $fd;
     }
 }
 

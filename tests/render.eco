@@ -224,3 +224,63 @@ test mime_types_by_extension {
     assert(http::mimeOf('archive.tar.gz') == 'application/octet-stream', 'unknown');
     assert(http::mimeOf('dir.d/README') == 'application/octet-stream', 'a dot in a directory is not an extension');
 }
+
+#[group: "unit"]
+test serializer_owns_framing_in_any_case {
+    http::Response $r = http::Response(ok: 'hello');
+
+    $r->headers->add('content-length', '999');
+    $r->headers->add('TRANSFER-ENCODING', 'chunked');
+    $r->headers->add('connection', 'keep-alive');
+
+    string $bytes = http::render($r, true);
+
+    assert(!$bytes->contains('999') && !$bytes->contains('chunked') && !$bytes->contains('keep-alive'), 'dropped, whatever the case');
+    assert($bytes->contains('Content-Length: 5\r\n'), 'the real length');
+}
+
+#[group: "unit"]
+test lowercase_date_is_kept_once {
+    http::Response $r = http::Response(ok: '');
+
+    $r->headers->add('date', 'Thu, 01 Jan 1970 00:00:00 GMT');
+
+    string $bytes = http::render($r, true);
+
+    assert($bytes->contains('date: Thu, 01 Jan 1970'), 'the handler date');
+    assert(!$bytes->contains('Date: '), 'and no second one');
+}
+
+#[group: "unit"]
+test render_skips_control_bytes {
+    http::Response $r = http::Response(ok: 'x');
+
+    $r->header('X-Nul', "a\u{0}b");
+    $r->header('X-Lf', "a\nSet-Cookie: evil");
+    $r->header('X-Cr', "a\rb");
+    $r->header('X Space', 'c');
+    $r->header('X-Fine', 'ok');
+
+    string $bytes = http::render($r, true);
+
+    assert(!$bytes->contains('X-Nul') && !$bytes->contains('X-Lf') && !$bytes->contains('X-Cr'), 'values with control bytes');
+    assert(!$bytes->contains('evil'), 'no injected header');
+    assert(!$bytes->contains('X Space'), 'a name must be a token');
+    assert($bytes->contains('X-Fine: ok\r\n'), 'the rest goes out');
+}
+
+#[group: "unit"]
+test bodyless_statuses_ignore_the_framing {
+    string $chunked = http::renderHead(http::Response::noContent(), http::Length::chunked, http::Persist::keep);
+    string $interim = http::render(http::Response(100, 'no'), true);
+
+    assert(!$chunked->contains('Transfer-Encoding'), 'a 204 is never chunked');
+    assert(!$interim->contains('Content-Length') && !$interim->ends('no'), 'a 1xx has no body');
+}
+
+#[group: "unit"]
+test http_date_across_centuries {
+    assert(http::httpDate(951782400) == 'Tue, 29 Feb 2000 00:00:00 GMT', '2000 is a leap year');
+    assert(http::httpDate(4107542400) == 'Mon, 01 Mar 2100 00:00:00 GMT', '2100 is not');
+    assert(http::httpDate(253402300799) == 'Fri, 31 Dec 9999 23:59:59 GMT', 'the last four-digit second');
+}

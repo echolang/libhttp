@@ -1,0 +1,141 @@
+/**
+ * Response helpers, file serving, and the statuses errors turn into.
+ */
+
+use std::io;
+
+#[group: "unit"]
+test status_classes {
+    http::Response $ok = http::Response(ok: '');
+    http::Response $bad = http::Response::badRequest();
+    http::Response $down = http::Response(503, '');
+    http::Response $moved = http::Response(301, '');
+
+    assert($ok->success() && !$ok->clientError() && !$ok->serverError(), '200');
+    assert($bad->status == 400 && $bad->clientError() && !$bad->success(), '400');
+    assert(($bad->headers->get('Content-Type') ?? '') == 'text/plain; charset=utf-8', 'error responses are text');
+    assert($down->serverError() && !$down->clientError(), '503');
+    assert(!$moved->success() && !$moved->clientError() && !$moved->serverError(), '3xx is none of them');
+    assert(http::Response(299, '')->success() && !http::Response(300, '')->success(), '2xx edges');
+    assert(http::Response(499, '')->clientError() && http::Response(599, '')->serverError(), 'upper edges');
+}
+
+#[group: "unit"]
+test mime_table {
+    assert(http::mimeOf('a.htm') == 'text/html; charset=utf-8', 'htm');
+    assert(http::mimeOf('a.css') == 'text/css; charset=utf-8', 'css');
+    assert(http::mimeOf('a.mjs') == 'text/javascript; charset=utf-8', 'mjs');
+    assert(http::mimeOf('a.json') == 'application/json', 'json');
+    assert(http::mimeOf('a.xml') == 'application/xml', 'xml');
+    assert(http::mimeOf('a.png') == 'image/png', 'png');
+    assert(http::mimeOf('a.JPG') == 'image/jpeg' && http::mimeOf('a.jpeg') == 'image/jpeg', 'jpeg');
+    assert(http::mimeOf('a.gif') == 'image/gif', 'gif');
+    assert(http::mimeOf('a.webp') == 'image/webp', 'webp');
+    assert(http::mimeOf('a.ico') == 'image/x-icon', 'ico');
+    assert(http::mimeOf('a.wasm') == 'application/wasm', 'wasm');
+    assert(http::mimeOf('a.pdf') == 'application/pdf', 'pdf');
+    assert(http::mimeOf('a.woff2') == 'font/woff2', 'woff2');
+    assert(http::mimeOf('archive.tar.gz') == 'application/octet-stream', 'the last extension counts');
+}
+
+#[group: "unit"]
+test mime_odd_names {
+    assert(http::mimeOf('file.') == 'application/octet-stream', 'a trailing dot');
+    assert(http::mimeOf('.env') == 'application/octet-stream', 'a dotfile');
+    assert(http::mimeOf('README') == 'application/octet-stream', 'no extension');
+    assert(http::mimeOf('') == 'application/octet-stream', 'no name');
+    assert(http::mimeOf('/srv/www.site/index') == 'application/octet-stream', 'a dot in a directory only');
+}
+
+#[group: "unit"]
+test empty_file_has_length_zero {
+    string $dir = str::from(std::env::tmp());
+    int64 $pid = std::env::pid() as int64;
+    string $path = "{$dir}/libhttp-empty-{$pid}.txt";
+    result<usize, io::ioerror> $wrote = io::writefile($path, '');
+
+    http::Response $r = http::Response(file: $path);
+
+    result<bool, io::ioerror> $removed = io::remove($path);
+
+    assert($wrote->has_value(), 'wrote the fixture');
+    assert($r->status == 200, 'found');
+    assert($r->streamed() && "{$r}" == '200 (0 bytes, streamed)', 'a stream of nothing, with a length');
+}
+
+internal function fileThere(const string& $path) : bool
+{
+    bool $there = guard io::exists($path) else {
+        return false;
+    }
+
+    return $there;
+}
+
+#[group: "unit"]
+test unreadable_file_is_403 {
+    // readable by root only on either system; root reads anything, so skip it
+    string $path = '/etc/shadow';
+
+    if (!fileThere($path)) {
+        $path = '/etc/master.passwd';
+    }
+
+    string $user = str::from(std::env::var('USER', ''));
+
+    if ($user == 'root' || !fileThere($path)) {
+        return;
+    }
+
+    http::Response $r = http::Response(file: $path);
+
+    assert($r->status == 403, 'denied');
+    assert(!$r->streamed(), 'the refusal is a plain body');
+    assert(($r->headers->get('Content-Type') ?? '') == 'text/plain; charset=utf-8', 'as text');
+}
+
+#[group: "unit"]
+test file_path_with_a_nul_is_404 {
+    string $dir = str::from(std::env::tmp());
+    int64 $pid = std::env::pid() as int64;
+    string $path = "{$dir}/libhttp-nul-{$pid}.txt";
+    result<usize, io::ioerror> $wrote = io::writefile($path, 'secret');
+
+    // what a decoded %00 in a rest param looks like
+    http::Response $r = http::Response(file: "{$path}\u{0}.png");
+
+    result<bool, io::ioerror> $removed = io::remove($path);
+
+    assert($wrote->has_value(), 'wrote the fixture');
+    assert($r->status == 404, 'no file has a NUL in its name');
+}
+
+// a wire error as the status line it becomes
+internal function wireLine(const http::WireError& $e) : string
+{
+    int32 $status = $e->status();
+    string $body = $e->body();
+
+    return "{$status} {$body}";
+}
+
+#[group: "unit"]
+test wire_errors_answer_with_a_status_and_a_reason {
+    assert(wireLine(http::WireError::badRequest) == '400 Bad Request', '400');
+    assert(wireLine(http::WireError::tooLarge) == '413 Payload Too Large', '413');
+    assert(wireLine(http::WireError::timeout) == '408 Request Timeout', '408');
+    assert(wireLine(http::WireError::unsupportedCoding) == '501 Not Implemented', '501');
+    assert(wireLine(http::WireError::unsupportedVersion) == '505 HTTP Version Not Supported', '505');
+    assert(wireLine(http::WireError::expectationFailed) == '417 Expectation Failed', '417');
+
+    // the body is the reason phrase the status line carries
+    assert(http::reason(413) == 'Payload Too Large' && http::reason(505) == 'HTTP Version Not Supported', 'phrases agree');
+}
+
+#[group: "unit"]
+test reason_phrases {
+    assert(http::reason(304) == 'Not Modified', '304');
+    assert(http::reason(404) == 'Not Found', '404');
+    assert(http::reason(418) == 'Unknown', 'a status with no phrase');
+    assert(http::render(http::Response(418, 'tea'), true)->starts('HTTP/1.1 418 Unknown\r\n'), 'still a status line');
+}

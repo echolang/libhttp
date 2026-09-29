@@ -227,10 +227,16 @@ internal struct FileBody
 /**
  * Opens a file to serve, or the status to send instead. A directory
  * opens and has a size on POSIX, so we refuse it here, before the head
- * promises a length.
+ * promises a length. So is a path holding a NUL, which no file has.
  */
 internal function openFile(const string& $path) : result<FileBody, int32>
 {
+    // the C side would stop at a NUL and open a different file than the
+    // one the extension and the handler's checks were about
+    if ($path->find("\u{0}") < $path->size()) {
+        return .error(404);
+    }
+
     if (io::opendir($path)->has_value()) {
         return .error(404);
     }

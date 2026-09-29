@@ -127,12 +127,13 @@ public struct Headers
 }
 
 /**
- * A header name as it arrived before the colon. Empty, or holding a space or
- * tab, is refused: `Host : x` is how one hop reads a header another skips.
+ * A token as RFC 9110 spells it: letters, digits, and `!#$%&'*+-.^_`|~`.
+ * A header name is one, so a space, a colon, a control byte or a
+ * delimiter in a name is refused rather than read two ways.
  */
-private function nameOk(const string& $name) : bool
+internal function isToken(const string& $s) : bool
 {
-    usize $n = $name->size();
+    usize $n = $s->size();
     usize $i = 0;
 
     if ($n == 0) {
@@ -140,9 +141,7 @@ private function nameOk(const string& $name) : bool
     }
 
     while ($i < $n) {
-        uint8 $b = $name->byte($i);
-
-        if ($b == CH_SPACE || $b == CH_TAB) {
+        if (!tokenByte($s->byte($i))) {
             return false;
         }
 
@@ -152,9 +151,30 @@ private function nameOk(const string& $name) : bool
     return true;
 }
 
+private function tokenByte(uint8 $b) : bool
+{
+    if (($b >= CH_ZERO && $b <= CH_NINE) || ($b >= CH_UPPER_A && $b <= CH_UPPER_Z) || ($b >= CH_LOWER_A && $b <= CH_LOWER_Z)) {
+        return true;
+    }
+
+    string $marks = "!#$%&'*+-.^_`|~";
+    usize $i = 0;
+
+    while ($i < $marks->size()) {
+        if ($marks->byte($i) == $b) {
+            return true;
+        }
+
+        $i = $i + 1;
+    }
+
+    return false;
+}
+
 /**
  * Header lines from a request block. Folded continuations join onto the
- * header above. A line with no colon is a 400, not something to guess.
+ * header above. A line with no colon, a fold with no header above it, or a
+ * CR or NUL inside a value is a 400, not something to guess.
  */
 internal function parseHeaderBlock(const string& $raw) : result<Headers, WireError>
 {
@@ -179,12 +199,19 @@ internal function parseHeaderBlock(const string& $raw) : result<Headers, WireErr
         uint8 $first = $line->byte(0);
 
         if ($first == CH_SPACE || $first == CH_TAB) {
-            if ($pending) {
-                $folded = str::from(str::trim($line));
-
-                $pendingValue = "{$pendingValue} {$folded}";
+            // whitespace before the first header is how one hop sees a
+            // header another one skips
+            if (!$pending) {
+                return .error(.badRequest);
             }
 
+            $folded = str::from(str::trim($line));
+
+            if (!headerSafe($folded)) {
+                return .error(.badRequest);
+            }
+
+            $pendingValue = "{$pendingValue} {$folded}";
             continue;
         }
 
@@ -201,11 +228,15 @@ internal function parseHeaderBlock(const string& $raw) : result<Headers, WireErr
 
         $pendingName = $line->sub(0, $at);
 
-        if (!nameOk($pendingName)) {
+        if (!isToken($pendingName)) {
             return .error(.badRequest);
         }
 
         $pendingValue = str::from(str::trim($line->sub($at + 1, $line->size() - $at - 1)));
+
+        if (!headerSafe($pendingValue)) {
+            return .error(.badRequest);
+        }
         $pending = true;
     }
 
