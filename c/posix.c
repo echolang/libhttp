@@ -15,6 +15,9 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
 
+/* glibc hides syscall(2), which the futex needs, under a bare _POSIX_C_SOURCE */
+#define _DEFAULT_SOURCE
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
