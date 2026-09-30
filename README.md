@@ -175,6 +175,8 @@ A body comes one of two ways: a `Content-Length`, or `Transfer-Encoding: chunked
 
 Chunked framing is read strictly. Every line ends in CRLF, a chunk size is at most 16 hex digits, and `chunked` has to be the last coding and appear once. A request that sends both `Transfer-Encoding` and `Content-Length` is a 400. Two servers that each believe a different one is how a request gets smuggled past the first. So is a `Transfer-Encoding` on HTTP/1.0, which has no transfer codings.
 
+Headers are read just as strictly. A header name has to be a token, so a space, a colon or a control byte in one is a 400. So is whitespace before the first header, a CR or NUL inside a value, and a second `Host`. Empty lines before a request line are skipped, as RFC 9112 asks: some clients end a body with a stray CRLF.
+
 Two refusals get their own status. A coding other than `chunked` (`gzip`, `identity`) is 501, since this server does not decode it. An `HTTP/x.y` other than `HTTP/1.0` and `HTTP/1.1` is 505.
 
 `Expect: 100-continue` is answered for you. Once the head parses and the length fits `maxBody`, the server sends `HTTP/1.1 100 Continue` and then reads the body, so a client like curl does not sit out its own timeout first. A chunked upload gets its 100 too. A body that is too large gets its 413 instead of the 100. Any other `Expect` is 417. HTTP/1.0 has no 100, so its `Expect` is ignored.
@@ -289,7 +291,7 @@ Files are a stream with a known length:
 return Response(file: '/srv/site/index.html');
 ```
 
-That opens the file, sets `Content-Length` from its size and `Content-Type` from its extension, and streams it from disk in 64 KiB reads. A missing file or a directory is a 404, and one the process may not read is a 403, decided when the `Response` is built. The path is used as given. Keeping a request from naming something outside what you meant to serve (`..`, an absolute path) is the handler's job.
+That opens the file, sets `Content-Length` from its size and `Content-Type` from its extension, and streams it from disk in 64 KiB reads. A missing file or a directory is a 404, and one the process may not read is a 403, decided when the `Response` is built. The path is used as given. Keeping a request from naming something outside what you meant to serve (`..`, an absolute path) is the handler's job. Note that a `{path*}` param is percent-decoded, so `%2F` arrives as a real slash and `..` passes through as sent. A path with a NUL in it, which a decoded `%00` can put there, is a 404 rather than the file the name stops at.
 
 A HEAD, or a status that never has a body, sends the head and never runs the callback. A HEAD keeps the length when there is one.
 
@@ -426,7 +428,7 @@ $app->maxBody(1024 * 1024);                // default 1 MiB
 $app->headerTimeout(.secs(10));            // default 10 seconds
 $app->bodyTimeout(.secs(60));              // default 60 seconds
 $app->idleTimeout(.secs(5));               // default 5 seconds
-$app->maxRequests(100);                    // default 100 per connection
+$app->maxRequests(1000);                   // default 1000 per connection
 $app->maxConnections(1024);                // default 1024
 $app->maxQueueWait(.secs(1));              // default 1 second
 $app->maxMessage(1024 * 1024);             // websockets, default 1 MiB
@@ -441,9 +443,9 @@ Each timeout is one deadline for the whole phase, not a per-read allowance. A cl
 
 Complete requests wait in a queue until a worker is free. A new connection is answered `503 Service Unavailable` with `Retry-After: 1`, straight from the reactor, once the oldest waiting request has waited `maxQueueWait`, or `maxConnections` connections are open. It is the wait that counts, not the length: one read of a busy reactor can queue hundreds of requests that workers take within microseconds, and that is not a server falling behind. A flood costs a refusal instead of a longer and longer line. Every connection is a file descriptor, so keep `maxConnections` under the process's `ulimit -n`. If the process runs out anyway, the server stops accepting for a moment instead of spinning on it.
 
-A connection the server closes after answering gets a lingering close: the server shuts its side, drains what the client is still sending for up to two seconds, then closes. That is what lets a client mid-upload read its 413 instead of a reset. The 503 is the exception. It is a plain close, because draining on the reactor would stall everyone else.
+A connection the server closes after answering gets a lingering close: the server shuts its side, drains what the client is still sending for up to two seconds or 4 MiB, then closes. That is what lets a client mid-upload read its 413 instead of a reset. The worker only shuts the write side. The reactor does the draining as bytes arrive, so a client that reads its answer and never hangs up costs a slot for two seconds, not a worker. The same goes for a websocket after its close. The 503 is the exception. It is a plain close, sent before the connection ever had a slot.
 
-`stop()` is safe from another thread. Every reactor wakes, closes its idle connections, and stops accepting. Requests already on a worker finish, and their connections close after the response. Then `listen` returns the bound port. `workers(0)` fails with `Error::tooFewWorkers` before bind.
+`stop()` is safe from another thread. Every reactor wakes, closes its idle connections, and stops accepting. Requests already on a worker finish, and their connections close after the response. Then `listen` returns the bound port, and `port()` is 0 again. A `stop()` that comes while no `listen` is running, including one still starting up on another thread, is kept: the next `listen` binds and returns at once. A stopped server can `listen` again. `workers(0)` fails with `Error::tooFewWorkers` before bind.
 
 A handler that `die`s ends the process, not just its worker. So does a failed `assert`, a `guard` with no `else`, or an index past the end of an array. Echo has no catch, and a `crash::` hook can report but not recover. There is no half-alive pool to repair. When a request is bad, return an error `Response` instead of stopping, and run a production server under something that restarts it: systemd's `Restart=`, launchd's `KeepAlive`, or your container runtime.
 
@@ -478,14 +480,6 @@ echoc test --filter group:net     # loopback only
 ```
 
 The unit tests need no network at all. Parsing, routing, percent-decoding, and response rendering are pure Echo. The net tests bind `127.0.0.1:0`, send a request over a real socket, and `stop()`.
-
-The router has a benchmark. It is compiled only with the `bench` flag, so a plain `echoc test` never runs it:
-
-```bash
-echoc test --release --optimize whole --define bench --filter group:bench --verbose
-```
-
-Measure with `--optimize whole`. Under the default, `module`, the stdlib does not inline into this module, and a five-byte string compare costs 13 ns instead of 2. That turns every number into a benchmark of call overhead. Build your server the same way.
 
 ## Examples
 

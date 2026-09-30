@@ -1,10 +1,9 @@
 /**
- * A complete request in, a response out, the connection back or closed.
- * The same for a websocket: one whole message in, the hook run, the socket
- * back to the reactor.
+ * Whole request in, response out, connection parked or closed.
  *
- * A worker never waits on a client that is still sending. Writes still
- * block under the 10 second send timeout.
+ * Same shape for a websocket: one message, the hook, the socket back.
+ * Workers never wait on a client still sending. Writes still block
+ * under the send timeout.
  */
 
 use std::thread;
@@ -13,21 +12,21 @@ use std::time;
 namespace http;
 
 /**
- * One complete request and the connection it came in on: the reactor's
- * whole slot, moved rather than copied. Its Framer holds the request, and
- * its buffer the bytes past it, the start of the next one when pipelined.
+ * One request and its connection: the reactor's whole slot, moved.
+ * Framer holds the request; leftover bytes are the next one.
  */
 internal struct Visit
 {
     public int32 $fd;
 
-    // which reactor the connection goes back to
+    // which reactor the connection goes back to after the response
     public int32 $home;
     public Slot $slot;
 }
 
 /**
- * A kept connection on its way back to the reactor.
+ * A kept connection on its way back to the reactor, ready for the next
+ * request.
  */
 internal struct Parked
 {
@@ -38,32 +37,93 @@ internal struct Parked
 }
 
 /**
- * A connection on its way back to the reactor: a kept HTTP one, an open
- * websocket, or one whose last response is out and whose write side is
- * shut, for the reactor to drain until the client hangs up.
+ * Connection going home: kept HTTP, open websocket, or linger-drain.
  */
 internal enum Back
 {
     case kept(Parked $p);
     case socket(WsConn $ws);
     case linger(int32 $fd);
+
+    // a parked connection whose arm failed after the reactor had adopted it
+    // the reactor arms it again, or drops it
+    case rearm(int32 $fd);
+}
+
+/**
+ * Kept connections handed back without waking the reactor.
+ *
+ * The worker arms the fd itself. Only empty-buffer connections come
+ * this way; leftover bytes still take the pipe.
+ */
+#[atomic]
+internal class Inbox
+{
+    private thread::mutex<array<Parked>> $parked;
+
+    internal constructor()
+    {
+        $this->parked = thread::mutex<array<Parked>>(array<Parked>());
+    }
+
+    internal function put(mv Parked $p) : void
+    {
+        thread::locked<array<Parked>> $held = $this->parked->lock();
+
+        $held->value[] = mv $p;
+    }
+
+    /**
+     * Empty the inbox. Popped so each entry moves; order does not matter.
+     */
+    internal function takeAll() : array<Parked>
+    {
+        array<Parked> $out = array<Parked>();
+        thread::locked<array<Parked>> $held = $this->parked->lock();
+
+        while (!$held->value->empty()) {
+            $out[] = $held->value->pop();
+        }
+
+        return $out;
+    }
+
+    /**
+     * Take back `$fd`. False if the reactor adopted it first.
+     */
+    internal function remove(int32 $fd) : bool
+    {
+        thread::locked<array<Parked>> $held = $this->parked->lock();
+        usize $n = $held->value->count();
+        usize $i = 0;
+
+        while ($i < $n) {
+            if ($held->value[$i]->fd == $fd) {
+                $held->value->remove($i);
+                return true;
+            }
+
+            $i = $i + 1;
+        }
+
+        return false;
+    }
 }
 
 internal enum Job
 {
     case serve(Visit $visit);
 
-    // the reactor could not make a request of the bytes: answer, then close.
+    // the reactor could not make a request of the bytes: answer, then close
     // `$home` is the reactor that lingers on the close
     case fail(int32 $fd, int32 $home, WireError $e);
 
-    // something for an open websocket's worker to do
+    // something for an open websocket's worker to do: a message, a ping, a close
     case ws(WsConn $ws, WsEvent $event);
 }
 
 /**
- * What the reactors and every worker share. `#[atomic]` because all of them
- * hold it.
+ * What reactors and workers share. `#[atomic]` because they all hold it.
  */
 #[atomic]
 internal class Shared
@@ -84,17 +144,21 @@ internal class Shared
 }
 
 /**
- * Where a worker hands a connection back: one reactor's return channel, and
- * the pipe that wakes it.
+ * Where a worker hands a connection back: one reactor's return channel,
+ * and the pipe that wakes it.
  */
 internal struct Home
 {
     public thread::sender<Back> $back;
     public int32 $wake;
 
+    // the reactor's event set, which a worker arms parked connections on
+    public int32 $ev;
+    public Inbox $inbox;
+
     /**
-     * Sends `$b` home and wakes the reactor. False when that reactor is
-     * gone; `$b` is then dropped with this call.
+     * Send `$b` home and wake the reactor. False if that reactor is gone;
+     * `$b` is dropped, so the caller still closes it.
      */
     public function hand(Back $b) : bool
     {
@@ -105,10 +169,35 @@ internal struct Home
         http_wake($this->wake);
         return true;
     }
+
+    /**
+     * Park a kept connection with nothing buffered, without waking the
+     * reactor. Put on the inbox before arming.
+     */
+    public function park(mv Parked $p, Shared $shared) : void
+    {
+        int32 $fd = $p->fd;
+
+        $this->inbox->put(mv $p);
+
+        if (http_ev_arm($this->ev, $fd, 1) == 0) {
+            return;
+        }
+
+        // whoever holds the entry owns the connection, and the one who owns
+        // it closes it
+        if ($this->inbox->remove($fd)) {
+            http_close($fd);
+            $shared->live->sub(1);
+            return;
+        }
+
+        $this->hand(Back::rearm($fd));
+    }
 }
 
 /**
- * Writes one response and ends the connection, which `linger` closes.
+ * Write one response and linger-close. Parse failures, handshake refusals.
  */
 internal function respond(Conn& $conn, const Response& $res, bool $sendBody, array<Home>& $homes, int32 $home, Shared $shared) : void
 {
@@ -117,11 +206,9 @@ internal function respond(Conn& $conn, const Response& $res, bool $sendBody, arr
 }
 
 /**
- * Ends a connection after its last response with a lingering close, so a
- * client still sending (a 413 body, a pipelined request) reads the answer
- * instead of a reset. The write side shuts here and the reactor drains the
- * rest, so the worker never waits on the client. The connection counts as
- * live until the reactor closes it.
+ * Linger-close after the last response so a client still sending reads
+ * the answer instead of a reset. Write side shuts here; the reactor
+ * drains. Worker never waits.
  */
 internal function linger(Conn& $conn, array<Home>& $homes, int32 $home, Shared $shared) : void
 {
@@ -129,9 +216,8 @@ internal function linger(Conn& $conn, array<Home>& $homes, int32 $home, Shared $
 }
 
 /**
- * `linger` for a bare descriptor this worker owns. A server that is stopping
- * may have no reactor left to drain it, and `listen` waits on the workers
- * anyway, so the worker lingers itself then.
+ * `linger` for a bare fd. If no reactor is left (server stopping), the
+ * worker lingers itself: the one time it waits on a client.
  */
 internal function lingerOn(int32 $fd, array<Home>& $homes, int32 $home, Shared $shared) : void
 {
@@ -146,7 +232,7 @@ internal function lingerOn(int32 $fd, array<Home>& $homes, int32 $home, Shared $
         return;
     }
 
-    // the client is gone already: nothing to drain
+    // the client is gone already. nothing to drain
     if (http_shut_write($fd) != 0) {
         http_close($fd);
         $shared->live->sub(1);
@@ -161,8 +247,8 @@ internal function lingerOn(int32 $fd, array<Home>& $homes, int32 $home, Shared $
 }
 
 /**
- * The route table as a handler: match, 404 or 405 with `Allow`, params, then
- * the route's own handler.
+ * Route table as a handler: match, 404 or 405 with `Allow`, then the
+ * route's handler.
  */
 internal function dispatch(const Router& $router, Request $req) : Response
 {
@@ -185,7 +271,7 @@ internal function dispatch(const Router& $router, Request $req) : Response
 
     Response $res = $router->routes[$at]->handler($req);
 
-    // the Socket keeps the request as the handler saw it, params and all
+    // Socket keeps the request as the handler saw it, params and all
     if ($res->upgrades()) {
         $res->origin = $req;
     }
@@ -194,9 +280,7 @@ internal function dispatch(const Router& $router, Request $req) : Response
 }
 
 /**
- * What this response tells the client about the connection. Kept only when
- * the client asked, the connection has requests left, and the server is not
- * stopping.
+ * Keep-alive for this response: client asked, requests left, not stopping.
  */
 internal function persistFor(const Request& $req, int32 $served, const Limits& $limits, const Shared& $shared) : Persist
 {
@@ -228,9 +312,8 @@ internal function closes(const Persist& $p) : bool
 }
 
 /**
- * Sends a streamed response: the head, then the callback through a Writer.
- * A length is Content-Length. No length over HTTP/1.1 is chunked. HEAD,
- * or a status with no body, never runs the stream.
+ * Streamed response: head, then the callback. A length is
+ * Content-Length; none over HTTP/1.1 is chunked. HEAD never runs it.
  */
 internal function streamTo(Conn $conn, const Response& $res, bool $head, bool $http11, const Persist& $persist, Shared $shared) : bool
 {
@@ -291,7 +374,7 @@ internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<
     bool $whole = false;
 
     if ($res->streamed()) {
-        // an HTTP/1.0 client can only read the end of an unsized body as the close
+        // HTTP/1.0 can only see the end of an unsized body as the close
         if (!$http11 && !$head && $res->length < 0 && !bodyless($res->status)) {
             $persist = Persist::close;
         }
@@ -302,7 +385,7 @@ internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<
     }
 
     if (!$whole) {
-        // the client is gone, or the body fell short: the conn closes on drop
+        // the client is gone, or the body fell short. the conn closes on drop
         $shared->live->sub(1);
         return;
     }
@@ -314,6 +397,12 @@ internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<
 
     int32 $fd = $conn->release();
     Parked $parked = Parked($fd, $visit->slot->peer, $visit->slot->framer->buffer, $visit->slot->served + 1);
+
+    // nothing pipelined: park without waking the reactor
+    if ($parked->rest->empty()) {
+        $homes[$visit->home]->park(mv $parked, $shared);
+        return;
+    }
 
     if (!$homes[$visit->home]->hand(Back::kept($parked))) {
         http_close($fd);
@@ -345,9 +434,8 @@ internal function workerLoop(JobQueue $jobs, array<Home> $homes, function<Respon
 }
 
 /**
- * Answers a websocket response: the 101, `onOpen`, and the socket handed to
- * the reactor. A request that is not a valid upgrade gets its 426 or 400 and
- * the connection closes, with no hook run.
+ * Websocket response: 101, `onOpen`, socket to the reactor. A bad
+ * upgrade gets 426 or 400, no hook.
  */
 internal function upgrade(Conn $conn, const Visit& $visit, const Request& $asked, const Response& $res, array<Home>& $homes, Shared $shared) : void
 {
@@ -364,7 +452,7 @@ internal function upgrade(Conn $conn, const Visit& $visit, const Request& $asked
     Channel $channel = $to->channel;
     string $protocol = '';
 
-    // a client must fail a handshake that names a subprotocol it did not offer
+    // only echo a subprotocol the client actually offered
     if (hasToken($req->headers, 'Sec-WebSocket-Protocol', $to->protocol, exact: true)) {
         $protocol = $to->protocol;
     }
@@ -383,8 +471,7 @@ internal function upgrade(Conn $conn, const Visit& $visit, const Request& $asked
 }
 
 /**
- * One thing done for an open websocket, then the socket back to the reactor,
- * unless it ended.
+ * One event for an open websocket, then the socket back, unless it ended.
  */
 internal function serveSocket(WsConn $ws, WsEvent $event, array<Home>& $homes, Shared $shared) : void
 {
@@ -392,7 +479,7 @@ internal function serveSocket(WsConn $ws, WsEvent $event, array<Home>& $homes, S
 
     match ($event) {
         WsEvent::message($m) => {
-            // once a close went out, what the client still sends is read and dropped
+            // after our close, leftover client frames are read and dropped
             if (!$s->closing()) {
                 $ws->channel->runMessage($s, $m);
             }
@@ -415,7 +502,8 @@ internal function serveSocket(WsConn $ws, WsEvent $event, array<Home>& $homes, S
             return;
         },
         WsEvent::gone => {
-            // gone includes a peer still connected that went quiet or never answered our close
+            // gone includes a peer still connected that went quiet or never
+            // answered our close. 1006 either way
             finishClose($ws, Close(CLOSE_ABNORMAL, '', false), $homes, $shared);
             return;
         },
@@ -429,8 +517,7 @@ internal function serveSocket(WsConn $ws, WsEvent $event, array<Home>& $homes, S
 }
 
 /**
- * Hands an open socket back to the reactor. A server that is stopping gets
- * a 1001 instead: the reactor may already have stopped taking sockets back.
+ * Hand an open socket back to the reactor. Stopping: 1001 instead.
  */
 internal function park(WsConn $ws, array<Home>& $homes, Shared $shared) : void
 {
@@ -439,14 +526,14 @@ internal function park(WsConn $ws, array<Home>& $homes, Shared $shared) : void
         return;
     }
 
-    // the failed send dropped its copy; this one still owns the socket
+    // the failed send dropped its copy. this one still owns the socket
     if (!$homes[$ws->home]->hand(Back::socket($ws))) {
         end($ws, Close(CLOSE_ABNORMAL, '', false), $shared);
     }
 }
 
 /**
- * Closes a socket because the server is stopping.
+ * Close because the server is stopping: 1001, then `onClose`.
  */
 internal function goAway(WsConn $ws, Shared $shared) : void
 {
@@ -455,8 +542,7 @@ internal function goAway(WsConn $ws, Shared $shared) : void
 }
 
 /**
- * The end of a socket whose close frame went out: the reactor lingers on
- * the connection while the client finishes its side, then `onClose`, once.
+ * Close frame went out: linger while the client finishes, then `onClose`.
  */
 internal function finishClose(WsConn $ws, Close $c, array<Home>& $homes, Shared $shared) : void
 {
@@ -465,7 +551,7 @@ internal function finishClose(WsConn $ws, Close $c, array<Home>& $homes, Shared 
 }
 
 /**
- * The end of a socket: the connection closed, then `onClose`, once.
+ * Connection already gone, then `onClose`, once.
  */
 internal function end(WsConn $ws, Close $c, Shared $shared) : void
 {

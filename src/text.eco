@@ -1,7 +1,5 @@
 /**
- * Named ASCII bytes the rest of the module compares against.
- *
- * A mistyped `34` is a name the compiler can refuse.
+ * Named ASCII bytes. A mistyped `34` compiles; `CH_CR` does not.
  */
 
 namespace http;
@@ -45,13 +43,12 @@ internal const int64 HEADER_TIMEOUT_SECS = 10;
 internal const int64 BODY_TIMEOUT_SECS = 60;
 internal const int64 IDLE_TIMEOUT_SECS = 5;
 internal const int64 QUEUE_WAIT_MS = 1000;
-internal const int32 DEFAULT_MAX_REQUESTS = 100;
+internal const int32 DEFAULT_MAX_REQUESTS = 1000;
 internal const int32 DEFAULT_MAX_CONNECTIONS = 1024;
 internal const usize DEFAULT_MESSAGE_CAP = 1048576;
 internal const int64 PING_INTERVAL_SECS = 30;
 internal const int64 CLOSE_WAIT_SECS = 5;
 
-// the lingering close: how long, and how much, a client may still send
-// after its last response before the reactor gives up on it
+// lingering close: how long, and how much, before the reactor gives up
 internal const int64 LINGER_MS = 2000;
 internal const int64 LINGER_CAP = 4194304;

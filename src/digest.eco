@@ -1,12 +1,11 @@
 /**
- * SHA-1, base64, and UTF-8 checking: the three things the websocket handshake
- * and frames need that the standard library does not have.
+ * SHA-1, base64, UTF-8: the three things websockets need that stdlib
+ * does not have.
  *
- * SHA-1 is here for `Sec-WebSocket-Accept` and nothing else. It is broken for
- * anything that needs collision resistance, and the handshake does not: the
- * accept key only proves the server read the request.
- *
- * `uint32` arithmetic wraps, which is what SHA-1's additions want.
+ * SHA-1 is here for `Sec-WebSocket-Accept` and nothing else. It is
+ * broken for collision resistance, and the handshake does not need
+ * that: the accept key only proves we read the request. `uint32`
+ * arithmetic wraps, which is what SHA-1's additions want.
  */
 
 namespace http;
@@ -229,8 +228,8 @@ internal function keyShape(const string& $key) : bool
 internal const usize UTF8_WINDOW = 64;
 
 /**
- * Whether `$s` is well-formed UTF-8: no overlong forms, no surrogates, nothing
- * past U+10FFFF, and no sequence cut short.
+ * Well-formed UTF-8: no overlongs, no surrogates, nothing past U+10FFFF,
+ * no sequence cut short.
  */
 internal function utf8Valid(const string& $s) : bool
 {

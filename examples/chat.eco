@@ -1,8 +1,8 @@
 use http::{Server, Request, Response, Channel, Message, Close, Group, Socket};
 
 /**
- * The rooms, as `Group`s. Two fixed ones keep the example short:
- * `/chat/lobby`, and every other name shares the second.
+ * Rooms as `Group`s. Two of them keep the example short: lobby, and
+ * everything else.
  */
 #[atomic]
 internal class Rooms

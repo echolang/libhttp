@@ -1,22 +1,13 @@
 /**
- * Websockets as a handler sees them: a `Channel` of hooks, a `Socket` per
- * connection, and the `Message` and `Close` values the hooks are handed.
+ * Websockets as a handler sees them: `Channel`, `Socket`, `Message`, `Close`.
  *
- * An open socket lives on the reactor, the same as an idle keep-alive
- * connection, so it costs a file descriptor and not a worker. When a whole
- * message arrives, `onMessage` runs on a worker, and the socket goes back to
- * the reactor once it returns. One socket's messages are handled in order,
- * one at a time; different sockets run in parallel.
+ * An open socket lives on the reactor, so it costs an fd, not a worker.
+ * A whole message runs `onMessage` on a worker, then the socket goes
+ * back. One socket is in-order; different sockets run in parallel.
  *
- * A `Socket` is safe to hold and use from any thread, which is what a chat
- * room's broadcast needs. Its fd sits behind a lock, and only the connection's
- * owner closes it, so a send from elsewhere never lands on a descriptor that
- * was closed and handed to someone new. A send blocks under the socket's 10
- * second send timeout, the same as a streamed response.
- *
- * `onClose` runs exactly once for every socket whose `onOpen` ran, whether
- * the client closed, the server did, the client vanished, or the server is
- * stopping.
+ * A `Socket` is safe from any thread. The fd is locked, and only the
+ * owner closes it, so a broadcast never writes a recycled descriptor.
+ * `onClose` runs once for every socket whose `onOpen` ran.
  */
 
 use std::thread;
@@ -25,8 +16,10 @@ use std::time;
 namespace http;
 
 /**
- * One whole message from the client, fragments already put together. RFC 6455
- * has exactly these two kinds. Text is checked UTF-8 before a handler sees it.
+ * One whole message from the client, fragments already put together.
+ *
+ * RFC 6455 has exactly these two kinds. Text is checked UTF-8 before a
+ * handler sees it.
  */
 public enum Message
 {
@@ -35,9 +28,11 @@ public enum Message
 }
 
 /**
- * How a socket ended. `$code` is what the close frame said: 1005 when the
- * client sent one with no code, 1006 when there was no close frame at all,
- * and the server's own code when it closed first or the client broke the
+ * How a socket ended.
+ *
+ * `$code` is what the close frame said: 1005 when the client sent one
+ * with no code, 1006 when there was no close frame at all, and the
+ * server's own code when it closed first or the client broke the
  * protocol. `$clean` is whether the client sent a close frame.
  */
 public struct Close
@@ -48,10 +43,10 @@ public struct Close
 }
 
 /**
- * The hooks one kind of websocket runs. Set them before `listen`, the same
- * as routes. A hook left unset is skipped.
+ * The hooks one kind of websocket runs.
  *
- * `#[atomic]` because every worker reads it.
+ * Set them before `listen`, the same as routes. A hook left unset is
+ * skipped. `#[atomic]` because every worker reads it.
  */
 #[atomic]
 public class Channel
@@ -68,7 +63,7 @@ public class Channel
     }
 
     /**
-     * Runs once the handshake is done, before the first message.
+     * Once the handshake is done, before the first message.
      */
     public function onOpen(function<void(Socket)> $fn) : void
     {
@@ -76,7 +71,7 @@ public class Channel
     }
 
     /**
-     * Runs for every whole message, in order.
+     * Every whole message, in order, on a worker.
      */
     public function onMessage(function<void(Socket, Message)> $fn) : void
     {
@@ -84,7 +79,7 @@ public class Channel
     }
 
     /**
-     * Runs once, after the connection is closed.
+     * Once, after the connection is closed.
      */
     public function onClose(function<void(Socket, Close)> $fn) : void
     {
@@ -120,11 +115,8 @@ public class Channel
 }
 
 /**
- * One open websocket.
- *
- * `$request` is the request that was upgraded, route params included, so a
- * hook can tell `/chat/{room}` rooms apart. `$protocol` is the subprotocol
- * the handshake agreed on, or empty.
+ * One open websocket. `$request` is the upgrade, params included.
+ * `$protocol` is what the handshake agreed on, or empty.
  */
 #[atomic]
 public class Socket
@@ -134,10 +126,10 @@ public class Socket
     private int64 $serial;
     private thread::mutex<int32> $fd;
 
-    // a close frame has gone out: no more data frames may follow it
+    // a close frame has gone out. no more data frames may follow it
     private atomic<bool> $closing;
 
-    // a send failed. The client is gone or stopped reading
+    // a send failed. the client is gone or stopped reading
     private atomic<bool> $broken;
     private Shared $shared;
 
@@ -153,8 +145,7 @@ public class Socket
     }
 
     /**
-     * A number no other socket of this `listen` has. What a registry keys
-     * sockets by.
+     * Number no other socket of this `listen` has.
      */
     public const function id() : int64
     {
@@ -162,8 +153,7 @@ public class Socket
     }
 
     /**
-     * Sends a text message. False when it will not reach the client: the
-     * socket is closing or closed, or the send failed.
+     * Send a text message. False if closing, closed, or the send failed.
      */
     public function send(text: const string& $data) : bool
     {
@@ -179,8 +169,8 @@ public class Socket
     }
 
     /**
-     * Sends a ping. The server already pings a socket that goes quiet, so
-     * this is for a hook that wants its own. At most 125 bytes of payload.
+     * Send a ping. The server already pings quiet sockets; this is for a
+     * hook that wants its own. At most 125 bytes.
      */
     public function ping(const string& $payload = '') : bool
     {
@@ -188,10 +178,9 @@ public class Socket
     }
 
     /**
-     * Starts the closing handshake. Nothing more can be sent after it; the
-     * connection closes once the client answers, or after 5 seconds. A code
-     * a peer may not send (1005, 1006, anything outside 1000 to 4999) goes
-     * out as 1000. The reason is cut to fit a control frame.
+     * Start the closing handshake. Nothing more can be sent. Closes once
+     * the client answers, or after 5 seconds. Illegal codes go out as
+     * 1000.
      */
     public function close(int32 $code = 1000, const string& $reason = '') : void
     {
@@ -205,9 +194,7 @@ public class Socket
     }
 
     /**
-     * Whether sending still reaches anyone: not closing, not broken, and the
-     * server is not stopping. A loop pushing to the socket from its own thread
-     * should run on this.
+     * True if a send still reaches anyone. A push loop should run on this.
      */
     public const function open() : bool
     {
@@ -310,14 +297,11 @@ public class Socket
 }
 
 /**
- * A set of open sockets to send to at once: a chat room, the viewers of one
- * document. Safe from any thread.
+ * A set of open sockets to send to at once. Safe from any thread.
  *
- * A broadcast sends to a snapshot, outside the lock, so a socket joining or
- * leaving never waits on a slow one. The sends still go one after another,
- * each under its socket's send timeout. A socket that closed is skipped and
- * dropped from the group; `remove` it in `onClose` all the same, so the group
- * never holds one longer than it has to.
+ * Broadcast sends to a snapshot, outside the lock. Sends still go one
+ * after another, each under that socket's timeout. Closed sockets are
+ * dropped; `remove` them in `onClose` anyway.
  */
 #[atomic]
 public class Group

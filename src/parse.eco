@@ -1,10 +1,9 @@
 /**
- * HTTP/1.1 request bytes into a Request.
+ * HTTP/1.1 bytes in, a Request out.
  *
- * `Framer` holds unread bytes and is advanced as they arrive, so the
- * reactor never waits on a client. `parse` is the same Framer with no
- * socket, for tests. Bytes past one request stay in the buffer: they
- * are the next one on a kept connection.
+ * `Framer` holds unread bytes so the reactor never blocks on a client.
+ * `parse` is that with no socket, for tests. Leftover bytes stay in the
+ * buffer: they are the next request.
  */
 
 use std::time;
@@ -12,8 +11,7 @@ use std::time;
 namespace http;
 
 /**
- * What one connection may cost the server. Snapshotted from the Server at
- * `listen`. The defaults are the Server's defaults.
+ * Per-connection caps, copied off the Server at `listen`.
  */
 internal struct Limits
 {
@@ -23,12 +21,11 @@ internal struct Limits
     public time::duration $idleTimeout = time::duration::secs(IDLE_TIMEOUT_SECS);
     public int32 $maxRequests = DEFAULT_MAX_REQUESTS;
 
-    // how long the oldest whole request may wait for a worker before new
-    // connections are refused
+    // oldest whole request waiting on a worker; past this, new conns get 503
     public time::duration $queueWait = time::duration::millis(QUEUE_WAIT_MS);
 
-    // websockets: the largest message put together, and how long a socket
-    // may be quiet before it is pinged. A zero interval never pings
+    // websocket: assembled-message cap, and quiet time before a ping
+    // a zero interval never pings
     public usize $maxMessage = DEFAULT_MESSAGE_CAP;
     public time::duration $pingInterval = time::duration::secs(PING_INTERVAL_SECS);
 }
@@ -40,13 +37,11 @@ internal struct HeadEnd
 }
 
 /**
- * Where the head stops: the earliest blank line, CRLF or bare LF. Earliest,
- * because a bare LF head followed by a body holding CRLF CRLF must not end at
- * the body's.
+ * Earliest blank line in `$raw`, CRLF or bare LF.
  *
- * One pass over the line feeds, sixteen bytes at a time. Every blank line
- * has one at a fixed place, so checking around each LF in order finds the
- * earliest of both kinds and never reads the body behind it.
+ * Earliest matters: a bare-LF head plus a body that contains CRLF CRLF
+ * has to stop at the head's. One SIMD pass over LFs; every blank line
+ * has one, so we never scan the body.
  */
 internal function findHeadEnd(const string& $raw) : HeadEnd?
 {
@@ -91,8 +86,8 @@ internal function findHeadEnd(const string& $raw) : HeadEnd?
 }
 
 /**
- * The blank line the LF at `$at` belongs to, if it is one: LF LF starting
- * there, or CR LF CR LF starting one byte before.
+ * The blank line this LF belongs to, if it does: LF LF, or CRLF CRLF one
+ * byte back.
  */
 private function blankLineAt(ptr<const uint8> $p, usize $n, usize $at) : HeadEnd?
 {
@@ -114,9 +109,10 @@ private function blankLineAt(ptr<const uint8> $p, usize $n, usize $at) : HeadEnd
 }
 
 /**
- * Room toward `$want` bytes, grown only as fast as bytes arrive: at most
- * double what is buffered, or `GROW_AHEAD` past it, and never past `$want`.
- * A peer that only announces a large body or frame gets a small buffer.
+ * Grow `$buf` toward `$want`, at most 2x what is already there.
+ *
+ * A peer that announces a huge body gets a small buffer until the bytes
+ * actually show up.
  */
 internal function growToward(string& $buf, usize $want) : void
 {
@@ -155,12 +151,11 @@ internal function hostOk(const string& $version, const Headers& $headers) : bool
         return true;
     }
 
-    return $headers->all('Host')->count() == 1;
+    return $headers->countOf('Host') == 1;
 }
 
 /**
- * ASCII digits and nothing else. `str::int` takes a sign, and a
- * Content-Length may not have one.
+ * ASCII digits only. `str::int` accepts a sign; Content-Length does not.
  */
 private function digitsOnly(const string& $s) : bool
 {
@@ -185,7 +180,7 @@ private function digitsOnly(const string& $s) : bool
 }
 
 /**
- * How the request says its body ends: a length, or the chunked coding.
+ * How the body ends: Content-Length, or chunked.
  */
 internal enum Framing
 {
@@ -194,9 +189,11 @@ internal enum Framing
 }
 
 /**
- * The body framing the headers declare. Transfer-Encoding plus
- * Content-Length is a 400: two hops could each believe a different one.
- * Only `chunked`, last, once. Anything else is 501. HTTP/1.0 has no TE.
+ * Framing the headers declare.
+ *
+ * TE plus Content-Length is a 400: two hops would disagree, which is
+ * request smuggling. Only `chunked`, last, once. Anything else is 501.
+ * HTTP/1.0 has no TE.
  */
 internal function framing(const Request& $req) : result<Framing, WireError>
 {
@@ -256,7 +253,8 @@ internal function framing(const Request& $req) : result<Framing, WireError>
 }
 
 /**
- * The Content-Length of a request with no Transfer-Encoding, or 0.
+ * Content-Length when there is no TE, or 0. Several values are fine if
+ * they agree; disagree or non-digits is a 400.
  */
 internal function bodyLength(const Headers& $headers) : result<usize, WireError>
 {
@@ -308,9 +306,10 @@ internal function bodyLength(const Headers& $headers) : result<usize, WireError>
 }
 
 /**
- * Whether the client is waiting for a 100 before it sends the body. HTTP/1.0
- * has no 100, so its Expect is ignored. `100-continue` is the one expectation
- * this server meets; anything else is 417.
+ * True if the client is waiting for a 100 before the body.
+ *
+ * HTTP/1.0 has no 100, so its Expect is ignored. Only `100-continue`;
+ * anything else is 417.
  */
 internal function expectation(const Request& $req) : result<bool, WireError>
 {
@@ -340,8 +339,8 @@ internal function expectation(const Request& $req) : result<bool, WireError>
 }
 
 /**
- * The request line and headers, without the blank line that ends them. The
- * answer is a Request with an empty body; the caller knows where the body is.
+ * Request line and headers, no blank line, empty body. The caller
+ * already knows where the body starts.
  */
 internal function parseHead(const string& $head) : result<Request, WireError>
 {
@@ -410,25 +409,29 @@ internal function parseHead(const string& $head) : result<Request, WireError>
         return .error(.badRequest);
     }
 
+    // empty then moved in: the constructor would copy both twice
     Request $req = Request(
         methodOf($methodRaw),
         $target,
         $path,
         $qs,
-        parseQuery($qs),
+        Query(),
         $version,
-        $headers,
+        Headers(),
         '',
         ''
     );
+    Query $query = parseQuery($qs);
+
+    $req->headers = mv $headers;
+    $req->query = mv $query;
 
     return .ok($req);
 }
 
 /**
- * Whether the client wants the connection kept after this request. HTTP/1.1
- * keeps it unless `Connection` says `close`. HTTP/1.0 drops it unless
- * `Connection` says `keep-alive`.
+ * Keep-alive after this request? HTTP/1.1 yes unless `close`; HTTP/1.0
+ * no unless `keep-alive`.
  */
 internal function persistent(const Request& $req) : bool
 {
@@ -440,9 +443,8 @@ internal function persistent(const Request& $req) : bool
 }
 
 /**
- * Whether any header of this name lists `$token` among its comma-separated
- * values. Case-insensitive, both the name and the token, unless `exact`
- * asks for the token to match byte for byte, as a subprotocol name does.
+ * True if any header of this name lists `$token`. Case-insensitive
+ * unless `exact`, which a subprotocol name needs.
  */
 internal function hasToken(const Headers& $headers, const string& $name, const string& $token, exact: bool $exact = false) : bool
 {
@@ -482,22 +484,22 @@ internal enum Phase
 }
 
 /**
- * What one `advance` found. `sendContinue` asks the caller to send the
- * interim 100 and advance again.
+ * What one `advance` found. `sendContinue` means send the 100 and
+ * advance again.
  */
 internal enum Step
 {
     case needMore;
     case sendContinue;
 
-    // the request is whole; `Framer::request()` has it
+    // the request is whole. `Framer::request()` has it
     case ready;
     case fail(WireError $e);
 }
 
 /**
- * Which deadline a connection has run past. `idle` closes without an answer;
- * `timeout` is a 408.
+ * Deadline the connection blew. `idle` closes with no answer; `timeout`
+ * is a 408.
  */
 internal enum Expiry
 {
@@ -507,16 +509,16 @@ internal enum Expiry
 }
 
 /**
- * One connection's request in progress. The caller appends to `$buffer`
- * and calls `advance`. Nothing here touches a socket.
+ * One connection's request in progress. Append to `$buffer`, call
+ * `advance`. No socket, so tests can drive it with a string.
  */
 internal struct Framer
 {
     public string $buffer;
     private Phase $phase = Phase::idle;
 
-    // the head parsed so far, and once `ready`, the finished request's. Kept
-    // here rather than handed out, so the reactor never copies a request
+    // parsed head, then the finished request. stays here so the reactor
+    // never copies it
     private Request? $pending = null;
     private string $body = '';
     private usize $bodyAt = 0;
@@ -530,7 +532,7 @@ internal struct Framer
     }
 
     /**
-     * A Framer that starts from bytes a previous request left behind.
+     * Start from leftover bytes of the previous request.
      */
     public constructor(const string& $rest)
     {
@@ -550,8 +552,7 @@ internal struct Framer
     }
 
     /**
-     * The request the last `ready` finished, body included. Nothing before
-     * the first one.
+     * The request the last `ready` finished, body included.
      */
     public const function request() : Request?
     {
@@ -564,8 +565,7 @@ internal struct Framer
     }
 
     /**
-     * Which deadline, if any, this connection is past. The clock is the one
-     * for the phase it is in.
+     * Deadline for the phase this connection is in, if it blew it.
      */
     public const function expired(const Limits& $limits) : Expiry
     {
@@ -601,9 +601,8 @@ internal struct Framer
     }
 
     /**
-     * Drops empty lines before a request line, which a server should ignore:
-     * some clients end a body with an extra CRLF. A CR alone at the end waits
-     * for its LF.
+     * Drop empty lines before a request line. Some clients trail a body
+     * with an extra CRLF. A lone CR waits for its LF.
      */
     private function skipBlankLines() : void
     {
@@ -641,7 +640,7 @@ internal struct Framer
             return .fail(.tooLarge);
         }
 
-        // head problems answer before a byte of body is read
+        // answer a bad head before reading a byte of body
         Request $req = guard parseHead($this->buffer->sub(0, $end->at)) else ($e) {
             return .fail($e);
         }
@@ -663,7 +662,7 @@ internal struct Framer
 
         if ($isChunked) {
             $this->chunks = Dechunk($this->bodyAt);
-            $this->pending = $req;
+            $this->pending = mv $req;
             $this->phase = Phase::chunked;
             $this->since = time::instant::now();
 
@@ -679,13 +678,13 @@ internal struct Framer
             else => 0,
         };
 
-        // a 413 is the answer to an Expect as well, so this comes before the 100
+        // 413 answers Expect too, so this is before the 100
         if ($need > $limits->maxBody) {
             return .fail(.tooLarge);
         }
 
         $this->need = $need;
-        $this->pending = $req;
+        $this->pending = mv $req;
         $this->phase = Phase::body;
         $this->since = time::instant::now();
 

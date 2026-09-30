@@ -1,15 +1,12 @@
 /**
  * One registered path, and the matching that fills its params.
  *
- * First match wins. A pattern segment is a literal or a param:
- * `{name}` is one whole, non-empty segment, `{name?}` is one or none,
- * `{name*}` is every segment left, and `{name:kind}` is one that passes a
- * check (`number`, `alpha`, `alphanum`, `uuid`, `ulid`, or `a|b|c`). `?`
- * and `*` only go last. Split on `/` first, then percent-decode, so `%2F`
- * stays inside its segment. HEAD with no HEAD route falls back to GET.
+ * First match wins. `{name}` is one non-empty segment, `{name?}` is one
+ * or none, `{name*}` is the rest, `{name:kind}` is one that passes a
+ * check. `?` and `*` only go last. Split on `/` first, then decode, so
+ * `%2F` stays in its segment. HEAD with no HEAD route falls back to GET.
  *
- * A pattern is compiled once, at registration. `Router` is the table the
- * workers read: routes bucketed by how many segments they take, so a
+ * Compiled at registration. `Router` buckets by segment count, so a
  * request only looks at routes it could match, in registration order.
  */
 
@@ -80,8 +77,7 @@ internal struct Route
     internal function<Response(Request)> $handler;
 
     /**
-     * Compiles `$pattern`. A pattern that cannot mean anything stops the
-     * program here, at registration, rather than failing to match later.
+     * Compile `$pattern`. A nonsense pattern dies here, at registration.
      */
     public constructor(Method $method, const string& $pattern, function<Response(Request)> $handler)
     {
@@ -129,12 +125,11 @@ internal struct Route
 }
 
 /**
- * The route table as the workers read it, built once at `listen`.
+ * Route table the workers read, built at `listen`.
  *
- * `$byCount[n]` lists the routes that take exactly `n` segments, and a
- * `{name?}` route sits in two of them. `$open` lists the `{name*}` routes,
- * which take any count from their prefix up. Both lists ascend, so walking
- * them together in index order is registration order.
+ * `$byCount[n]` is routes of exactly `n` segments; a `{name?}` sits in
+ * two. `$open` is `{name*}` routes. Both lists ascend, so walking them
+ * together is registration order.
  */
 internal struct Router
 {
@@ -336,9 +331,8 @@ internal function splitPath(const string& $path) : array<string>
 }
 
 /**
- * A request path as the router compares it: split on `/`, then each segment
- * percent-decoded. One pass; a segment with no `%` is a substring, not a
- * decoded copy.
+ * Path as the router compares it: split on `/`, then decode. A segment
+ * with no `%` is a substring, not a copy.
  */
 internal function segments(const string& $path) : array<string>
 {
@@ -723,8 +717,8 @@ private function oneOf(const array<string>& $choices, const string& $seg) : bool
 }
 
 /**
- * Fills the route's params from a path it matched. A `{name?}` with no
- * segment stays unset; a `{name*}` is always set, `''` when nothing is left.
+ * Fill params from a matched path. `{name?}` with no segment stays
+ * unset; `{name*}` is always set, `''` if nothing is left.
  */
 internal function applyParams(Request& $req, const Route& $route, const array<string>& $path) : void
 {

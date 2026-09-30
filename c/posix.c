@@ -37,6 +37,20 @@
 #include <sys/epoll.h>
 #endif
 
+#if defined(__APPLE__)
+#include <os/os_sync_wait_on_address.h>
+#include <stdint.h>
+
+/* before macOS 14.4 the same wait has only its private spelling */
+extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout);
+extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+#define UL_COMPARE_AND_WAIT 1
+#define ULF_WAKE_ALL 0x00000100
+#elif defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#endif
+
 #define DRAIN_MS 2000
 #define IO_TIMEOUT_SECS 10
 #define RECV_AGAIN (-3)
@@ -680,6 +694,61 @@ int http_is_fd_limit(void)
 int http_is_badfd(void)
 {
     return errno == EBADF;
+}
+
+/*
+ * A word threads sleep on. `http_futex_wait` sleeps only while `*word` still
+ * holds `seen`, and a wake after a bump can never be missed: the check and
+ * the sleep are one step in the kernel. What a mutex and condition give,
+ * without the mutex every waker and sleeper would queue on.
+ */
+void http_futex_wait(int *word, int seen)
+{
+#if defined(__APPLE__)
+    if (__builtin_available(macOS 14.4, *)) {
+        os_sync_wait_on_address(word, (uint64_t)(uint32_t)seen, sizeof(int), OS_SYNC_WAIT_ON_ADDRESS_NONE);
+    } else {
+        __ulock_wait(UL_COMPARE_AND_WAIT, word, (uint64_t)(uint32_t)seen, 0);
+    }
+#elif defined(__linux__)
+    syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, seen, NULL, NULL, 0);
+#else
+    (void)word;
+    (void)seen;
+#endif
+}
+
+void http_futex_wake(int *word, int all)
+{
+#if defined(__APPLE__)
+    if (__builtin_available(macOS 14.4, *)) {
+        if (all) {
+            os_sync_wake_by_address_all(word, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+        } else {
+            os_sync_wake_by_address_any(word, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+        }
+    } else {
+        __ulock_wake(UL_COMPARE_AND_WAIT | (all ? ULF_WAKE_ALL : 0), word, 0);
+    }
+#elif defined(__linux__)
+    syscall(SYS_futex, word, FUTEX_WAKE_PRIVATE, all ? 0x7fffffff : 1, NULL, NULL, 0);
+#else
+    (void)word;
+    (void)all;
+#endif
+}
+
+/*
+ * One beat of a spin-wait: tells the core this is a busy loop, without
+ * the syscall sched_yield would be.
+ */
+void http_cpu_relax(void)
+{
+#if defined(__aarch64__) || defined(__arm64__)
+    __asm__ volatile("isb" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("pause" ::: "memory");
+#endif
 }
 
 const char *http_errstr(void)

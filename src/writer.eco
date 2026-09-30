@@ -1,9 +1,9 @@
 /**
- * The body of a streamed response, written while the stream callback runs.
+ * Streamed response body, written while the callback runs.
  *
  * `write` buffers 4 KiB; `flush` sends now. HTTP/1.1 with no length is
- * chunked. `open()` is false once the client is gone or the server is
- * stopping. Keep no copy of the Writer past the callback.
+ * chunked. `open()` is false once the client is gone. Keep no copy past
+ * the callback.
  */
 
 namespace http;
@@ -43,9 +43,8 @@ public class Writer
     }
 
     /**
-     * Queues `$bytes`, sending once the buffer fills. False when nothing more
-     * will reach the client: it is gone, or a sized stream is already at its
-     * length, in which case the bytes past it are dropped.
+     * Queue `$bytes`, send once the buffer fills. False if the client is
+     * gone, or a sized stream is already at length.
      */
     public function write(const string& $bytes) : bool
     {
@@ -122,9 +121,8 @@ public class Writer
     }
 
     /**
-     * Ends the body once the callback has returned: flushes, writes the last
-     * chunk, and answers whether the response went out whole. A sized stream
-     * that fell short did not, and its connection cannot be kept.
+     * Finish the body: flush, last chunk, whether it went out whole. A
+     * short sized stream cannot be kept.
      */
     internal function finish() : bool
     {

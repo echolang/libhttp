@@ -1,9 +1,9 @@
 /**
- * Code that runs around every request, with the rest of the chain as `$next`.
+ * Code around every request, rest of the chain as `$next`.
  *
- * First `wrap` is outermost. The chain ends in routing, so 404 and 405
- * go through it. A request that never parsed does not: there is no
- * Request to hand it. Built once at `listen`.
+ * First `wrap` is outermost. 404 and 405 go through it. A request that
+ * never parsed does not: there is no Request to hand it. Built at
+ * `listen`.
  */
 
 namespace http;
@@ -22,8 +22,7 @@ public struct Next
     }
 
     /**
-     * Runs the rest of the chain and answers its response. Not calling it
-     * is how a middleware answers on its own, a 401 say.
+     * Run the rest of the chain. Skip it to answer yourself, a 401 say.
      */
     public const function run(Request $req) : Response
     {
@@ -32,8 +31,8 @@ public struct Next
 }
 
 /**
- * Folds the middleware around `$inner`, last registered innermost, so the
- * first one registered runs first.
+ * Fold middleware around `$inner`. Last registered is innermost, so
+ * first registered runs first.
  */
 internal function chain(const array<function<Response(Request, Next)>>& $layers, function<Response(Request)> $inner) : function<Response(Request)>
 {

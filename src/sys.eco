@@ -1,6 +1,6 @@
 /**
- * The C symbols in c/posix.c. One block: a C symbol may only appear
- * once per module.
+ * C symbols from c/posix.c. One block: a C symbol may only appear once
+ * per module.
  */
 
 namespace http;
@@ -28,6 +28,9 @@ internal extern {
     function http_is_fd_limit() : int32;
     function http_is_badfd() : int32;
     function http_errstr() : ptr<uint8>;
+    function http_cpu_relax() : void;
+    function http_futex_wait(ptr<int32> $word, int32 $seen) : void;
+    function http_futex_wake(ptr<int32> $word, int32 $all) : void;
 }
 
 internal const isize RECV_AGAIN = -3;

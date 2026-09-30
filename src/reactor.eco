@@ -1,20 +1,14 @@
 /**
- * The reactor: one thread that owns every connection no worker is serving.
+ * One thread that owns every connection no worker is serving.
  *
- * It waits on the listen socket, the wake pipe, and every idle or
- * half-read connection. A whole request goes to a worker. Everything
- * else costs a slot in the map. The reactor never waits on a client.
+ * It waits on the listen socket, the wake pipe, and idle or half-read
+ * connections. A whole request goes to a worker. The reactor never
+ * blocks on a client.
  *
- * So do connections a worker has answered for the last time: their write
- * side is shut, and what the client still sends is read and dropped until
- * it hangs up, so the answer is never lost to a reset.
- *
- * Open websockets live here too, in their own map. Their bytes are decoded
- * as they arrive, and a whole message, a ping, a close, or a broken frame
- * goes to a worker the same way a request does. A pong only resets the
- * socket's quiet clock. The sweep pings a socket that has gone quiet, and
- * gives up on one that stays quiet, broke a send, or never answered a
- * close.
+ * Last-response connections linger here: write side shut, leftover
+ * bytes drained, so the answer is never a reset. Open websockets sit
+ * in their own map; a whole message, ping, close, or bad frame goes to
+ * a worker. A pong only resets the quiet clock.
  */
 
 use std::thread;
@@ -30,7 +24,7 @@ internal const usize READ_MIN = 4096;
 internal const usize READ_CHUNK = 16384;
 
 /**
- * A connection the reactor holds, between requests or part of the way
+ * A connection the reactor holds: between requests, or part of the way
  * through one.
  */
 internal struct Slot
@@ -41,8 +35,8 @@ internal struct Slot
 }
 
 /**
- * A connection in its lingering close: since when, and how much has been
- * dropped.
+ * A connection in its lingering close: since when, and how much of what
+ * the client is still sending has been dropped.
  */
 internal struct Linger
 {
@@ -61,8 +55,13 @@ internal class Reactor
     private JobQueue $jobs;
     private thread::receiver<Back> $back;
 
+    // kept connections workers parked here without waking this reactor,
+    // and whether this event batch already looked for one
+    private Inbox $inbox;
+    private bool $checked;
+
     // this reactor's index among the server's, which is where its
-    // connections come back to, and how many it accepts per wake
+    // connections come back to, and how many new ones it accepts per wake
     private int32 $home;
     private int32 $acceptBatch;
 
@@ -71,7 +70,7 @@ internal class Reactor
     private map<int32, Linger> $lingering;
     private time::instant $swept;
 
-    // out of descriptors: the listen socket is disarmed until PAUSE_MS passes
+    // out of descriptors: listen is disarmed until PAUSE_MS passes
     private bool $paused;
     private time::instant $pausedAt;
 
@@ -85,7 +84,8 @@ internal class Reactor
         int32 $maxConns,
         Shared $shared,
         JobQueue $jobs,
-        thread::receiver<Back> $back
+        thread::receiver<Back> $back,
+        Inbox $inbox
     )
     {
         $this->ev = $ev;
@@ -98,6 +98,8 @@ internal class Reactor
         $this->shared = $shared;
         $this->jobs = $jobs;
         $this->back = $back;
+        $this->inbox = $inbox;
+        $this->checked = false;
         $this->slots = map<int32, Slot>();
         $this->sockets = map<int32, WsConn>();
         $this->lingering = map<int32, Linger>();
@@ -107,8 +109,7 @@ internal class Reactor
     }
 
     /**
-     * Serves until `stop()`. Answers an Error only when the listen socket
-     * itself broke.
+     * Serve until `stop()`. Errors only if the listen socket itself broke.
      */
     internal function run() : status<Error>
     {
@@ -121,8 +122,11 @@ internal class Reactor
         while (true) {
             int32 $wait = -1;
 
-            // deadlines need a sweep even when nothing is readable
-            if (!$this->slots->empty() || !$this->sockets->empty() || !$this->lingering->empty() || $this->paused) {
+            // deadlines need a sweep even when nothing is readable. a
+            // connection on a worker or in the inbox is in none of the maps
+            // yet, and may come back here to idle out, so any live one keeps
+            // the sweep going
+            if (!$this->slots->empty() || !$this->sockets->empty() || !$this->lingering->empty() || $this->paused || $this->shared->live->load() > 0) {
                 $wait = SWEEP_MS;
             }
 
@@ -135,6 +139,8 @@ internal class Reactor
 
             bool $woke = false;
             usize $i = 0;
+
+            $this->checked = false;
 
             while ($i < ($n as usize)) {
                 int32 $fd = $fds:$[$i];
@@ -171,9 +177,8 @@ internal class Reactor
     }
 
     /**
-     * The first half of stopping: every connection the reactor holds is
-     * closed. An open websocket goes to a worker for its 1001 and `onClose`
-     * first. The server closes the job queue once every reactor is here.
+     * Close every connection this reactor holds. Open websockets go to a
+     * worker for 1001 and `onClose` first.
      */
     internal function shutdown() : void
     {
@@ -205,12 +210,15 @@ internal class Reactor
             $this->unlinger($closing[$i]);
             $i = $i + 1;
         }
+
+        closeParked($this->inbox, $this->shared);
     }
 
     private function acceptAll() : status<Error>
     {
-        // behind is the oldest job waiting too long, not a queue a burst just
-        // filled. Asked once per batch: it takes the lock every worker contends for
+        // behind is the oldest job waiting too long, not a queue a burst
+        // just filled. asked once per batch: it takes the lock every worker
+        // contends for
         bool $behind = $this->jobs->oldestWait() >= $this->limits->queueWait;
         int32 $round = 0;
 
@@ -231,7 +239,7 @@ internal class Reactor
 
             if ($fd < 0) {
                 if (http_is_fd_limit() != 0) {
-                    // out of descriptors: stop listening a moment instead of spinning on it
+                    // out of descriptors: stop listening a moment instead of spinning on EMFILE
                     http_ev_drop($this->ev, $this->listenFd);
                     $this->paused = true;
                     $this->pausedAt = time::instant::now();
@@ -278,11 +286,26 @@ internal class Reactor
         if (!$this->slots->has($fd)) {
             if ($this->sockets->has($fd)) {
                 $this->socketReadable($fd);
-            } else if ($this->lingering->has($fd)) {
-                $this->lingerReadable($fd);
+                return;
             }
 
-            return;
+            if ($this->lingering->has($fd)) {
+                $this->lingerReadable($fd);
+                return;
+            }
+
+            // parked and armed before this wait returned. still unknown
+            // after one look: stale
+            if ($this->checked) {
+                return;
+            }
+
+            $this->checked = true;
+            $this->adoptInbox();
+
+            if (!$this->slots->has($fd)) {
+                return;
+            }
         }
 
         isize $got = recvInto($fd, $this->slots->at($fd)->framer->buffer);
@@ -292,7 +315,7 @@ internal class Reactor
             return;
         }
 
-        // the client closed, mid-request or not: nothing to answer
+        // the client closed, mid-request or not. nothing to answer
         if ($got <= 0) {
             $this->drop($fd);
             return;
@@ -302,8 +325,7 @@ internal class Reactor
     }
 
     /**
-     * Advances the Framer over what the slot holds, and acts on the step:
-     * wait for more, send the 100, or hand the connection to a worker.
+     * Advance the Framer: wait for more, send the 100, or hand to a worker.
      */
     private function process(int32 $fd) : void
     {
@@ -322,7 +344,7 @@ internal class Reactor
                     string $interim = 'HTTP/1.1 100 Continue\r\n\r\n';
                     isize $put = http_send_now($fd, $interim->data(), $interim->size());
 
-                    // 25 bytes into an empty send buffer: short means the client is gone
+                    // 25 bytes into an empty send buffer. short means the client is gone
                     if ($put != ($interim->size() as isize)) {
                         $this->drop($fd);
                     } else {
@@ -330,7 +352,7 @@ internal class Reactor
                     }
                 },
                 Step::ready => {
-                    // the whole slot moves: the request inside it is never copied here
+                    // the whole slot moves. the request inside it is never copied here
                     Slot $slot = $this->slots->take($fd);
 
                     $this->jobs->send(Job::serve(Visit($fd, $this->home, mv $slot)));
@@ -365,6 +387,11 @@ internal class Reactor
                                 $this->unlinger($fd);
                             }
                         },
+                        Back::rearm($fd) => {
+                            if ($this->slots->has($fd)) {
+                                $this->arm($fd);
+                            }
+                        },
                     }
                 },
                 else => {
@@ -375,9 +402,8 @@ internal class Reactor
     }
 
     /**
-     * Drops what a lingering connection sent. It closes once the client
-     * hangs up, or once it has sent more than a client with nothing left to
-     * say would.
+     * Drain a lingering connection. Closes on hangup, or once it has sent
+     * more than a client with nothing left would.
      */
     private function lingerReadable(int32 $fd) : void
     {
@@ -407,18 +433,32 @@ internal class Reactor
         $this->shared->live->sub(1);
     }
 
+    /**
+     * Adopt parked connections. Each fd is already armed; this only gives
+     * it a slot.
+     */
+    private function adoptInbox() : void
+    {
+        array<Parked> $parked = $this->inbox->takeAll();
+
+        while (!$parked->empty()) {
+            $this->slotFor($parked->pop());
+        }
+    }
+
+    /**
+     * A kept connection with bytes already buffered, so it goes straight to
+     * processing. One with none is parked through the inbox instead.
+     */
     private function adopt(Parked $parked) : void
     {
-        int32 $fd = $parked->fd;
+        $this->slotFor($parked);
+        $this->process($parked->fd);
+    }
 
-        $this->slots[$fd] = Slot($parked->peer, Framer($parked->rest), $parked->served);
-
-        if ($parked->rest->empty()) {
-            $this->arm($fd);
-            return;
-        }
-
-        $this->process($fd);
+    private function slotFor(const Parked& $parked) : void
+    {
+        $this->slots[$parked->fd] = Slot($parked->peer, Framer($parked->rest), $parked->served);
     }
 
     private function adoptSocket(WsConn $ws) : void
@@ -428,7 +468,7 @@ internal class Reactor
 
         $this->sockets[$fd] = $ws;
 
-        // frames that came in behind the last one never make the socket readable again
+        // frames behind the last one never make the socket readable again
         if ($pending) {
             $this->socketProcess($fd);
             return;
@@ -456,7 +496,7 @@ internal class Reactor
             return;
         }
 
-        // the client went away without a close frame
+        // the client went away without a close frame. 1006, and onClose runs
         if ($got <= 0) {
             $this->hand($fd, WsEvent::gone);
             return;
@@ -466,8 +506,8 @@ internal class Reactor
     }
 
     /**
-     * Decodes what the socket holds, and hands a worker the first thing that
-     * needs one. A pong needs nothing; decoding goes on past it.
+     * Decode buffered frames. Hand a worker the first thing that needs
+     * one. A pong needs nothing; decoding continues past it.
      */
     private function socketProcess(int32 $fd) : void
     {
@@ -502,7 +542,7 @@ internal class Reactor
     }
 
     /**
-     * Takes a socket off the reactor and gives a worker `$event` for it.
+     * Take the socket off this reactor and give a worker `$event`.
      */
     private function hand(int32 $fd, WsEvent $event) : void
     {
@@ -519,8 +559,7 @@ internal class Reactor
     }
 
     /**
-     * Closes what has been idle too long, and hands a 408 to a worker for
-     * what has been too slow to send its request.
+     * Drop idle connections, 408 slow requests, ping quiet websockets.
      */
     private function sweep() : void
     {
@@ -534,6 +573,9 @@ internal class Reactor
         }
 
         $this->swept = time::instant::now();
+
+        // parked connections still have to idle out; they sit in the inbox
+        $this->adoptInbox();
 
         array<int32> $fds = $this->slots->keys();
         usize $n = $fds->count();
@@ -554,7 +596,8 @@ internal class Reactor
                 Expiry::timeout => {
                     Slot $gone = $this->slots->take($fd);
 
-                    // armed while it was waiting: it must not report to the reactor on a worker
+                    // armed while it was waiting: it must not report to the
+                    // reactor once a worker owns it
                     http_ev_drop($this->ev, $fd);
                     $this->jobs->send(Job::fail($fd, $this->home, .timeout));
                 },
@@ -590,7 +633,8 @@ internal class Reactor
                 continue;
             }
 
-            // armed while it was waiting: it must not report to the reactor on a worker
+            // armed while it was waiting: it must not report to the reactor
+            // once a worker owns it
             http_ev_drop($this->ev, $fd);
             $this->hand($fd, $due);
         }
@@ -604,8 +648,7 @@ internal class Reactor
     }
 
     /**
-     * A plain close, for a connection with no answer owed: nothing to
-     * linger for. Closing also takes the fd out of the readiness set.
+     * Plain close, no answer owed. Also drops the fd from the event set.
      */
     private function drop(int32 $fd) : void
     {
@@ -619,11 +662,13 @@ internal class Reactor
 }
 
 /**
- * The second half of stopping, once the workers are joined: a connection a
- * worker handed back to a reactor on its way out is closed too.
+ * After workers join: close anything handed back on the way out.
  */
-internal function drainReturned(thread::receiver<Back> $back, Shared $shared) : void
+internal function drainReturned(thread::receiver<Back> $back, Inbox $inbox, Shared $shared) : void
 {
+    // parked after this reactor's shutdown looked. still has to close
+    closeParked($inbox, $shared);
+
     while (true) {
         thread::poll<Back> $p = $back->try_recv();
 
@@ -639,8 +684,11 @@ internal function drainReturned(thread::receiver<Back> $back, Shared $shared) : 
                         $shared->live->sub(1);
                     },
                     Back::socket($ws) => {
-                        // no worker is left, and onClose still has to run once
+                        // no worker left; onClose still has to run once
                         goAway($ws, $shared);
+                    },
+                    Back::rearm($fd) => {
+                        // the slot it names was closed with the rest. nothing to rearm
                     },
                 }
             },
@@ -652,8 +700,24 @@ internal function drainReturned(thread::receiver<Back> $back, Shared $shared) : 
 }
 
 /**
- * One read onto the end of `$buf`, which grows first when it is nearly full.
- * What `http_recv_now` answered: a count, `RECV_AGAIN`, or the end.
+ * Close every connection parked on `$inbox`. Taken under the lock, so
+ * it closes once.
+ */
+internal function closeParked(Inbox $inbox, Shared $shared) : void
+{
+    array<Parked> $parked = $inbox->takeAll();
+
+    while (!$parked->empty()) {
+        Parked $p = $parked->pop();
+
+        http_close($p->fd);
+        $shared->live->sub(1);
+    }
+}
+
+/**
+ * One read onto `$buf`, grown first if nearly full. Count, `RECV_AGAIN`,
+ * or the end.
  */
 internal function recvInto(int32 $fd, string& $buf) : isize
 {
@@ -673,8 +737,8 @@ internal function recvInto(int32 $fd, string& $buf) : isize
 }
 
 /**
- * 503 when the server is full. A plain close: lingering on the reactor
- * would stall everyone else.
+ * 503 when the server is full. Plain close: lingering would stall
+ * everyone else.
  */
 internal function reject(int32 $fd) : void
 {

@@ -651,6 +651,40 @@ test two_requests_one_connection {
 }
 
 #[group: "net"]
+test many_requests_one_connection {
+    http::Server $app = http::Server();
+
+    // one of each, so every request goes out, back through the inbox, and in again
+    $app->workers(1);
+    $app->reactors(1);
+    $app->maxRequests(5000);
+    $app->get('/n/{n}', function(http::Request $req) : http::Response {
+        return http::Response(text: $req->param('n') ?? '');
+    });
+
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+    int32 $right = 0;
+    int32 $i = 0;
+
+    while ($i < 2000) {
+        bool $sent = $c->send("GET /n/{$i} HTTP/1.1\r\nHost: x\r\n\r\n");
+        string $got = $c->response();
+
+        if ($sent && $got->ends("\r\n\r\n{$i}") && !$got->contains('Connection: close')) {
+            $right = $right + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    $app->stop();
+    $srv->join();
+
+    assert($right == 2000, 'every request on the one connection was answered, in turn, and kept');
+}
+
+#[group: "net"]
 test pipelined_requests_answer_in_order {
     http::Server $app = http::Server();
 

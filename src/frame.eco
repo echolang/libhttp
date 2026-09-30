@@ -1,22 +1,16 @@
 /**
- * Websocket frames (RFC 6455 section 5): bytes in, messages out, and back.
+ * Websocket frames (RFC 6455 §5): bytes in, messages out.
  *
- * `Reader` is the one decoder. It holds a connection's unread bytes and is
- * advanced each time more arrive, the same shape as the request `Framer`, so
- * the reactor can read a socket in pieces without a thread waiting on it.
- * Nothing here touches a socket.
+ * `Reader` is the decoder, same shape as the request `Framer`: hold
+ * unread bytes, advance as more arrive, never block. No sockets here.
  *
- * A server reads masked frames and writes unmasked ones. The decoder takes
- * which side it is, and `encode` can mask, so a test (or a client, one day)
- * speaks the other half with the same code.
+ * A server reads masked frames and writes unmasked ones. The decoder
+ * takes which side it is, and `encode` can mask, so tests speak both.
  *
- * What is refused, and with which close code: an unmasked frame from a
- * client, a reserved bit no extension claimed, an unknown opcode, a control
- * frame that is fragmented or longer than 125 bytes, a continuation with
- * nothing to continue, a new message in the middle of a fragmented one, or a
- * 64-bit length with its top bit set are all 1002. Text that is not UTF-8 is
- * 1007. A message past `maxMessage` is 1009, found from the frame header
- * before its payload is read.
+ * 1002: unmasked from a client, reserved bit, unknown opcode, fragmented
+ * or oversized control, continuation with nothing to continue, a new
+ * message mid-fragment, 64-bit length with the top bit set. 1007: bad
+ * UTF-8. 1009: over `maxMessage`, from the header, before the payload.
  */
 
 namespace http;
@@ -86,9 +80,8 @@ private function knownOpcode(uint8 $op) : bool
 }
 
 /**
- * Whether a peer may send this close code: the ones RFC 6455 defines for the
- * wire, and the 3000 to 4999 range left to libraries and applications. 1005
- * and 1006 are for reporting and never sent.
+ * Close codes a peer may send: RFC 6455's, plus 3000-4999. 1005 and
+ * 1006 are for reporting, never the wire.
  */
 internal function closeCodeOk(int32 $code) : bool
 {
@@ -133,9 +126,8 @@ internal struct Reader
     }
 
     /**
-     * Decodes frames until one means something to the caller: a whole
-     * message, a control frame, or a failure. `needMore` when the bytes run
-     * out first.
+     * Decode until a whole message, a control frame, or a failure.
+     * `needMore` if the bytes run out first.
      */
     public function advance(usize $maxMessage) : WsStep
     {
@@ -214,9 +206,8 @@ internal struct Reader
     }
 
     /**
-     * One frame off the front of the buffer. `$room` is how much payload the
-     * message still has space for; a data frame past it is 1009 before its
-     * payload has arrived.
+     * One frame off the buffer. `$room` is leftover payload budget; past
+     * it is 1009, from the header.
      */
     private function next(usize $room) : FrameStep
     {
@@ -321,8 +312,8 @@ private function finished(uint8 $op, const string& $data) : WsStep
 }
 
 /**
- * A close frame's payload as a step: no payload is 1005, one byte is a
- * protocol error, a code nobody may send is too, and the reason is UTF-8.
+ * Close payload as a step: empty is 1005, one byte or a banned code is
+ * 1002, reason must be UTF-8.
  */
 private function closeStep(const string& $payload) : WsStep
 {
@@ -461,8 +452,8 @@ internal function encode(uint8 $op, const string& $payload, mask: uint32 $key, b
 }
 
 /**
- * A close frame's payload: the code big-endian, then as much of the reason
- * as fits in a control frame, cut back to a whole UTF-8 character.
+ * Close payload: code big-endian, then as much of the reason as fits,
+ * cut on a character.
  */
 internal function closePayload(int32 $code, const string& $reason) : string
 {

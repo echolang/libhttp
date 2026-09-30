@@ -1,14 +1,18 @@
 /**
  * A Response as HTTP/1.1 bytes.
  *
- * The serializer owns the framing. A handler's Content-Length,
- * Connection, Keep-Alive or Transfer-Encoding is dropped. 1xx, 204 and
- * 304 carry no body. HEAD keeps the length and drops the body.
+ * The serializer owns framing. Handler Content-Length / Connection /
+ * Keep-Alive / Transfer-Encoding is dropped. 1xx, 204, 304 have no body.
+ * HEAD keeps the length, drops the body.
  */
 
+use std::thread;
 use std::time;
 
 namespace http;
+
+// room reserved for a head up front, so rendering one never grows its string
+internal const usize HEAD_ROOM = 256;
 
 internal function reason(int32 $status) : string
 {
@@ -170,12 +174,12 @@ internal function pad(int64 $v, usize $width) : string
 }
 
 /**
- * Seconds since 1970 as an IMF-fixdate, `Sun, 06 Nov 1994 08:49:37 GMT`, the
- * one form RFC 9110 lets a sender write. Days to a civil date is Howard
- * Hinnant's `civil_from_days`, since std::time stops at the Unix number.
+ * Unix seconds as an IMF-fixdate. Days to a civil date is Hinnant's
+ * `civil_from_days`; std::time stops at the Unix number.
  */
 internal function httpDate(int64 $unixSecs) : string
 {
+    // a render formats one a second (see appendDate), so this is off the hot path
     array<string> $dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     array<string> $monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -230,6 +234,44 @@ internal function httpDate(int64 $unixSecs) : string
     return "{$wd}, {$dd} {$mon} {$yyyy} {$hh}:{$mi}:{$ss} GMT";
 }
 
+/**
+ * Last `Date` line rendered. Shared, try-locked: if busy, format your
+ * own, never wait.
+ */
+internal struct DateLine
+{
+    static thread::mutex<DateLine> $last = thread::mutex<DateLine>(DateLine(-1, ''));
+
+    public int64 $secs;
+    public string $line;
+}
+
+internal function appendDate(string& $out) : void
+{
+    int64 $secs = time::timestamp::now()->unix_secs();
+    thread::locked<DateLine>? $maybe = DateLine::$last->try_lock();
+
+    thread::locked<DateLine> $held = guard mv $maybe else {
+        $out->append(dateLine($secs));
+        return;
+    }
+
+    // once a second, whoever renders first formats it for everyone
+    if ($held->value->secs != $secs) {
+        $held->value->line = dateLine($secs);
+        $held->value->secs = $secs;
+    }
+
+    $out->append($held->value->line);
+}
+
+private function dateLine(int64 $secs) : string
+{
+    string $now = httpDate($secs);
+
+    return "Date: {$now}\r\n";
+}
+
 internal function headerSafe(const string& $s) : bool
 {
     usize $n = $s->size();
@@ -258,9 +300,8 @@ internal function nameSafe(const string& $s) : bool
 }
 
 /**
- * What the response says about the connection after it. `keep` is HTTP/1.1,
- * where staying open is the default and needs no header. `keepAlive` is an
- * HTTP/1.0 client that asked, which has to be told yes, and for how long.
+ * Connection after this response. `keep` is HTTP/1.1 (no header).
+ * `keepAlive` is HTTP/1.0 that asked, which has to be told yes.
  */
 internal enum Persist
 {
@@ -306,9 +347,20 @@ internal enum Length
 
 internal function render(const Response& $res, bool $sendBody, const Persist& $persist) : string
 {
-    string $out = renderHead($res, Length::exact($res->body->size()), $persist);
+    bool $withBody = $sendBody && !bodyless($res->status);
+    usize $room = HEAD_ROOM;
 
-    if ($sendBody && !bodyless($res->status)) {
+    if ($withBody) {
+        $room = $room + $res->body->size();
+    }
+
+    // one allocation for head and body both
+    string $out = '';
+
+    $out->reserve($room);
+    writeHead($out, $res, Length::exact($res->body->size()), $persist);
+
+    if ($withBody) {
         $out->append($res->body);
     }
 
@@ -321,9 +373,30 @@ internal function render(const Response& $res, bool $sendBody, const Persist& $p
 internal function renderHead(const Response& $res, const Length& $length, const Persist& $persist) : string
 {
     string $out = '';
-    string $phrase = reason($res->status);
 
-    $out->append("HTTP/1.1 {$res->status} {$phrase}\r\n");
+    $out->reserve(HEAD_ROOM);
+    writeHead($out, $res, $length, $persist);
+    return $out;
+}
+
+/**
+ * Append the head to `$out` piece by piece. An interpolated line would
+ * be its own string first, and most lines are too long to stay inline.
+ */
+internal function writeHead(string& $out, const Response& $res, const Length& $length, const Persist& $persist) : void
+{
+    if ($res->status == 200) {
+        $out->append('HTTP/1.1 200 OK\r\n');
+    } else {
+        string $code = str::from($res->status);
+        string $phrase = reason($res->status);
+
+        $out->append('HTTP/1.1 ');
+        $out->append($code);
+        $out->append(' ');
+        $out->append($phrase);
+        $out->append('\r\n');
+    }
 
     string $dateName = 'Date';
     bool $hasDate = false;
@@ -331,7 +404,7 @@ internal function renderHead(const Response& $res, const Length& $length, const 
     usize $i = 0;
 
     while ($i < $count) {
-        Header $h = $res->headers->items[$i];
+        const Header& $h = $res->headers->items[$i];
 
         $i = $i + 1;
 
@@ -348,21 +421,25 @@ internal function renderHead(const Response& $res, const Length& $length, const 
             $hasDate = true;
         }
 
-        $out->append("{$h->name}: {$h->value}\r\n");
+        $out->append($h->name);
+        $out->append(': ');
+        $out->append($h->value);
+        $out->append('\r\n');
     }
 
     if (!$hasDate) {
-        string $now = httpDate(time::timestamp::now()->unix_secs());
-
-        $out->append("Date: {$now}\r\n");
+        appendDate($out);
     }
 
     if (!bodyless($res->status)) {
         match ($length) {
             Length::exact($n) => {
-                usize $len = $n;
+                usize $size = $n;
+                string $len = str::from($size as uint64);
 
-                $out->append("Content-Length: {$len}\r\n");
+                $out->append('Content-Length: ');
+                $out->append($len);
+                $out->append('\r\n');
             },
             Length::chunked => {
                 $out->append('Transfer-Encoding: chunked\r\n');
@@ -379,9 +456,11 @@ internal function renderHead(const Response& $res, const Length& $length, const 
         Persist::keep => {
         },
         Persist::keepAlive($secs) => {
-            int64 $idle = $secs;
+            string $idle = str::from($secs);
 
-            $out->append("Connection: keep-alive\r\nKeep-Alive: timeout={$idle}\r\n");
+            $out->append('Connection: keep-alive\r\nKeep-Alive: timeout=');
+            $out->append($idle);
+            $out->append('\r\n');
         },
         Persist::upgrade => {
             $out->append('Connection: Upgrade\r\n');
@@ -389,5 +468,4 @@ internal function renderHead(const Response& $res, const Length& $length, const 
     }
 
     $out->append('\r\n');
-    return $out;
 }

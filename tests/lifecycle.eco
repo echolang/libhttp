@@ -40,6 +40,29 @@ internal function hangUp(int32 $port, const string& $bytes) : bool
 
 internal const string PLAIN_GET = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
+// dials `$n` clients, sends each a PLAIN_GET, and keeps them open in `$keep`.
+// how many were answered 200
+internal function servedAndKept(int32 $port, int32 $n, array<Client>& $keep) : int32
+{
+    int32 $served = 0;
+    int32 $i = 0;
+
+    while ($i < $n) {
+        Client $c = Client($port);
+        bool $sent = $c->send(PLAIN_GET);
+        string $got = $c->response();
+
+        if ($sent && $got->starts('HTTP/1.1 200 ')) {
+            $served = $served + 1;
+        }
+
+        $keep[] = $c;
+        $i = $i + 1;
+    }
+
+    return $served;
+}
+
 internal function plainServer() : http::Server
 {
     http::Server $app = http::Server();
@@ -85,6 +108,54 @@ test max_connections_refuses_then_recovers {
     assert($third->starts('HTTP/1.1 503 '), 'past the cap is 503');
     assert($third->contains('Retry-After: 1\r\n'), 'with a hint to retry');
     assert($after->starts('HTTP/1.1 200 '), 'served again once the others left');
+}
+
+#[group: "net"]
+test parked_connections_are_counted_and_closed {
+    http::Server $app = plainServer();
+
+    $app->maxConnections(50);
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    int32 $served = 0;
+
+    {
+        // answered and kept, so each is parked by the worker, then hangs up
+        array<Client> $gone = array<Client>();
+
+        $served = servedAndKept($port, 50, $gone);
+    }
+
+    // every hang-up gave its slot back: the whole allowance is there again
+    thread::sleep(300);
+
+    int32 $servedAgain = 0;
+    int32 $closed = 0;
+
+    {
+        array<Client> $idle = array<Client>();
+
+        $servedAgain = servedAndKept($port, 50, $idle);
+
+        // and a stop closes each, wherever it sits: inbox, slot, or worker
+        $app->stop();
+        $srv->join();
+
+        int32 $i = 0;
+
+        while ($i < 50) {
+            if ($idle[$i]->closed()) {
+                $closed = $closed + 1;
+            }
+
+            $i = $i + 1;
+        }
+    }
+
+    assert($served == 50, 'all fifty served');
+    assert($servedAgain == 50, 'fifty more once the first fifty hung up');
+    assert($closed == 50, 'the stop closed every kept connection');
 }
 
 #[group: "net"]

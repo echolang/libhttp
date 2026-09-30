@@ -1,9 +1,8 @@
 /**
  * Chunked transfer coding, decoded as it arrives.
  *
- * `feed` is resumable: one pass over whatever has arrived. Framing is
- * strict (CRLF, hex size). Trailers are checked, then dropped. Capped
- * at maxBody.
+ * `feed` is resumable. Framing is strict. Trailers are checked, then
+ * dropped. Capped at maxBody.
  */
 
 namespace http;
@@ -12,9 +11,8 @@ internal const usize CHUNK_LINE_CAP = 1024;
 internal const usize CHUNK_SLACK = 65536;
 
 /**
- * How many wire bytes a body still arriving may take: twice maxBody plus
- * slack for the framing. Held at the top rather than wrapping, since a
- * maxBody near the top is how a caller says there is no cap.
+ * Wire budget for a body still arriving: 2x maxBody plus slack. Held at
+ * the top rather than wrapping: a maxBody near the top means no cap.
  */
 internal function wireCap(usize $maxBody) : usize
 {

@@ -1,19 +1,29 @@
 /**
- * The line of jobs between the reactors and the workers.
+ * Job line from reactors to workers.
  *
- * Not `thread::channel`: a channel signals its one condition on every take
- * as well as every put, and with a dozen idle workers that wakes one just
- * to find nothing, on the lock the reactor needs next. This one signals
- * only when a worker is actually asleep on it, and never from `recv`.
+ * A `thread::channel` wakes on every take too, which with idle workers
+ * is a wakeup to find nothing, on the lock the reactor needs next. This
+ * one signals only when someone is actually asleep, never from `recv`.
  *
- * It also knows how long its oldest job has waited, which is how a reactor
- * tells a server that is behind from one that just read a burst.
+ * Jobs sit behind a spinlock: every critical section is a few moves, and
+ * a mutex under contention parks you in the kernel. Sleeping is a futex
+ * on an epoch word for the same reason. An empty `recv` spins a moment
+ * first; under load that saves two syscalls per job.
+ *
+ * `oldestWait` is how a reactor tells "behind" from "just read a burst".
  */
 
 use std::thread;
 use std::time;
 
 namespace http;
+
+// workers spinning at once, and for how long each spins before it sleeps
+internal const int32 MAX_SPINNERS = 2;
+internal const int64 SPIN_MICROS = 50;
+
+// spins on a held spinlock before yielding the core
+internal const int32 LOCK_SPINS = 256;
 
 internal struct Pending
 {
@@ -23,116 +33,248 @@ internal struct Pending
     // when each job in `$jobs` was queued, index for index
     internal array<time::instant> $since;
 
-    // jobs `recv` takes from, oldest last, so a take is a pop and not a shift.
-    // Refilled from `$jobs` in reverse once it runs dry
+    // jobs `recv` takes from, oldest last, so a take is a pop
+    // refilled from `$jobs` in reverse once it runs dry
     internal array<Job> $ready;
     internal array<time::instant> $readySince;
-
-    // workers asleep in `recv`
-    internal int32 $waiting;
-    internal bool $closed;
 }
 
 #[atomic]
 internal class JobQueue
 {
-    private thread::mutex<Pending> $lock;
-    private thread::condition $cv;
+    // touched only while `$busy` is held
+    private Pending $pending;
+    private atomic<bool> $busy;
+
+    // jobs queued, beside the lock, so a spinning worker can watch it
+    // without taking the lock every sender needs
+    private atomic<int32> $count;
+
+    // workers asleep in `recv`, and workers spinning in it
+    private atomic<int32> $sleepers;
+    private atomic<int32> $spinning;
+    private atomic<bool> $closed;
+
+    // what sleepers wait on: bumped before every wake, so a worker that
+    // read it before a job came sleeps not at all. one word of its own,
+    // since the kernel needs its address
+    private ptr<int32> $epoch;
 
     internal constructor()
     {
-        $this->lock = thread::mutex<Pending>(Pending(array<Job>(), array<time::instant>(), array<Job>(), array<time::instant>(), 0, false));
-        $this->cv = thread::condition();
+        $this->pending = Pending(array<Job>(), array<time::instant>(), array<Job>(), array<time::instant>());
+        $this->busy = atomic<bool>(false);
+        $this->count = atomic<int32>(0);
+        $this->sleepers = atomic<int32>(0);
+        $this->spinning = atomic<int32>(0);
+        $this->closed = atomic<bool>(false);
+        $this->epoch:$ = mem::alloc<int32>(1);
+        $this->epoch:$[0] = 0;
+    }
+
+    destructor()
+    {
+        mem::free($this->epoch);
     }
 
     /**
-     * Queues `$job`. The server closes the queue only once every reactor has
-     * stopped sending, so nothing is ever refused.
+     * Queue `$job`. Never refused: the server closes only after reactors
+     * stop sending.
      */
     internal function send(mv Job $job) : void
     {
-        bool $wake = false;
-
         // read the clock before the lock, which every reactor and worker contends for
         time::instant $now = time::instant::now();
 
-        {
-            thread::locked<Pending> $g = $this->lock->lock();
+        $this->acquire();
+        $this->pending->jobs[] = mv $job;
+        $this->pending->since[] = $now;
+        $this->count->add(1);
+        $this->release();
 
-            $g->value->jobs[] = mv $job;
-            $g->value->since[] = $now;
-            $wake = $g->value->waiting > 0;
-        }
-
-        // outside the lock, so the woken worker does not block on it at once
-        if ($wake) {
-            $this->cv->notify();
+        // a spinning worker takes it. if one takes it and more are left,
+        // that worker passes the wake on
+        if ($this->spinning->load() == 0) {
+            $this->wakeOne();
         }
     }
 
     /**
-     * The next job, waiting for one. Nothing once the queue is closed and
-     * empty.
+     * Next job, blocking. Nothing once closed and empty.
      */
     internal function recv() : Job?
     {
-        thread::locked<Pending> $g = $this->lock->lock();
+        bool $spun = false;
 
         while (true) {
-            if ($g->value->ready->empty()) {
-                while (!$g->value->jobs->empty()) {
-                    $g->value->ready[] = $g->value->jobs->pop();
-                    $g->value->readySince[] = $g->value->since->pop();
+            if ($this->count->load() > 0) {
+                $this->acquire();
+
+                if ($this->pending->ready->empty()) {
+                    while (!$this->pending->jobs->empty()) {
+                        $this->pending->ready[] = $this->pending->jobs->pop();
+                        $this->pending->readySince[] = $this->pending->since->pop();
+                    }
                 }
+
+                if (!$this->pending->ready->empty()) {
+                    $this->pending->readySince->pop();
+
+                    Job $job = $this->pending->ready->pop();
+                    int32 $left = $this->count->sub(1) - 1;
+
+                    $this->release();
+
+                    // the sender skipped the wake while someone spun: pass it on
+                    if ($left > 0 && $this->spinning->load() == 0) {
+                        $this->wakeOne();
+                    }
+
+                    return $job;
+                }
+
+                $this->release();
+                continue;
             }
 
-            if (!$g->value->ready->empty()) {
-                $g->value->readySince->pop();
-                return $g->value->ready->pop();
-            }
-
-            if ($g->value->closed) {
+            if ($this->closed->load()) {
                 return null;
             }
 
-            $g->value->waiting = $g->value->waiting + 1;
-            $this->cv->wait($g);
-            $g->value->waiting = $g->value->waiting - 1;
+            // spin once per empty look, and only a few workers at a time
+            if (!$spun && $this->spinning->load() < MAX_SPINNERS) {
+                $this->spinning->add(1);
+                $this->spin();
+                $this->spinning->sub(1);
+                $spun = true;
+                continue;
+            }
+
+            $spun = false;
+
+            // the epoch first, then counted as asleep, then the look. a
+            // sender that queues after the look sees this worker and bumps
+            // the epoch, and a bump after the read ends the wait before it
+            // starts
+            int32 $seen = 0;
+
+            unsafe {
+                $seen = mem::atomic::load<int32>($this->epoch:$[0]);
+            }
+
+            $this->sleepers->add(1);
+
+            if ($this->count->load() == 0 && !$this->closed->load()) {
+                http_futex_wait($this->epoch, $seen);
+            }
+
+            $this->sleepers->sub(1);
         }
     }
 
     /**
-     * How long the oldest queued job has waited. Zero when none is.
+     * How long the oldest job has waited. Zero if none.
      */
     internal function oldestWait() : time::duration
     {
-        thread::locked<Pending> $g = $this->lock->lock();
+        time::duration $wait = time::duration::zero();
 
-        usize $ready = $g->value->readySince->count();
+        $this->acquire();
+
+        usize $ready = $this->pending->readySince->count();
 
         if ($ready > 0) {
-            return $g->value->readySince[$ready - 1]->elapsed();
+            $wait = $this->pending->readySince[$ready - 1]->elapsed();
+        } else if (!$this->pending->since->empty()) {
+            $wait = $this->pending->since[0]->elapsed();
         }
 
-        if ($g->value->since->empty()) {
-            return time::duration::zero();
-        }
-
-        return $g->value->since[0]->elapsed();
+        $this->release();
+        return $wait;
     }
 
     /**
-     * No more jobs. Workers drain what is queued, then `recv` answers
-     * nothing.
+     * No more jobs. Workers drain, then `recv` returns nothing.
      */
     internal function close() : void
     {
-        {
-            thread::locked<Pending> $g = $this->lock->lock();
+        $this->closed->store(true);
+        $this->bump(1);
+    }
 
-            $g->value->closed = true;
+    /**
+     * Wake one sleeper, if any. Either it still has to look (and sees the
+     * job) or the epoch bump ends its wait.
+     */
+    private function wakeOne() : void
+    {
+        if ($this->sleepers->load() == 0) {
+            return;
         }
 
-        $this->cv->notify_all();
+        $this->bump(0);
+    }
+
+    /**
+     * Moves the epoch on and wakes one sleeper on it, or with `$all`, every
+     * one.
+     */
+    private function bump(int32 $all) : void
+    {
+        // the word lives as long as the queue, and past the constructor
+        // every touch of it is atomic
+        unsafe {
+            mem::atomic::add<int32>($this->epoch:$[0], 1);
+        }
+
+        http_futex_wake($this->epoch, $all);
+    }
+
+    /**
+     * Watch the count outside the lock until a job shows or the spin
+     * runs out. Clock is sampled every 64 beats: it costs more than one.
+     */
+    private function spin() : void
+    {
+        time::instant $from = time::instant::now();
+        time::duration $limit = time::duration::micros(SPIN_MICROS);
+        int32 $beat = 0;
+
+        while ($this->count->load() == 0 && !$this->closed->load()) {
+            http_cpu_relax();
+            $beat = $beat + 1;
+
+            if ($beat == 64) {
+                $beat = 0;
+
+                if ($from->elapsed() >= $limit) {
+                    return;
+                }
+            }
+        }
+    }
+
+    private function acquire() : void
+    {
+        int32 $spins = 0;
+
+        while (!$this->busy->compare_exchange(false, true)) {
+            // wait on a plain load, so failed swaps do not bounce the line
+            while ($this->busy->load()) {
+                http_cpu_relax();
+                $spins = $spins + 1;
+
+                // the holder was likely preempted. let it run
+                if ($spins >= LOCK_SPINS) {
+                    $spins = 0;
+                    thread::yield();
+                }
+            }
+        }
+    }
+
+    private function release() : void
+    {
+        $this->busy->store(false);
     }
 }

@@ -1,19 +1,14 @@
 /**
- * The websocket opening handshake (RFC 6455 section 4.2): whether a request
- * may be upgraded, and the 101 that says yes.
+ * Websocket opening handshake (RFC 6455 §4.2).
  *
- * A request is only an attempt at all when its `Upgrade` lists `websocket`.
- * Anything else, on a route that answers with a websocket, is 426 Upgrade
- * Required. An attempt then needs GET, HTTP/1.1, `upgrade` in `Connection`,
- * and a `Sec-WebSocket-Key` that is the base64 of 16 bytes, or it is a 400.
- * A `Sec-WebSocket-Version` other than 13 is 426 with the version this server
- * speaks, which is how the RFC asks a client to retry.
+ * Only an attempt if `Upgrade` lists `websocket`; anything else on a ws
+ * route is 426. An attempt needs GET, HTTP/1.1, `upgrade` in
+ * `Connection`, and a 16-byte base64 key, or it is 400. Version other
+ * than 13 is 426 with the version we speak.
  *
- * The 101 is the server's: a handler's own `Upgrade`, `Connection` or
- * `Sec-WebSocket-*` headers are replaced. Its other headers (a cookie, say)
- * go out with it. A subprotocol the handler picked is sent back only when the
- * client offered it, since a client must fail a handshake that names one it
- * did not ask for.
+ * The 101 is ours: handler `Upgrade` / `Sec-WebSocket-*` are replaced,
+ * other headers (a cookie) go out. A subprotocol is echoed only if the
+ * client offered it.
  */
 
 namespace http;
@@ -33,8 +28,7 @@ internal enum UpgradeError
 }
 
 /**
- * The request's `Sec-WebSocket-Key`, once every other part of the handshake
- * checks out.
+ * `Sec-WebSocket-Key` once the rest of the handshake checks out.
  */
 internal function upgradeKey(const Request& $req) : result<string, UpgradeError>
 {
@@ -115,8 +109,8 @@ private function upgradeRequired(bool $version) : Response
 }
 
 /**
- * The 101 for a handler's websocket response, the key it answers, and the
- * subprotocol agreed on, or empty for none.
+ * 101 for a websocket response: the accept key, and the agreed
+ * subprotocol, or empty.
  */
 internal function switching(const Response& $res, const string& $key, const string& $protocol) : Response
 {

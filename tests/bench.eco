@@ -1,14 +1,11 @@
 /**
- * Router and byte-scan throughput. Not a correctness test: it asserts nothing, since a
- * release build drops `assert`. Compiled only with the `bench` flag:
+ * Router and byte-scan throughput. Asserts nothing: release drops
+ * `assert`. Compiled only with `bench`:
  *
  *     echoc test --release --optimize whole --define bench --filter group:bench --verbose
  *
- * `--optimize whole` or the numbers measure call overhead: under the default,
- * nothing from the stdlib inlines here. See ECHOCBUGS.md.
- *
- * Each shape runs what `dispatch` runs before the handler: split and decode
- * the path, find the route, then capture params or build `Allow` on a miss.
+ * `--optimize whole` or you measure call overhead. Each shape runs what
+ * `dispatch` runs before the handler.
  */
 
 #[if: bench]

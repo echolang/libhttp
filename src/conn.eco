@@ -47,9 +47,8 @@ internal class Conn
     }
 
     /**
-     * Ends the connection with a lingering close: the write side shuts, what
-     * the client is still sending is drained for a moment, then the fd closes.
-     * The response survives a client that had more to say.
+     * Linger-close: shut write, drain a moment, close. So the response
+     * survives a client that still had something to say.
      */
     internal function finish() : void
     {

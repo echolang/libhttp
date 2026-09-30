@@ -1,9 +1,8 @@
 /**
  * One incoming request, as a value.
  *
- * Parsed once, handed to one handler by value. A class would be a
- * refcount for nothing. `$params` is filled by the router, just before
- * the handler runs.
+ * Parsed once, handed to one handler by value. `$params` is filled by
+ * the router, just before the handler runs.
  */
 
 namespace http;
@@ -54,9 +53,8 @@ public struct Request
     }
 
     /**
-     * Whether this is a well-formed websocket upgrade, the kind
-     * `Response(websocket:)` would accept. Lets one route answer both a page
-     * and its socket.
+     * True if this is a well-formed websocket upgrade. Lets one route
+     * answer both a page and its socket.
      */
     public const function websocket() : bool
     {
@@ -64,9 +62,8 @@ public struct Request
     }
 
     /**
-     * A param captured from the matched route, or nothing. A `{name?}` the
-     * path left out is nothing; a `{name*}` is always there, `''` when the
-     * path ended at it.
+     * A captured route param, or nothing. `{name?}` missing is nothing;
+     * `{name*}` is always there, `''` if the path ended at it.
      */
     public const function param(const string& $name) : string?
     {

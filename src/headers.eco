@@ -1,8 +1,7 @@
 /**
  * Case-insensitive header list. Duplicates kept, arrival order.
  *
- * An array, not a map: HTTP repeats Set-Cookie, and lookup is
- * case-insensitive.
+ * An array, not a map: HTTP repeats Set-Cookie.
  */
 
 namespace http;
@@ -115,6 +114,27 @@ public struct Headers
         return $found;
     }
 
+    /**
+     * How many headers of this name there are. `all` without building the
+     * list, for a check that only counts.
+     */
+    internal const function countOf(const string& $name) : usize
+    {
+        usize $found = 0;
+        usize $count = $this->items->count();
+        usize $i = 0;
+
+        while ($i < $count) {
+            if (str::iequals($this->items[$i]->name->view(), $name->view())) {
+                $found = $found + 1;
+            }
+
+            $i = $i + 1;
+        }
+
+        return $found;
+    }
+
     public const function has(const string& $name) : bool
     {
         return $this->get($name) != null;
@@ -127,9 +147,8 @@ public struct Headers
 }
 
 /**
- * A token as RFC 9110 spells it: letters, digits, and `!#$%&'*+-.^_`|~`.
- * A header name is one, so a space, a colon, a control byte or a
- * delimiter in a name is refused rather than read two ways.
+ * RFC 9110 token: letters, digits, `!#$%&'*+-.^_`|~`. A header name is
+ * one, so a space or colon in a name is refused.
  */
 internal function isToken(const string& $s) : bool
 {
@@ -172,31 +191,35 @@ private function tokenByte(uint8 $b) : bool
 }
 
 /**
- * Header lines from a request block. Folded continuations join onto the
- * header above. A line with no colon, a fold with no header above it, or a
- * CR or NUL inside a value is a 400, not something to guess.
+ * Header lines from a request block. Folds join onto the header above.
+ * No colon, a fold with nothing above, or CR/NUL in a value is a 400.
  */
 internal function parseHeaderBlock(const string& $raw) : result<Headers, WireError>
 {
     Headers $out = Headers();
-    str::parts $lines = str::split($raw, '\n');
-    usize $count = $lines->count();
+    usize $n = $raw->size();
+    usize $start = 0;
 
     string $pendingName = '';
     string $pendingValue = '';
     bool $pending = false;
-    usize $i = 0;
 
-    while ($i < $count) {
-        $line = str::from(str::rtrim($lines->at($i)));
+    // one walk over the block. Names and values are slices of it, not copies:
+    // a copy is two allocations for anything past fifteen bytes
+    while ($start < $n) {
+        usize $from = $start;
+        usize $end = $raw->find('\n', $from);
 
-        $i = $i + 1;
+        $start = $end + 1;
 
-        if ($line->empty()) {
+        // a window, so the trim copies nothing. a CRLF line ends at its CR
+        $end = $from + str::rtrim($raw->view()->sub($from, $end - $from))->size;
+
+        if ($end == $from) {
             continue;
         }
 
-        uint8 $first = $line->byte(0);
+        uint8 $first = $raw->byte($from);
 
         if ($first == CH_SPACE || $first == CH_TAB) {
             // whitespace before the first header is how one hop sees a
@@ -205,7 +228,7 @@ internal function parseHeaderBlock(const string& $raw) : result<Headers, WireErr
                 return .error(.badRequest);
             }
 
-            $folded = str::from(str::trim($line));
+            $folded = str::from(str::trim($raw->sub($from, $end - $from)));
 
             if (!headerSafe($folded)) {
                 return .error(.badRequest);
@@ -220,23 +243,24 @@ internal function parseHeaderBlock(const string& $raw) : result<Headers, WireErr
             $pending = false;
         }
 
-        usize $at = $line->find(':');
+        usize $at = $raw->find(':', $from);
 
-        if ($at >= $line->size()) {
+        if ($at >= $end) {
             return .error(.badRequest);
         }
 
-        $pendingName = $line->sub(0, $at);
+        $pendingName = $raw->sub($from, $at - $from);
 
         if (!isToken($pendingName)) {
             return .error(.badRequest);
         }
 
-        $pendingValue = str::from(str::trim($line->sub($at + 1, $line->size() - $at - 1)));
+        $pendingValue = str::ltrim($raw->sub($at + 1, $end - $at - 1));
 
         if (!headerSafe($pendingValue)) {
             return .error(.badRequest);
         }
+
         $pending = true;
     }
 

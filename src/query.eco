@@ -1,5 +1,5 @@
 /**
- * Percent-decoding, and the key/value pairs a query string holds.
+ * Percent-decoding, and the pairs a query string holds.
  *
  * A list, not a map: `?a=1&a=2` is two values. `+` is a space in a
  * query, a plus in a path.

@@ -1,8 +1,8 @@
 /**
- * Why the server did not start, or why a loopback connect failed.
+ * Why the server did not start, or why a connect failed.
  *
- * A malformed client request is not this type: that is a 400 on that
- * connection. `"{$e}"` is the sentence.
+ * A bad client request is not this: that is a 400 on that connection.
+ * `"{$e}"` is the sentence.
  */
 
 namespace http;
@@ -32,8 +32,8 @@ public enum Error
 }
 
 /**
- * Why a connection's bytes were not a request. Internal: the worker turns
- * these into status codes, they never cross `listen`.
+ * Why the bytes were not a request. Internal: becomes a status, never
+ * crosses `listen`.
  */
 internal enum WireError
 {
