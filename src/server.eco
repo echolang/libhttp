@@ -213,6 +213,19 @@ public class Server
     }
 
     /**
+     * Pick the body cap per request. `$f` sees the parsed head (method,
+     * path, query, headers; the body is still empty) and returns the cap
+     * for that request. The cap is the smaller of that and maxBody.
+     *
+     * It runs on the reactor before a byte of body is read, so a 413
+     * still comes before the 100. Keep it quick: the reactor waits on it.
+     */
+    public function bodyLimit(function<usize(const Request&)> $f) : void
+    {
+        $this->limits->bodyLimit = $f;
+    }
+
+    /**
      * Time to finish the request line and headers. 408 after that.
      */
     public function headerTimeout(time::duration $d) : void

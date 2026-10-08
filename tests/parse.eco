@@ -758,6 +758,101 @@ test framer_refuses_a_long_body_before_it_arrives {
     assert(stepStatus($f->advance($limits)) == 413, 'a 413 instead of the 100');
 }
 
+// limits whose body cap is 4 under /small and maxBody everywhere else
+internal function smallUploads() : http::Limits
+{
+    http::Limits $limits = http::Limits();
+
+    $limits->maxBody = 64;
+    $limits->bodyLimit = function(const http::Request& $req) : usize {
+        if ($req->path->starts('/small')) {
+            return 4;
+        }
+
+        return std::math::MAX_USIZE;
+    };
+
+    return $limits;
+}
+
+// one advance over `$raw` under `$limits`
+internal function stepUnder(const string& $raw, const http::Limits& $limits) : int32
+{
+    http::Framer $f = http::Framer();
+
+    $f->buffer->append($raw);
+
+    return stepStatus($f->advance($limits));
+}
+
+#[group: "unit"]
+test body_limit_picks_a_cap_per_path {
+    http::Limits $limits = smallUploads();
+
+    int32 $small = stepUnder("POST /small/x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello", $limits);
+    int32 $fits = stepUnder("POST /small/x HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nhell", $limits);
+    int32 $other = stepUnder("POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello", $limits);
+    int32 $over = stepUnder("POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 65\r\n\r\n", $limits);
+
+    assert($small == 413, 'over the cap on its path');
+    assert($fits == 0, 'exactly the cap on its path');
+    assert($other == 0, 'the same body on another path');
+    assert($over == 413, 'a callback above maxBody still stops at maxBody');
+}
+
+#[group: "unit"]
+test body_limit_answers_before_the_100 {
+    http::Limits $limits = smallUploads();
+
+    int32 $s = stepUnder("POST /small HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n", $limits);
+
+    assert($s == 413, 'a 413 instead of the 100');
+}
+
+#[group: "unit"]
+test body_limit_caps_a_chunked_body {
+    http::Limits $limits = smallUploads();
+    string $chunks = "3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+
+    int32 $small = stepUnder("POST /small HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n{$chunks}", $limits);
+    int32 $other = stepUnder("POST /big HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n{$chunks}", $limits);
+
+    assert($small == 413, 'the decoded size passes the cap on its path');
+    assert($other == 0, 'the same chunks on another path');
+}
+
+#[group: "unit"]
+test body_limit_is_worked_out_per_request {
+    http::Framer $f = http::Framer();
+    http::Limits $limits = smallUploads();
+
+    // a roomy request first, then a small one on the same connection
+    $f->buffer->append("POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    $f->buffer->append("POST /small HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+
+    int32 $first = stepStatus($f->advance($limits));
+    int32 $second = stepStatus($f->advance($limits));
+
+    assert($first == 0, 'the first request had room');
+    assert($second == 413, 'the next one gets its own cap');
+}
+
+#[group: "unit"]
+test no_body_limit_is_just_max_body {
+    http::Limits $limits = http::Limits();
+
+    $limits->maxBody = 4;
+
+    int32 $fits = stepUnder("POST /small HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nhell", $limits);
+    int32 $over = stepUnder("POST /small HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello", $limits);
+    int32 $chunked = stepUnder("POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", $limits);
+
+    assert($limits->bodyLimit == null, 'no callback by default');
+    assert($fits == 0, 'up to maxBody');
+    assert($over == 413, 'past maxBody');
+    assert($chunked == 413, 'a chunked body past maxBody');
+}
+
 // a head of exactly `$size` bytes, blank line included
 internal function headOf(usize $size) : string
 {

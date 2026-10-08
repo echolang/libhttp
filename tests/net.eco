@@ -939,6 +939,48 @@ test chunked_upload_over_max_is_413 {
 }
 
 #[group: "net"]
+test body_limit_is_per_request {
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->bodyLimit(function(const http::Request& $req) : usize {
+        if ($req->path == '/avatar') {
+            return 4;
+        }
+
+        return std::math::MAX_USIZE;
+    });
+    $app->post('/avatar', function(http::Request $req) : http::Response {
+        return http::Response(ok: $req->body);
+    });
+    $app->post('/echo', function(http::Request $req) : http::Response {
+        return http::Response(ok: $req->body);
+    });
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    string $small = exchange($port, "POST /avatar HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nabcd");
+    string $over = exchange($port, "POST /avatar HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    string $other = exchange($port, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    string $chunked = exchange($port, "POST /avatar HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+
+    // the 413 comes in place of the 100, before the client sends a byte of body
+    http::Conn $c = dialOrDie($port);
+    bool $sentHead = $c->writeAll("POST /avatar HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n");
+    string $pending = '';
+    string $refused = readResponse($c, $pending);
+
+    $app->stop();
+    $srv->join();
+
+    assert($small->ends("\r\n\r\nabcd"), 'within the cap on its path');
+    assert($over->starts('HTTP/1.1 413'), 'over the cap on its path');
+    assert($other->ends("\r\n\r\nhello"), 'the same body on another path');
+    assert($chunked->starts('HTTP/1.1 413'), 'a chunked body over the cap');
+    assert($sentHead && $refused->starts('HTTP/1.1 413'), 'a 413 instead of the 100');
+}
+
+#[group: "net"]
 test chunked_upload_with_expect_gets_100 {
     http::Server $app = http::Server();
 

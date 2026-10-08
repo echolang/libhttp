@@ -28,6 +28,28 @@ internal struct Limits
     // a zero interval never pings
     public usize $maxMessage = DEFAULT_MESSAGE_CAP;
     public time::duration $pingInterval = time::duration::secs(PING_INTERVAL_SECS);
+
+    // per-request body cap from the parsed head. null means maxBody for every request
+    public function<usize(const Request&)>? $bodyLimit = null;
+
+    /**
+     * Body cap for this request: what `bodyLimit` answers for its head,
+     * never above maxBody. Just maxBody when there is no callback.
+     */
+    public const function bodyCap(const Request& $req) : usize
+    {
+        function<usize(const Request&)> $f = guard $this->bodyLimit else {
+            return $this->maxBody;
+        }
+
+        usize $asked = $f($req);
+
+        if ($asked < $this->maxBody) {
+            return $asked;
+        }
+
+        return $this->maxBody;
+    }
 }
 
 internal struct HeadEnd
@@ -523,6 +545,9 @@ internal struct Framer
     private string $body = '';
     private usize $bodyAt = 0;
     private usize $need = 0;
+
+    // this request's body cap, worked out from its head
+    private usize $cap = 0;
     private Dechunk $chunks = Dechunk(0);
     private time::instant $since = time::instant::now();
 
@@ -547,7 +572,7 @@ internal struct Framer
             Phase::idle => $this->start($limits),
             Phase::head => $this->head($limits),
             Phase::body => $this->body(),
-            Phase::chunked => $this->chunkedBody($limits),
+            Phase::chunked => $this->chunkedBody(),
         };
     }
 
@@ -653,6 +678,8 @@ internal struct Framer
             return .fail($e);
         }
 
+        // the head is good: the server picks this request's cap before any body
+        $this->cap = $limits->bodyCap($req);
         $this->bodyAt = $end->at + $end->sep;
 
         bool $isChunked = match ($framing) {
@@ -670,7 +697,7 @@ internal struct Framer
                 return .sendContinue;
             }
 
-            return $this->chunkedBody($limits);
+            return $this->chunkedBody();
         }
 
         usize $need = match ($framing) {
@@ -679,7 +706,7 @@ internal struct Framer
         };
 
         // 413 answers Expect too, so this is before the 100
-        if ($need > $limits->maxBody) {
+        if ($need > $this->cap) {
             return .fail(.tooLarge);
         }
 
@@ -721,9 +748,9 @@ internal struct Framer
         return .ready;
     }
 
-    private function chunkedBody(const Limits& $limits) : Step
+    private function chunkedBody() : Step
     {
-        Chunking $c = $this->chunks->feed($this->buffer, $limits->maxBody);
+        Chunking $c = $this->chunks->feed($this->buffer, $this->cap);
 
         match ($c) {
             Chunking::needMore => {

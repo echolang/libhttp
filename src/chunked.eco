@@ -2,7 +2,7 @@
  * Chunked transfer coding, decoded as it arrives.
  *
  * `feed` is resumable. Framing is strict. Trailers are checked, then
- * dropped. Capped at maxBody.
+ * dropped. Capped at the request's body cap, never above maxBody.
  */
 
 namespace http;
