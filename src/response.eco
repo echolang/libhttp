@@ -228,11 +228,11 @@ internal function openFile(const string& $path) : result<FileBody, int32>
         return .error(404);
     }
 
-    if (io::opendir($path)->has_value()) {
+    if (std::fs::opendir($path)->has_value()) {
         return .error(404);
     }
 
-    io::file $f = guard io::open($path, .read) else ($e) {
+    io::file $f = guard std::fs::open($path, .read) else ($e) {
         return .error(fileStatus($e));
     }
 

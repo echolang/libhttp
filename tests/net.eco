@@ -1192,7 +1192,7 @@ test file_is_served_with_its_length {
         $content->append('0123456789abcdef');
     }
 
-    result<usize, std::io::ioerror> $wrote = std::io::writefile($path, $content);
+    result<usize, std::io::ioerror> $wrote = std::fs::writefile($path, $content);
 
     http::Server $app = http::Server();
 
@@ -1220,7 +1220,7 @@ test file_is_served_with_its_length {
     $app->stop();
     $srv->join();
 
-    result<bool, std::io::ioerror> $removed = std::io::remove($path);
+    result<bool, std::io::ioerror> $removed = std::fs::remove($path);
 
     assert($wrote->has_value(), 'wrote the fixture');
     assert($sent && $sentMissing, 'sent');

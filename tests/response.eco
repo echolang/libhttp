@@ -52,11 +52,11 @@ test empty_file_has_length_zero {
     string $dir = str::from(std::env::tmp());
     int64 $pid = std::env::pid() as int64;
     string $path = "{$dir}/libhttp-empty-{$pid}.txt";
-    result<usize, io::ioerror> $wrote = io::writefile($path, '');
+    result<usize, io::ioerror> $wrote = std::fs::writefile($path, '');
 
     http::Response $r = http::Response(file: $path);
 
-    result<bool, io::ioerror> $removed = io::remove($path);
+    result<bool, io::ioerror> $removed = std::fs::remove($path);
 
     assert($wrote->has_value(), 'wrote the fixture');
     assert($r->status == 200, 'found');
@@ -65,7 +65,7 @@ test empty_file_has_length_zero {
 
 internal function fileThere(const string& $path) : bool
 {
-    bool $there = guard io::exists($path) else {
+    bool $there = guard std::fs::exists($path) else {
         return false;
     }
 
@@ -99,12 +99,12 @@ test file_path_with_a_nul_is_404 {
     string $dir = str::from(std::env::tmp());
     int64 $pid = std::env::pid() as int64;
     string $path = "{$dir}/libhttp-nul-{$pid}.txt";
-    result<usize, io::ioerror> $wrote = io::writefile($path, 'secret');
+    result<usize, io::ioerror> $wrote = std::fs::writefile($path, 'secret');
 
     // what a decoded %00 in a rest param looks like
     http::Response $r = http::Response(file: "{$path}\u{0}.png");
 
-    result<bool, io::ioerror> $removed = io::remove($path);
+    result<bool, io::ioerror> $removed = std::fs::remove($path);
 
     assert($wrote->has_value(), 'wrote the fixture');
     assert($r->status == 404, 'no file has a NUL in its name');
