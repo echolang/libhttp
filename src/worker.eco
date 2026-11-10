@@ -135,11 +135,15 @@ internal class Shared
     // websockets opened so far, which is where a Socket's id comes from
     public atomic<int64> $sockets;
 
+    // connections handed over raw, which stop shuts
+    public Tunnels $tunnels;
+
     public constructor()
     {
         $this->live = atomic<int32>(0);
         $this->stopping = atomic<bool>(false);
         $this->sockets = atomic<int64>(0);
+        $this->tunnels = Tunnels();
     }
 }
 
@@ -362,6 +366,11 @@ internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<
     $req->peer = $visit->slot->peer;
 
     Response $res = $app($req);
+
+    if ($res->tunnels()) {
+        tunnel($conn, $visit, $res, $shared);
+        return;
+    }
 
     if ($res->upgrades()) {
         upgrade($conn, $visit, $req, $res, $homes, $shared);

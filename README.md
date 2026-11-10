@@ -404,6 +404,34 @@ A message past `maxMessage` is refused from its frame header, before the payload
 
 The protocol is read strictly, the way RFC 6455 says a server must. An unmasked frame from a client, a reserved bit with no extension to claim it, an unknown opcode, a fragmented or oversized control frame, a continuation with nothing to continue: those close with 1002. Text that is not UTF-8 closes with 1007. No extensions are offered, so there is no `permessage-deflate` yet.
 
+## Tunnels
+
+A websocket here is libhttp's own: it reads the frames and hands your hooks whole messages. A reverse proxy needs the opposite. Its upstream does the handshake, and the proxy has to pass the upstream's `101` and every byte after it through untouched. `Response(tunnel:)` hands the connection over raw:
+
+```echo
+$app->get('/ws', function(Request $req) : Response {
+    return Response(tunnel: function(RawConn $raw) : void {
+        // write the head yourself: libhttp sends nothing for this response
+        if (!$raw->write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", 10000)) {
+            return;
+        }
+
+        string $chunk = '';
+        result<usize?, TunnelError> $got = $raw->read($chunk, 65536, 30000);
+        // ... copy to the upstream and back, until either side ends
+    });
+});
+```
+
+The callback runs on a thread of its own, so the worker goes back to the pool at once, and an open tunnel holds no worker. Decide in the handler, before you return the tunnel, whether there is one at all: the handler still runs on a worker, and anything else it returns is an ordinary response.
+
+- **The head is the callback's.** Nothing of the response goes out, its status and headers included.
+- **Bytes the client sent right behind the request head** are what the first reads hand out, before anything new off the socket.
+- **`read(into, most, ms)`** answers how many bytes, null when `ms` ran out first, or `.eof`, `.closed` (this side closed it, or the server is stopping) and `.broken`. **`write(bytes, ms)`** is false once it could not send everything within `ms`. One thread may read while another writes, which is how a proxy copies both ways.
+- **`close()`** shuts both directions and wakes a read or write blocked on another thread. The file descriptor itself closes when the callback returns, never earlier, so its number cannot go to another connection while a thread still uses it. `shutdownWrite()` tells the client nothing more comes.
+- **The callback always runs exactly once.** When the server is stopping, or no thread can be started, it runs on the worker with the tunnel already closed, so whatever it holds (an upstream connection, a counter) is let go by the same code.
+- **`stop()` closes every open tunnel**, and `listen` returns only once each callback has. A tunnel counts toward `maxConnections` until its callback returns.
+
 ## Headers and query
 
 **An `array` with a linear scan. Not a `map<string, string>`.** A map would compile. It would also hash exact bytes (so case-insensitive lookup would allocate a lowercase key on every insert *and* every read), drop every `Set-Cookie` after the first, and `get` would assert on a miss, which is gone in a release build.
@@ -435,7 +463,7 @@ $app->maxMessage(1024 * 1024);             // websockets, default 1 MiB
 $app->pingInterval(.secs(30));             // websockets, default 30 seconds
 ```
 
-That split is the point. A worker only ever sees a whole request, and gives the connection back the moment its response is written. A browser tab holding a kept connection, or a client sending its headers a byte at a time, costs the reactor a slot and costs no worker anything. So `workers` bounds how many handlers run at once, not how many clients can be connected. The things that do hold a worker are a handler running, a stream writing, and a websocket hook running. An open websocket between messages holds nothing but its slot.
+That split is the point. A worker only ever sees a whole request, and gives the connection back the moment its response is written. A browser tab holding a kept connection, or a client sending its headers a byte at a time, costs the reactor a slot and costs no worker anything. So `workers` bounds how many handlers run at once, not how many clients can be connected. The things that do hold a worker are a handler running, a stream writing, and a websocket hook running. An open websocket between messages holds nothing but its slot. A tunnel holds a thread of its own and its connection slot, never a worker.
 
 A `Content-Length` above `maxBody` is 413 without reading the rest.
 
@@ -445,7 +473,7 @@ Complete requests wait in a queue until a worker is free. A new connection is an
 
 A connection the server closes after answering gets a lingering close: the server shuts its side, drains what the client is still sending for up to two seconds or 4 MiB, then closes. That is what lets a client mid-upload read its 413 instead of a reset. The worker only shuts the write side. The reactor does the draining as bytes arrive, so a client that reads its answer and never hangs up costs a slot for two seconds, not a worker. The same goes for a websocket after its close. The 503 is the exception. It is a plain close, sent before the connection ever had a slot.
 
-`stop()` is safe from another thread. Every reactor wakes, closes its idle connections, and stops accepting. Requests already on a worker finish, and their connections close after the response. Then `listen` returns the bound port, and `port()` is 0 again. A `stop()` that comes while no `listen` is running, including one still starting up on another thread, is kept: the next `listen` binds and returns at once. A stopped server can `listen` again. `workers(0)` fails with `Error::tooFewWorkers` before bind.
+`stop()` is safe from another thread. Every reactor wakes, closes its idle connections, and stops accepting. Requests already on a worker finish, and their connections close after the response. Open tunnels are closed, and their callbacks return. Then `listen` returns the bound port, and `port()` is 0 again. A `stop()` that comes while no `listen` is running, including one still starting up on another thread, is kept: the next `listen` binds and returns at once. A stopped server can `listen` again. `workers(0)` fails with `Error::tooFewWorkers` before bind.
 
 A handler that `die`s ends the process, not just its worker. So does a failed `assert`, a `guard` with no `else`, or an index past the end of an array. Echo has no catch, and a `crash::` hook can report but not recover. There is no half-alive pool to repair. When a request is bad, return an error `Response` instead of stopping, and run a production server under something that restarts it: systemd's `Restart=`, launchd's `KeepAlive`, or your container runtime.
 
@@ -493,7 +521,7 @@ echoc run -m . examples/chat.eco      # a websocket chat room, open / in two tab
 ## What is not here yet
 
 - **TLS.** Plain HTTP. Terminate TLS in front, or wait.
-- **HTTP/2.** HTTP/1.1 and websockets. `Upgrade: h2c` is not answered.
+- **HTTP/2.** HTTP/1.1 and websockets. `Upgrade: h2c` is not answered, unless a handler passes it through as a tunnel.
 - **Websocket extensions.** No `permessage-deflate`, and a message arrives whole, never as a stream of fragments.
 - **Transfer codings other than chunked.** A `gzip` upload is 501, and responses are never compressed.
 - **IPv6 and Windows.** IPv4, POSIX. Echo's prebuilts are darwin arm64 and linux x86_64.

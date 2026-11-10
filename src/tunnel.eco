@@ -1,0 +1,345 @@
+/**
+ * A connection handed over raw, after a handler said `Response(tunnel:)`:
+ * no more HTTP, just bytes both ways, for a proxy that passes an upgrade
+ * through to an upstream of its own.
+ *
+ * The callback runs on a thread of its own, so the worker goes back to
+ * the pool at once. One thread may read while another writes. Only the
+ * server closes the fd, once the callback has returned: `close` shuts
+ * both directions, which wakes a blocked read or write without letting
+ * the number go to another connection while it is still in use.
+ */
+
+use std::thread;
+use std::time;
+
+namespace http;
+
+/**
+ * Why a tunnel read gave nothing.
+ */
+public enum TunnelError
+{
+    /**
+     * The client closed its side cleanly.
+     */
+    case eof;
+
+    /**
+     * This side closed the tunnel, or the server is stopping.
+     */
+    case closed;
+
+    /**
+     * The connection failed: reset, or another error from the OS.
+     */
+    case broken;
+
+    public const function name() : string
+    {
+        return match ($this) {
+            TunnelError::eof => 'eof',
+            TunnelError::closed => 'closed',
+            TunnelError::broken => 'broken',
+        };
+    }
+}
+
+#[atomic]
+public class RawConn
+{
+    private int32 $fd;
+
+    // what the reactor read past the request head, handed out by the first reads
+    private string $early;
+    private atomic<bool> $shut;
+
+    /**
+     * The client's address, as `Request::peer` has it.
+     */
+    public const string $peer;
+
+    internal constructor(int32 $fd, const string& $early, const string& $peer)
+    {
+        $this->fd = $fd;
+        $this->early = $early;
+        $this->shut = atomic<bool>(false);
+        $this->peer = $peer;
+    }
+
+    /**
+     * Append at most `$most` bytes onto `$into`, waiting up to `$ms`:
+     * how many, or null when the time ran out first. Bytes the client
+     * sent right behind the request head come first.
+     */
+    public function read(string& $into, usize $most, int64 $ms) : result<usize?, TunnelError>
+    {
+        usize? $none = null;
+
+        if ($this->shut->load()) {
+            return .error(.closed);
+        }
+
+        if (!$this->early->empty()) {
+            usize $n = $this->early->size();
+
+            if ($n > $most) {
+                $n = $most;
+            }
+
+            $into->append($this->early->sub(0, $n));
+            $this->early = $this->early->sub($n, $this->early->size() - $n)->clone();
+
+            usize? $took = $n;
+
+            return .ok($took);
+        }
+
+        int32 $ready = http_wait($this->fd, 1, clampMs($ms));
+
+        if ($ready == 0) {
+            return .ok($none);
+        }
+
+        if ($ready < 0) {
+            return .error($this->failure());
+        }
+
+        if ($into->room() < $most) {
+            $into->reserve($into->size() + $most);
+        }
+
+        isize $got = http_recv_now($this->fd, $into->spare(), $most);
+
+        if ($got == RECV_AGAIN) {
+            return .ok($none);
+        }
+
+        if ($got == 0) {
+            if ($this->shut->load()) {
+                return .error(.closed);
+            }
+
+            return .error(.eof);
+        }
+
+        if ($got < 0) {
+            return .error($this->failure());
+        }
+
+        $into->commit($got as usize);
+
+        usize? $read = $got as usize;
+
+        return .ok($read);
+    }
+
+    /**
+     * Send every byte of `$bytes` within `$ms`. False when the time ran
+     * out, the client is gone or the tunnel was closed; what went out of
+     * it is unknown then, so stop writing.
+     */
+    public function write(const string& $bytes, int64 $ms) : bool
+    {
+        time::instant $start = time::instant::now();
+        usize $off = 0;
+        usize $n = $bytes->size();
+        $p = $bytes->data();
+
+        while ($off < $n) {
+            if ($this->shut->load()) {
+                return false;
+            }
+
+            isize $put = http_send_now($this->fd, $p:$ + $off, $n - $off);
+
+            if ($put > 0) {
+                $off = $off + ($put as usize);
+                continue;
+            }
+
+            if ($put != RECV_AGAIN) {
+                return false;
+            }
+
+            int64 $left = $ms - ($start->elapsed()->as_millis() as int64);
+
+            if ($left <= 0 || http_wait($this->fd, 2, clampMs($left)) <= 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Tell the client nothing more comes, and keep reading what it
+     * still sends.
+     */
+    public function shutdownWrite() : void
+    {
+        http_shut_write($this->fd);
+    }
+
+    /**
+     * End the tunnel both ways. A read or write blocked on another
+     * thread wakes and fails. The fd itself closes when the callback has
+     * returned.
+     */
+    public function close() : void
+    {
+        $this->shut->store(true);
+        http_shut_both($this->fd);
+    }
+
+    public const function closed() : bool
+    {
+        return $this->shut->load();
+    }
+
+    /**
+     * Why a read failed: this side's close, or the connection's own error.
+     */
+    private const function failure() : TunnelError
+    {
+        if ($this->shut->load()) {
+            return .closed;
+        }
+
+        return .broken;
+    }
+
+    /**
+     * The fd, closed: after the callback, once nothing uses it.
+     */
+    internal function finish() : void
+    {
+        $this->shut->store(true);
+        http_close($this->fd);
+    }
+}
+
+/**
+ * The tunnels a running server has open, so `stop` can shut them, and
+ * `listen` returns only once each one's callback has.
+ */
+#[atomic]
+internal class Tunnels
+{
+    private thread::mutex<map<int64, RawConn>> $open;
+    private atomic<int64> $ids;
+
+    internal constructor()
+    {
+        $this->open = thread::mutex<map<int64, RawConn>>(map<int64, RawConn>());
+        $this->ids = atomic<int64>(0);
+    }
+
+    /**
+     * Keep `$raw` until `remove`, and its id; -1 when the server is
+     * stopping, decided under the same lock `shutAll` takes, so no
+     * tunnel opens after a stop shut the others.
+     */
+    internal function add(RawConn $raw, Shared $shared) : int64
+    {
+        thread::locked<map<int64, RawConn>> $held = $this->open->lock();
+
+        if ($shared->stopping->load()) {
+            return -1;
+        }
+
+        int64 $id = $this->ids->add(1);
+
+        $held->value[$id] = $raw;
+        return $id;
+    }
+
+    internal function remove(int64 $id) : void
+    {
+        thread::locked<map<int64, RawConn>> $held = $this->open->lock();
+
+        $held->value->remove($id);
+    }
+
+    internal function shutAll() : void
+    {
+        thread::locked<map<int64, RawConn>> $held = $this->open->lock();
+
+        foreach ($held->value->keys() as $id) {
+            $held->value->get($id)->close();
+        }
+    }
+
+    internal function count() : usize
+    {
+        thread::locked<map<int64, RawConn>> $held = $this->open->lock();
+
+        return $held->value->count();
+    }
+
+    /**
+     * Wait until every tunnel's callback has returned.
+     */
+    internal function drain() : void
+    {
+        while ($this->count() > 0) {
+            thread::sleep(2);
+        }
+    }
+}
+
+/**
+ * A wait in whole milliseconds for C: never negative, never past int32.
+ */
+internal function clampMs(int64 $ms) : int32
+{
+    if ($ms <= 0) {
+        return 0;
+    }
+
+    if ($ms > 2147483647) {
+        return 2147483647;
+    }
+
+    return $ms as int32;
+}
+
+/**
+ * A tunnel response: hand the connection to the callback on a thread
+ * of its own and go back to the pool. The callback always runs exactly
+ * once; when the server is stopping, or no thread can be had, it runs
+ * here with the tunnel closed already, so whatever it holds is let go
+ * by the same code.
+ */
+internal function tunnel(Conn $conn, const Visit& $visit, const Response& $res, Shared $shared) : void
+{
+    // serveVisit only calls this for a response that tunnels
+    function<void(RawConn)> $fn = guard $res->tunnel;
+
+    RawConn $raw = RawConn($conn->release(), $visit->slot->framer->buffer, $visit->slot->peer);
+    Tunnels $tunnels = $shared->tunnels;
+    int64 $id = $tunnels->add($raw, $shared);
+
+    if ($id >= 0) {
+        result<thread::handle, thread::error> $started = thread::spawn(function() : void {
+            $fn($raw);
+            $raw->finish();
+            $shared->live->sub(1);
+            $tunnels->remove($id);
+        });
+
+        if ($started->has_value()) {
+            thread::handle $t = $started->unwrap();
+
+            $t->detach();
+            return;
+        }
+
+        $tunnels->remove($id);
+    }
+
+    $raw->close();
+    $fn($raw);
+    $raw->finish();
+    $shared->live->sub(1);
+}

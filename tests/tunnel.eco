@@ -1,0 +1,274 @@
+/**
+ * Tunnels over loopback: the handler takes the connection raw, writes
+ * its own 101, and echoes bytes until either side ends.
+ */
+
+use std::thread;
+use std::time;
+
+internal const string TUNNEL_HEAD = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n";
+internal const string TUNNEL_ASK = "GET /tunnel HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n";
+
+/**
+ * What the tunnel callbacks saw, set from their threads.
+ */
+#[atomic]
+internal class Tunnelled
+{
+    public atomic<int32> $ran;
+    public atomic<int32> $ended;
+
+    // how the last echo loop ended: 1 eof, 2 closed, 3 broken, 4 a write failed
+    public atomic<int32> $how;
+
+    public constructor()
+    {
+        $this->ran = atomic<int32>(0);
+        $this->ended = atomic<int32>(0);
+        $this->how = atomic<int32>(0);
+    }
+}
+
+/**
+ * Echo what comes until the client ends, waiting in short reads so a
+ * stop is noticed the way a proxy's loop would.
+ */
+internal function echoLoop(http::RawConn $raw, Tunnelled $seen) : void
+{
+    $seen->ran->add(1);
+
+    if (!$raw->write(TUNNEL_HEAD, 2000)) {
+        $seen->how->store(4);
+        $seen->ended->add(1);
+        return;
+    }
+
+    while (true) {
+        string $chunk = '';
+        result<usize?, http::TunnelError> $got = $raw->read($chunk, 4096, 50);
+
+        if (!$got->has_value()) {
+            int32 $how = match ($got->failure()) {
+                http::TunnelError::eof => 1,
+                http::TunnelError::closed => 2,
+                http::TunnelError::broken => 3,
+            };
+
+            $seen->how->store($how);
+            $seen->ended->add(1);
+            return;
+        }
+
+        if ($got->unwrap() == null) {
+            continue;
+        }
+
+        if ($chunk == 'bye') {
+            $raw->close();
+            $seen->how->store(2);
+            $seen->ended->add(1);
+            return;
+        }
+
+        if (!$raw->write($chunk, 2000)) {
+            $seen->how->store(4);
+            $seen->ended->add(1);
+            return;
+        }
+    }
+}
+
+internal function tunnelServer(Tunnelled $seen, int32 $workers) : http::Server
+{
+    http::Server $app = http::Server();
+
+    $app->workers($workers);
+    $app->get('/tunnel', function(http::Request $req) : http::Response {
+        return http::Response(tunnel: function(http::RawConn $raw) : void {
+            echoLoop($raw, $seen);
+        });
+    });
+    $app->get('/hello', function(http::Request $req) : http::Response {
+        return http::Response(text: 'hello');
+    });
+
+    return $app;
+}
+
+/**
+ * Exactly `$n` bytes off `$c` after what `$pending` holds, or fewer
+ * when it ended first.
+ */
+internal function readN(http::Conn& $c, string& $pending, usize $n) : string
+{
+    while ($pending->size() < $n) {
+        if (!fill($c, $pending)) {
+            break;
+        }
+    }
+
+    usize $take = $n;
+
+    if ($pending->size() < $take) {
+        $take = $pending->size();
+    }
+
+    string $out = $pending->sub(0, $take)->clone();
+
+    $pending = $pending->sub($take, $pending->size() - $take)->clone();
+    return $out;
+}
+
+internal function waitFor(atomic<int32>& $counter, int32 $n, int32 $ms) : bool
+{
+    int32 $waited = 0;
+
+    while ($waited < $ms) {
+        if ($counter->load() >= $n) {
+            return true;
+        }
+
+        thread::sleep(5);
+        $waited = $waited + 5;
+    }
+
+    return $counter->load() >= $n;
+}
+
+#[group: "net"]
+test tunnel_echoes_and_hands_over_bytes_behind_the_head {
+    Tunnelled $seen = Tunnelled();
+    http::Server $app = tunnelServer($seen, 2);
+    thread::handle $srv = serve($app);
+    http::Conn $c = dialOrDie($app->port());
+    string $pending = '';
+
+    // the first bytes travel in the same write as the request head
+    string $ask = TUNNEL_ASK;
+
+    $ask->append('early');
+
+    bool $sent = $c->writeAll($ask);
+    string $head = readN($c, $pending, TUNNEL_HEAD->size());
+    string $early = readN($c, $pending, 5);
+    bool $more = $c->writeAll('more bytes');
+    string $back = readN($c, $pending, 10);
+
+    $c->finish();
+
+    bool $ended = waitFor($seen->ended, 1, 2000);
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $head == TUNNEL_HEAD, 'the head is the callback\'s own, and nothing of libhttp\'s');
+    assert($early == 'early', 'bytes behind the head come first');
+    assert($more && $back == 'more bytes', 'then the echo');
+    assert($ended && $seen->how->load() == 1, 'the client\'s close is the callback\'s eof');
+    assert($seen->ran->load() == 1, 'the callback ran once');
+}
+
+#[group: "net"]
+test tunnel_close_reaches_the_client {
+    Tunnelled $seen = Tunnelled();
+    http::Server $app = tunnelServer($seen, 2);
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+
+    bool $sent = $c->send(TUNNEL_ASK);
+    string $head = readN($c->conn, $c->pending, TUNNEL_HEAD->size());
+    bool $bye = $c->send('bye');
+    bool $closed = $c->closed();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $head == TUNNEL_HEAD, '101');
+    assert($bye && $closed, 'the callback\'s close ends the client\'s connection');
+}
+
+#[group: "net"]
+test tunnel_holds_no_worker {
+    Tunnelled $seen = Tunnelled();
+    http::Server $app = tunnelServer($seen, 1);
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    Client $a = Client($port);
+    Client $b = Client($port);
+
+    bool $sent = $a->send(TUNNEL_ASK) && $b->send(TUNNEL_ASK);
+    string $headA = readN($a->conn, $a->pending, TUNNEL_HEAD->size());
+    string $headB = readN($b->conn, $b->pending, TUNNEL_HEAD->size());
+    time::instant $start = time::instant::now();
+    string $got = exchange($port, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    time::duration $took = $start->elapsed();
+    bool $echo = $a->send('still');
+    string $back = readN($a->conn, $a->pending, 5);
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $headA == TUNNEL_HEAD && $headB == TUNNEL_HEAD, 'two tunnels on one worker');
+    assert($got->ends('hello') && $took < time::duration::millis(500), 'the worker was free for a request');
+    assert($echo && $back == 'still', 'and the tunnels still work');
+}
+
+#[group: "net"]
+test stop_shuts_open_tunnels_and_waits_for_them {
+    Tunnelled $seen = Tunnelled();
+    http::Server $app = tunnelServer($seen, 2);
+    Done $done = Done();
+    thread::handle $srv = listenInBackground($app, $done);
+    int32 $port = waitPort($app);
+    Client $c = Client($port);
+
+    bool $sent = $c->send(TUNNEL_ASK);
+    string $head = readN($c->conn, $c->pending, TUNNEL_HEAD->size());
+
+    $app->stop();
+
+    bool $returned = waitReturned($done, 3000);
+    int32 $ended = $seen->ended->load();
+    bool $closed = $c->closed();
+
+    $srv->join();
+
+    assert($sent && $head == TUNNEL_HEAD, '101');
+    assert($returned, 'listen returned with a tunnel open');
+    assert($ended == 1 && $seen->how->load() == 2, 'its callback saw the close, before listen returned');
+    assert($closed, 'and the client\'s connection ended');
+}
+
+#[group: "net"]
+test a_tunnel_counts_as_a_connection {
+    Tunnelled $seen = Tunnelled();
+    http::Server $app = tunnelServer($seen, 2);
+
+    $app->maxConnections(1);
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    string $refused = '';
+    string $after = '';
+
+    {
+        Client $a = Client($port);
+        bool $sent = $a->send(TUNNEL_ASK);
+        string $head = readN($a->conn, $a->pending, TUNNEL_HEAD->size());
+
+        $refused = exchange($port, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+
+        assert($sent && $head == TUNNEL_HEAD, 'the tunnel is open');
+    }
+
+    // the tunnel's client hung up at the end of the block: its slot comes back once the callback returns
+    bool $ended = waitFor($seen->ended, 1, 2000);
+
+    $after = eventually($port, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    $app->stop();
+    $srv->join();
+
+    assert($refused->starts('HTTP/1.1 503 '), 'an open tunnel holds its connection slot');
+    assert($ended && $after->starts('HTTP/1.1 200 '), 'and gives it back when it ends');
+}

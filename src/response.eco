@@ -30,6 +30,9 @@ public struct Response
     internal Upgrade? $upgrade = null;
     internal Request? $origin = null;
 
+    // a tunnel's callback, which takes the connection over raw
+    internal function<void(RawConn)>? $tunnel = null;
+
     public constructor(int32 $status, const string& $body)
     {
         $this->status = $status;
@@ -97,6 +100,20 @@ public struct Response
         $this->upgrade = Upgrade($channel, $name);
         $this->status = 101;
         $this->body = '';
+    }
+
+    /**
+     * Take the connection over raw: `$fn` gets it on a thread of its
+     * own and writes everything, the head of the answer included, so a
+     * proxy can pass an upstream's 101 through. Nothing of this response
+     * is sent, its status and headers included. See "Tunnels" in the
+     * README.
+     */
+    public constructor(tunnel: function<void(RawConn)> $fn)
+    {
+        $this->status = 101;
+        $this->body = '';
+        $this->tunnel = $fn;
     }
 
     /**
@@ -179,6 +196,14 @@ public struct Response
     public const function streamed() : bool
     {
         return $this->streaming;
+    }
+
+    /**
+     * Whether this response hands the connection over raw.
+     */
+    public const function tunnels() : bool
+    {
+        return $this->tunnel != null;
     }
 
     /**

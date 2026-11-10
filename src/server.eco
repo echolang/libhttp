@@ -378,8 +378,9 @@ public class Server
     }
 
     /**
-     * Unblock `listen`, from any thread. Idle conns close now; in-flight
-     * requests finish. A stop before listen is kept for the next one.
+     * Unblock `listen`, from any thread. Idle conns and open tunnels close
+     * now; in-flight requests finish. A stop before listen is kept for the
+     * next one.
      */
     public function stop() : void
     {
@@ -389,6 +390,7 @@ public class Server
 
         if (!$wr->value->empty()) {
             $this->shared->stopping->store(true);
+            $this->shared->tunnels->shutAll();
             wakeAll($wr->value);
         }
     }
@@ -550,6 +552,10 @@ public class Server
         // no reactor sends any more. workers finish what is queued, then return
         $jobs->close();
         joinAll($workers);
+
+        // a tunnel opened while stopping was shut as it registered, the rest by stop
+        $shared->tunnels->shutAll();
+        $shared->tunnels->drain();
 
         $k = 0;
 
