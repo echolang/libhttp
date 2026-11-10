@@ -24,6 +24,8 @@ internal extern {
     function http_close(int32 $fd) : int32;
     function http_finish(int32 $fd) : int32;
     function http_shut_write(int32 $fd) : int32;
+    function http_shut_both(int32 $fd) : int32;
+    function http_wait(int32 $fd, int32 $events, int32 $ms) : int32;
     function http_drain_now(int32 $fd) : int64;
     function http_is_fd_limit() : int32;
     function http_is_badfd() : int32;

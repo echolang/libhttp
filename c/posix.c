@@ -659,6 +659,52 @@ int http_shut_write(int fd)
 }
 
 /*
+ * Both directions shut, the fd still open: a thread blocked on it wakes, and
+ * nothing else can be handed the same number while it does. A tunnel's close.
+ */
+int http_shut_both(int fd)
+{
+    return shutdown(fd, SHUT_RDWR);
+}
+
+/*
+ * Waits up to ms for fd to be readable (events 1) or writable (2): 1 when it
+ * is, or has hung up or failed so the next call says how, 0 when the time ran
+ * out, -1 on an error of poll itself.
+ */
+int http_wait(int fd, int events, int ms)
+{
+    struct pollfd pfd;
+    struct timespec start;
+    int rc;
+
+    pfd.fd = fd;
+    pfd.events = (short)((events & 1 ? POLLIN : 0) | (events & 2 ? POLLOUT : 0));
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (;;) {
+        long left = ms - elapsed_ms(&start);
+
+        if (left < 0) {
+            left = 0;
+        }
+
+        pfd.revents = 0;
+        rc = poll(&pfd, 1, (int)left);
+
+        if (rc < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (rc < 0) {
+            return -1;
+        }
+
+        return rc > 0 ? 1 : 0;
+    }
+}
+
+/*
  * Reads and drops what has arrived, without waiting. The count dropped
  * while the peer is still there, or -1 once it has hung up or the socket
  * broke. Stops after DRAIN_STEP so one sender cannot hold the reactor.
