@@ -542,8 +542,23 @@ internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<
         },
     }
 
-    if (closes($persist) || $shared->stopping->load()) {
+    if (closes($persist)) {
         linger($conn, $homes, $visit->home, $shared);
+        return;
+    }
+
+    // told it stays, then the server stopped: no lingering, since a client
+    // that heard keep-alive has no reason to hang up and would hold the
+    // stop for the whole drain. what already came (a pipelined request) is
+    // read off first: a close over unread bytes is a reset, which can cost
+    // the client the response it has not read yet
+    if ($shared->stopping->load()) {
+        int32 $fd = $conn->release();
+
+        http_shut_write($fd);
+        http_drain_now($fd);
+        http_close($fd);
+        $shared->live->sub(1);
         return;
     }
 
