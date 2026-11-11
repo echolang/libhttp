@@ -237,26 +237,41 @@ test a_client_that_takes_nothing_is_closed_after_the_send_timeout {
     thread::handle $srv = serve($app);
     int32 $port = $app->port();
     http::Conn $slow = narrowClient($port);
+
+    // the server's clock starts after this one, once the reactor has it
+    time::instant $start = time::instant::now();
     bool $sent = $slow->writeAll("GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
 
     thread::sleep(100);
 
     bool $free = answeredWithin($port, 3000);
-    bool $heldAt9 = false;
+    bool $early = false;
+    bool $lookedLate = false;
     bool $gone = false;
-    int32 $waited = 0;
 
     // ten seconds without a byte taken, then a sweep of at most a second.
-    // later on a loaded machine: the clock starts once the reactor has it
-    while ($waited < 25000) {
+    // read off the real clock: on a loaded machine slept steps run long and
+    // add up to more than they say. live first, so a close seen with less
+    // than 9.5 seconds on the clock happened before then
+    while ($start->elapsed() < time::duration::secs(25)) {
         thread::sleep(100);
-        $waited = $waited + 100;
 
-        if ($waited == 9000) {
-            $heldAt9 = $app->live() == 1;
+        int32 $live = $app->live();
+        time::duration $at = $start->elapsed();
+
+        if ($at < time::duration::millis(9500)) {
+            if ($live == 0) {
+                $early = true;
+            }
+
+            if ($at >= time::duration::secs(5)) {
+                $lookedLate = true;
+            }
+
+            continue;
         }
 
-        if ($waited > 9000 && $app->live() == 0) {
+        if ($live == 0) {
             $gone = true;
             break;
         }
@@ -270,7 +285,7 @@ test a_client_that_takes_nothing_is_closed_after_the_send_timeout {
     $srv->join();
 
     assert($sent && $free, 'the worker was free meanwhile');
-    assert($heldAt9, 'still open before the timeout');
+    assert(!$early && $lookedLate, 'still open before the timeout');
     assert($gone, 'closed after it');
     assert($got->size() < $big->size(), 'cut short');
 }
