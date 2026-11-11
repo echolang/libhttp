@@ -1,0 +1,88 @@
+/**
+ * How often the reactor looks at what: requests in progress every
+ * SWEEP_MS, idle connections and websockets on a slower tick.
+ */
+
+use std::time;
+
+#[group: "sweep"]
+test idle_tick_is_a_fifth_of_the_idle_timeout_up_to_a_second {
+    http::Limits $limits = http::Limits();
+
+    $limits->idleTimeout = time::duration::secs(5);
+    $limits->pingInterval = time::duration::secs(30);
+    assert(http::idleTickFor($limits) == time::duration::secs(1), 'default: once a second');
+
+    $limits->idleTimeout = time::duration::secs(2);
+    assert(http::idleTickFor($limits) == time::duration::millis(400), 'a fifth of a short idle timeout');
+
+    $limits->idleTimeout = time::duration::secs(120);
+    assert(http::idleTickFor($limits) == time::duration::secs(1), 'never slower than a second');
+}
+
+#[group: "sweep"]
+test idle_tick_follows_a_short_ping_interval {
+    http::Limits $limits = http::Limits();
+
+    $limits->idleTimeout = time::duration::secs(60);
+    $limits->pingInterval = time::duration::secs(2);
+    assert(http::idleTickFor($limits) == time::duration::millis(400), 'a fifth of the ping interval');
+
+    $limits->pingInterval = time::duration::zero();
+    assert(http::idleTickFor($limits) == time::duration::secs(1), 'no pings: the idle timeout decides');
+}
+
+#[group: "sweep"]
+test idle_tick_is_never_faster_than_the_sweep {
+    http::Limits $limits = http::Limits();
+
+    $limits->idleTimeout = time::duration::millis(50);
+    $limits->pingInterval = time::duration::millis(200);
+    assert(http::idleTickFor($limits) == time::duration::millis(http::SWEEP_MS as int64), 'clamped to SWEEP_MS');
+}
+
+#[group: "sweep"]
+test a_framer_is_mid_request_from_its_first_byte_until_ready {
+    http::Limits $limits = http::Limits();
+    http::Framer $f = http::Framer();
+
+    assert(!$f->midRequest(), 'a fresh connection is idle');
+
+    $f->buffer->append('GET / HTTP/1.1\r\nHo');
+
+    http::Step $s = $f->advance($limits);
+
+    assert($f->midRequest(), 'half a head is a request in progress');
+
+    $f->buffer->append('st: x\r\n\r\n');
+    $s = $f->advance($limits);
+
+    bool $ready = match ($s) {
+        http::Step::ready => true,
+        else => false,
+    };
+
+    assert($ready, 'the request finished');
+}
+
+#[group: "sweep"]
+test expired_at_uses_the_clock_it_is_given {
+    http::Limits $limits = http::Limits();
+
+    $limits->idleTimeout = time::duration::secs(5);
+
+    http::Framer $f = http::Framer();
+    time::instant $now = time::instant::now();
+
+    bool $fresh = match ($f->expiredAt($limits, $now)) {
+        http::Expiry::none => true,
+        else => false,
+    };
+    bool $later = match ($f->expiredAt($limits, $now + time::duration::secs(6))) {
+        http::Expiry::idle => true,
+        else => false,
+    };
+
+    assert($fresh, 'not expired now');
+    assert($later, 'idle once the timeout has passed on the given clock');
+}

@@ -45,6 +45,7 @@ internal const int64 IDLE_TIMEOUT_SECS = 5;
 internal const int64 QUEUE_WAIT_MS = 1000;
 internal const int32 DEFAULT_MAX_REQUESTS = 1000;
 internal const int32 DEFAULT_MAX_CONNECTIONS = 1024;
+internal const int32 DEFAULT_BACKLOG = 4096;
 internal const usize DEFAULT_MESSAGE_CAP = 1048576;
 internal const int64 PING_INTERVAL_SECS = 30;
 internal const int64 CLOSE_WAIT_SECS = 5;
@@ -52,3 +53,18 @@ internal const int64 CLOSE_WAIT_SECS = 5;
 // lingering close: how long, and how much, before the reactor gives up
 internal const int64 LINGER_MS = 2000;
 internal const int64 LINGER_CAP = 4194304;
+
+// a buffered response the client is slow to take: the most of one the
+// reactor finishes for the worker, the most all its connections may hold
+// at once, how long a worker waits on a full socket before handing the
+// rest over, and how long the reactor waits on one that takes nothing
+// (the send timeout a worker's blocking write has)
+internal const usize OUTBOUND_CAP = 4194304;
+internal const int64 OUTBOUND_TOTAL = 268435456;
+internal const int32 SEND_GRACE_MS = 1;
+internal const int64 SEND_TIMEOUT_SECS = 10;
+
+// where a send cannot be told not to wait (darwin), a response this small
+// is written blocking as before: making the socket non-blocking and back
+// costs more than the rare small answer a slow client stalls
+internal const usize SEND_TRY_MIN = 65536;

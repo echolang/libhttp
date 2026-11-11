@@ -1,0 +1,393 @@
+/**
+ * Load over loopback: a real Server, client threads on raw sockets.
+ * Prints numbers, asserts nothing that depends on speed. Compiled only
+ * with `bench`:
+ *
+ *     echoc test --release --optimize whole --define bench --filter file:load.eco --verbose
+ *
+ * One test per scenario, so `--filter name:load_small_keepalive` runs
+ * one. See benchmarks/README.md for what each measures and the numbers.
+ */
+
+#[if: bench]
+
+use std::thread;
+use std::time;
+
+internal const string LOAD_FILE = "GET /file HTTP/1.1\r\nHost: x\r\n\r\n";
+internal const string LOAD_BIG = "GET /big HTTP/1.1\r\nHost: x\r\n\r\n";
+internal const int32 LOAD_WARMUP_MS = 300;
+internal const int32 LOAD_WINDOW_MS = 2000;
+internal const usize LOAD_SCRATCH = 65536;
+
+/**
+ * What the client threads count, and the flag that stops them.
+ */
+#[atomic]
+internal class LoadTally
+{
+    public atomic<int64> $done;
+    public atomic<int64> $bytes;
+    public atomic<int64> $failed;
+    public atomic<bool> $stop;
+
+    public constructor()
+    {
+        $this->done = atomic<int64>(0);
+        $this->bytes = atomic<int64>(0);
+        $this->failed = atomic<int64>(0);
+        $this->stop = atomic<bool>(false);
+    }
+}
+
+/**
+ * Read one response off `$c` and throw the body away. Body bytes, or -1.
+ * Only for a server that frames with Content-Length and a client that
+ * never pipelines.
+ */
+internal function drainResponse(http::Conn& $c, string& $buf, string& $scratch) : int64
+{
+    $buf->clear();
+
+    usize $end = 0;
+
+    while (true) {
+        if (!fill($c, $buf)) {
+            return -1;
+        }
+
+        $end = $buf->find('\r\n\r\n');
+
+        if ($end < $buf->size()) {
+            break;
+        }
+    }
+
+    usize $at = $buf->find('Content-Length: ');
+
+    if ($at >= $end) {
+        return -1;
+    }
+
+    usize $stop = $buf->find('\r\n', $at);
+    int64 $len = str::int($buf->sub($at + 16, $stop - $at - 16)) ?? -1;
+    int64 $have = ($buf->size() - $end - 4) as int64;
+
+    while ($have < $len) {
+        ptr<uint8> $dst = $scratch->spare();
+        isize $got = $c->recv($dst, LOAD_SCRATCH);
+
+        if ($got <= 0) {
+            return -1;
+        }
+
+        $have = $have + ($got as int64);
+    }
+
+    return $len;
+}
+
+/**
+ * One keep-alive connection sending `$req` back to back until told to stop.
+ */
+internal function hammer(int32 $port, string $req, LoadTally $t) : void
+{
+    http::Conn $c = dialOrDie($port);
+    string $buf = '';
+    string $scratch = '';
+
+    $scratch->reserve(LOAD_SCRATCH);
+
+    while (!$t->stop->load()) {
+        if (!$c->writeAll($req)) {
+            $t->failed->add(1);
+            return;
+        }
+
+        int64 $n = drainResponse($c, $buf, $scratch);
+
+        if ($n < 0) {
+            $t->failed->add(1);
+            return;
+        }
+
+        $t->done->add(1);
+        $t->bytes->add($n);
+    }
+}
+
+/**
+ * Start `$clients` hammer threads on `$req`.
+ */
+internal function startClients(int32 $port, const string& $req, int32 $clients, LoadTally $t) : array<thread::handle>
+{
+    string $line = $req;
+    array<thread::handle> $hs = array<thread::handle>();
+    int32 $i = 0;
+
+    while ($i < $clients) {
+        thread::handle $h = guard thread::spawn(function() : void {
+            hammer($port, $line, $t);
+        }) else ($e) {
+            die($e->message());
+        }
+
+        $hs[] = $h;
+        $i = $i + 1;
+    }
+
+    return $hs;
+}
+
+/**
+ * Count what completes in one window after a warmup: responses and body
+ * bytes per second.
+ */
+internal struct Rate
+{
+    public float64 $rps;
+    public float64 $mibps;
+}
+
+internal function window(LoadTally $t, int32 $ms) : Rate
+{
+    int64 $done0 = $t->done->load();
+    int64 $bytes0 = $t->bytes->load();
+    time::instant $from = time::instant::now();
+
+    thread::sleep($ms);
+
+    float64 $secs = ($from->elapsed()->as_micros() as float64) / 1000000.0;
+    int64 $done = $t->done->load() - $done0;
+    int64 $bytes = $t->bytes->load() - $bytes0;
+
+    return Rate(($done as float64) / $secs, ($bytes as float64) / $secs / 1048576.0);
+}
+
+/**
+ * Four clients sending `$req` to `$app` until the window after the warmup
+ * is over: their rate in that window. Stops the clients and the server.
+ */
+internal function measure(http::Server $app, const string& $req, LoadTally $t) : Rate
+{
+    thread::handle $srv = serve($app);
+    array<thread::handle> $hs = startClients($app->port(), $req, 4, $t);
+
+    thread::sleep(LOAD_WARMUP_MS);
+
+    Rate $r = window($t, LOAD_WINDOW_MS);
+
+    $t->stop->store(true);
+    http::joinAll($hs);
+    $app->stop();
+    $srv->join();
+    return $r;
+}
+
+internal function smallServer(int32 $workers, int32 $reactors) : http::Server
+{
+    http::Server $app = http::Server();
+
+    $app->workers($workers);
+    $app->reactors($reactors);
+    $app->maxRequests(1000000000);
+    $app->get('/', function(http::Request $req) : http::Response {
+        return http::Response(text: 'hello, world');
+    });
+
+    return $app;
+}
+
+/**
+ * (a) Small buffered responses over keep-alive.
+ */
+#[group: "load"]
+test load_small_keepalive {
+    LoadTally $t = LoadTally();
+    Rate $r = measure(smallServer(4, 2), PLAIN_GET, $t);
+    int64 $failed = $t->failed->load();
+
+    echo "load (a) small keep-alive: {$r->rps:.0f} rps, 4 clients, 4 workers, 2 reactors, {$failed} failed";
+    assert($t->failed->load() == 0, 'no client failed');
+}
+
+/**
+ * (b) A 1 MiB file over keep-alive.
+ */
+#[group: "load"]
+test load_file_1mib {
+    string $path = fixtureFile('load', patterned(1048576));
+    http::Server $app = smallServer(4, 2);
+
+    $app->get('/file', function(http::Request $req) : http::Response {
+        return http::Response(file: $path);
+    });
+
+    LoadTally $t = LoadTally();
+    Rate $r = measure($app, LOAD_FILE, $t);
+
+    result<bool, std::io::ioerror> $removed = std::fs::remove($path);
+
+    int64 $failed = $t->failed->load();
+
+    echo "load (b) 1 MiB file: {$r->mibps:.0f} MiB/s ({$r->rps:.0f} rps), 4 clients, {$failed} failed";
+    assert($failed == 0, 'no client failed');
+}
+
+/**
+ * (e) A 1 MiB buffered body (not a file) to clients that read at speed.
+ */
+#[group: "load"]
+test load_big_buffered {
+    string $big = patterned(1048576);
+    http::Server $app = smallServer(4, 2);
+
+    $app->get('/big', function(http::Request $req) : http::Response {
+        return http::Response(ok: $big);
+    });
+
+    LoadTally $t = LoadTally();
+    Rate $r = measure($app, LOAD_BIG, $t);
+
+    int64 $failed = $t->failed->load();
+
+    echo "load (e) 1 MiB buffered: {$r->mibps:.0f} MiB/s ({$r->rps:.0f} rps), 4 clients, {$failed} failed";
+    assert($failed == 0, 'no client failed');
+}
+
+/**
+ * (c) 10k idle keep-alive connections: how long they take to open, and
+ * what the process spends holding them (CPU, resident memory).
+ */
+#[group: "load"]
+test load_idle_10k {
+    int32 $conns = 10000;
+    http::Server $app = smallServer(4, 2);
+
+    $app->maxConnections(20000);
+    $app->idleTimeout(time::duration::secs(120));
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    int64 $rss0 = http_bench_rss_kb();
+    array<http::Conn> $held = arr::room<http::Conn>($conns as usize);
+    string $buf = '';
+    string $scratch = '';
+    int32 $ok = 0;
+    int32 $i = 0;
+
+    $scratch->reserve(LOAD_SCRATCH);
+
+    time::instant $opening = time::instant::now();
+
+    while ($i < $conns) {
+        http::Conn $c = dialOrDie($port);
+
+        if ($c->writeAll(PLAIN_GET) && drainResponse($c, $buf, $scratch) >= 0) {
+            $ok = $ok + 1;
+        }
+
+        $held[] = $c;
+        $i = $i + 1;
+    }
+
+    int64 $openMs = $opening->elapsed()->as_millis() as int64;
+
+    // let every connection settle back on its reactor
+    thread::sleep(500);
+
+    int64 $rss1 = http_bench_rss_kb();
+    int64 $cpu0 = http_bench_cpu_us();
+    time::instant $from = time::instant::now();
+
+    thread::sleep(5000);
+
+    int64 $cpu1 = http_bench_cpu_us();
+    float64 $wall = $from->elapsed()->as_micros() as float64;
+    float64 $pct = (($cpu1 - $cpu0) as float64) * 100.0 / $wall;
+    int64 $rssMiB = ($rss1 - $rss0) / 1024;
+
+    // the server closes first, so the client ports never sit in TIME_WAIT
+    $app->stop();
+    $srv->join();
+    $held->clear();
+
+    echo "load (c) 10k idle: opened in {$openMs} ms, held 5 s at {$pct:.2f}% of one core, rss +{$rssMiB} MiB";
+    assert($ok == $conns, 'every connection was answered');
+}
+
+/**
+ * (d) Fast clients' rate with and without one client that reads a 1 MiB
+ * buffered response 1 KiB every 50 ms. One worker, so a slow client
+ * that holds it holds them all.
+ */
+#[group: "load"]
+test load_slow_reader {
+    string $big = patterned(1048576);
+    http::Server $app = smallServer(1, 1);
+
+    $app->get('/big', function(http::Request $req) : http::Response {
+        return http::Response(ok: $big);
+    });
+
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    LoadTally $t = LoadTally();
+    array<thread::handle> $hs = startClients($port, PLAIN_GET, 4, $t);
+
+    thread::sleep(LOAD_WARMUP_MS);
+
+    Rate $before = window($t, LOAD_WINDOW_MS);
+
+    LoadTally $slow = LoadTally();
+    thread::handle $reader = guard thread::spawn(function() : void {
+        int32 $fd = http_bench_dial($port, 16384);
+
+        if ($fd < 0) {
+            return;
+        }
+
+        http::Conn $c = http::Conn($fd);
+        string $chunk = '';
+
+        $chunk->reserve(1024);
+
+        if (!$c->writeAll(LOAD_BIG)) {
+            return;
+        }
+
+        while (!$slow->stop->load()) {
+            ptr<uint8> $dst = $chunk->spare();
+            isize $got = $c->recv($dst, 1024);
+
+            if ($got <= 0) {
+                return;
+            }
+
+            $slow->bytes->add($got as int64);
+            thread::sleep(50);
+        }
+    }) else ($e) {
+        die($e->message());
+    }
+
+    thread::sleep(LOAD_WARMUP_MS);
+
+    Rate $during = window($t, LOAD_WINDOW_MS);
+
+    $slow->stop->store(true);
+    $reader->join();
+    $t->stop->store(true);
+    http::joinAll($hs);
+    $app->stop();
+    $srv->join();
+
+    float64 $ratio = $during->rps * 100.0 / $before->rps;
+
+    int64 $failed = $t->failed->load();
+
+    echo "load (d) slow reader: {$before->rps:.0f} rps alone, {$during->rps:.0f} rps beside it ({$ratio:.0f}%), 1 worker, {$failed} failed";
+    assert($failed == 0, 'no client failed');
+}
+
+#[end]

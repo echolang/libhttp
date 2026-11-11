@@ -2,10 +2,13 @@
  * Whole request in, response out, connection parked or closed.
  *
  * Same shape for a websocket: one message, the hook, the socket back.
- * Workers never wait on a client still sending. Writes still block
- * under the send timeout.
+ * Workers never wait on a client still sending, nor long on one slow to
+ * read: a buffered response or a file it does not take at once goes to
+ * the reactor to finish. Streams and small writes still block under the
+ * send timeout.
  */
 
+use std::io;
 use std::thread;
 use std::time;
 
@@ -37,6 +40,41 @@ internal struct Parked
 }
 
 /**
+ * A response the client was slow to take, on its way to the reactor to
+ * finish: the bytes or the file, how far they got, and what the
+ * connection does once they are out.
+ */
+internal struct Outbound
+{
+    public int32 $fd;
+    public string $bytes;
+    public usize $at;
+
+    // what this one counts against OUTBOUND_TOTAL until it is done
+    public int64 $charged;
+
+    // linger-close after the last byte, or wait for the next request
+    public bool $close;
+
+    // the socket was made non-blocking for this, and turns blocking again after
+    public bool $toggled;
+    public string $peer;
+    public string $rest;
+    public int32 $served;
+
+    // the last time the client took a byte
+    public time::instant $since;
+
+    // a file to send after `$bytes`, from `$fileAt` up to `$fileEnd`, with
+    // sendfile: a dup of the worker's handle that this one owns alone and
+    // closes when it ends, so no reference count crosses threads. -1 for a
+    // buffered response
+    public int32 $src;
+    public uint64 $fileAt;
+    public uint64 $fileEnd;
+}
+
+/**
  * Connection going home: kept HTTP, open websocket, or linger-drain.
  */
 internal enum Back
@@ -44,6 +82,9 @@ internal enum Back
     case kept(Parked $p);
     case socket(WsConn $ws);
     case linger(int32 $fd);
+
+    // a response for the reactor to finish writing, then park or linger
+    case write(Outbound $o);
 
     // a parked connection whose arm failed after the reactor had adopted it
     // the reactor arms it again, or drops it
@@ -120,6 +161,14 @@ internal enum Job
 
     // something for an open websocket's worker to do: a message, a ping, a close
     case ws(WsConn $ws, WsEvent $event);
+
+    // a reactor stopping with a response half written: finish it here, as
+    // the worker that started it would have
+    case flush(Outbound $o);
+
+    // a slow client's file has room again: sendfile it here, where a disk
+    // read may wait, then back to `$home`
+    case write(Outbound $o, int32 $home);
 }
 
 /**
@@ -135,15 +184,52 @@ internal class Shared
     // websockets opened so far, which is where a Socket's id comes from
     public atomic<int64> $sockets;
 
+    // bytes of slow clients' responses the reactors hold, against OUTBOUND_TOTAL
+    public atomic<int64> $outbound;
+
+    // whether MSG_DONTWAIT alone keeps a send from waiting (not darwin)
+    public bool $dontwait;
+
     // connections handed over raw, which stop shuts
     public Tunnels $tunnels;
+
+    // resumes in progress, which `shut` waits out: once listen is past its
+    // last reactor, a handoff resuming closes instead of parking on a
+    // reactor whose event set is closed or reused. no lock: a resume counts
+    // itself before it looks at `$stopping`, so either `shut` sees it
+    // counted and waits, or it sees `$stopping`
+    public atomic<int64> $resuming;
 
     public constructor()
     {
         $this->live = atomic<int32>(0);
         $this->stopping = atomic<bool>(false);
         $this->sockets = atomic<int64>(0);
+        $this->outbound = atomic<int64>(0);
+        $this->dontwait = http_dontwait_sends() != 0;
         $this->tunnels = Tunnels();
+        $this->resuming = atomic<int64>(0);
+    }
+
+    /**
+     * Every resume from now on closes instead of parking. Waits out the
+     * ones parking right now.
+     */
+    public function shut() : void
+    {
+        $this->stopping->store(true);
+
+        int32 $spins = 0;
+
+        while ($this->resuming->load() != 0) {
+            $spins = $spins + 1;
+
+            if ($spins < 64) {
+                thread::yield();
+            } else {
+                thread::sleep(1);
+            }
+        }
     }
 }
 
@@ -197,6 +283,26 @@ internal struct Home
         }
 
         $this->hand(Back::rearm($fd));
+    }
+
+    /**
+     * Send a kept connection back for its next request: parked without
+     * waking the reactor when nothing is buffered, handed over to be
+     * processed when the next request may be in `rest` already.
+     */
+    public function keep(mv Parked $p, Shared $shared) : void
+    {
+        if ($p->rest->empty()) {
+            $this->park(mv $p, $shared);
+            return;
+        }
+
+        int32 $fd = $p->fd;
+
+        if (!$this->hand(Back::kept($p))) {
+            http_close($fd);
+            $shared->live->sub(1);
+        }
     }
 }
 
@@ -300,11 +406,7 @@ internal function persistFor(const Request& $req, int32 $served, const Limits& $
         return .close;
     }
 
-    if ($req->version == 'HTTP/1.1') {
-        return .keep;
-    }
-
-    return .keepAlive($limits->idleTimeout->as_secs());
+    return keptPersist($req->version == 'HTTP/1.1', $limits->idleTimeout->as_secs() as int64);
 }
 
 internal function closes(const Persist& $p) : bool
@@ -319,38 +421,66 @@ internal function closes(const Persist& $p) : bool
  * Streamed response: head, then the callback. A length is
  * Content-Length; none over HTTP/1.1 is chunked. HEAD never runs it.
  */
-internal function streamTo(Conn $conn, const Response& $res, bool $head, bool $http11, const Persist& $persist, Shared $shared) : bool
+internal function streamTo(Conn $conn, const Response& $res, bool $head, bool $http11, const Persist& $persist, const Visit& $visit, array<Home>& $homes, Shared $shared) : Sent
 {
     bool $sendBody = !$head && !bodyless($res->status);
-    Length $length = Length::none;
+    Length $length = framing($res->length, $sendBody, $http11);
     Mode $mode = Mode::raw;
     uint64 $size = 0;
 
-    if ($res->length >= 0) {
-        $size = $res->length as uint64;
-        $length = Length::exact($res->length as usize);
-        $mode = Mode::sized;
-    } else if ($sendBody && $http11) {
-        $length = Length::chunked;
-        $mode = Mode::chunked;
+    match ($length) {
+        Length::exact($n) => {
+            $size = $n as uint64;
+            $mode = Mode::sized;
+        },
+        Length::chunked => {
+            $mode = Mode::chunked;
+        },
+        Length::none => {
+        },
     }
 
     if (!$conn->writeAll(renderHead($res, $length, $persist))) {
-        return false;
+        return .failed;
     }
 
     if (!$sendBody) {
-        return true;
+        return .done;
     }
 
     function<void(Writer)> $fn = guard $res->stream else {
-        return $size == 0;
+        if ($size == 0) {
+            return .done;
+        }
+
+        return .failed;
+    }
+
+    // a file is always sized: from the page cache to the socket, no copy through here
+    io::file? $file = $res->file;
+
+    if ($file != null) {
+        io::file $f = guard $file;
+        Sent $sent = sendFileBody($conn, $f, $size, $visit, closes($persist), $homes, $shared);
+
+        match ($sent) {
+            Sent::unsupported => {
+            },
+            else => {
+                return $sent;
+            },
+        }
     }
 
     Writer $w = Writer($conn, $shared, $mode, $size);
 
     $fn($w);
-    return $w->finish();
+
+    if ($w->finish()) {
+        return .done;
+    }
+
+    return .failed;
 }
 
 internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<Response(Request)> $app, const Limits& $limits, Shared $shared) : void
@@ -367,6 +497,11 @@ internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<
 
     Response $res = $app($req);
 
+    if ($res->hands()) {
+        handOver($conn, $visit, $req, $res, $homes, $limits, $shared);
+        return;
+    }
+
     if ($res->tunnels()) {
         tunnel($conn, $visit, $res, $shared);
         return;
@@ -380,23 +515,31 @@ internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<
     bool $head = methodEq($req->method, Method::head);
     bool $http11 = $req->version == 'HTTP/1.1';
     Persist $persist = persistFor($req, $visit->slot->served, $limits, $shared);
-    bool $whole = false;
+    Sent $sent = Sent::failed;
 
     if ($res->streamed()) {
         // HTTP/1.0 can only see the end of an unsized body as the close
-        if (!$http11 && !$head && $res->length < 0 && !bodyless($res->status)) {
+        if (closeDelimited($res->status, $res->length, $head, $http11)) {
             $persist = Persist::close;
         }
 
-        $whole = streamTo($conn, $res, $head, $http11, $persist, $shared);
+        $sent = streamTo($conn, $res, $head, $http11, $persist, $visit, $homes, $shared);
     } else {
-        $whole = $conn->writeAll(render($res, !$head, $persist));
+        $sent = sendBuffered($conn, render($res, !$head, $persist), $visit, closes($persist), $homes, $shared);
     }
 
-    if (!$whole) {
-        // the client is gone, or the body fell short. the conn closes on drop
-        $shared->live->sub(1);
-        return;
+    match ($sent) {
+        Sent::done => {
+        },
+        Sent::handed => {
+            // a slow client's: the reactor finishes it, then parks or lingers
+            return;
+        },
+        else => {
+            // the client is gone, or the body fell short. the conn closes on drop
+            $shared->live->sub(1);
+            return;
+        },
     }
 
     if (closes($persist) || $shared->stopping->load()) {
@@ -404,19 +547,299 @@ internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<
         return;
     }
 
-    int32 $fd = $conn->release();
-    Parked $parked = Parked($fd, $visit->slot->peer, $visit->slot->framer->buffer, $visit->slot->served + 1);
+    $homes[$visit->home]->keep(Parked($conn->release(), $visit->slot->peer, $visit->slot->framer->buffer, $visit->slot->served + 1), $shared);
+}
 
-    // nothing pipelined: park without waking the reactor
-    if ($parked->rest->empty()) {
-        $homes[$visit->home]->park(mv $parked, $shared);
+/**
+ * How a response went: all out, handed to the reactor to finish, or cut
+ * short (the client went away, a file shrank, the server is stopping). A
+ * file can also not go at all because there is no sendfile here.
+ */
+internal enum Sent
+{
+    case done;
+    case handed;
+    case failed;
+    case unsupported;
+}
+
+/**
+ * Hand a slow client's response to its reactor to finish. With no reactor
+ * left to take it, the send dropped its copy and the fd is closed here.
+ */
+internal function handWrite(Outbound $o, array<Home>& $homes, int32 $home, Shared $shared) : Sent
+{
+    int32 $fd = $o->fd;
+    int32 $src = $o->src;
+    int64 $charged = $o->charged;
+
+    if (!$homes[$home]->hand(Back::write(mv $o))) {
+        closeSource($src);
+        http_close($fd);
+        $shared->outbound->sub($charged);
+        $shared->live->sub(1);
+    }
+
+    return .handed;
+}
+
+/**
+ * Give up on a response the client will not get whole: the socket and the
+ * file closed, and nothing of it counted any more.
+ */
+internal function abandon(const Outbound& $o, Shared $shared) : void
+{
+    closeSource($o->src);
+    http_close($o->fd);
+    $shared->outbound->sub($o->charged);
+    $shared->live->sub(1);
+}
+
+/**
+ * Close an Outbound's file, if it has one.
+ */
+internal function closeSource(int32 $src) : void
+{
+    if ($src >= 0) {
+        http_close($src);
+    }
+}
+
+/**
+ * Write a rendered response without waiting on a slow client. What the
+ * socket takes now goes now; a client that frees no room within
+ * SEND_GRACE_MS gets the rest from the reactor, and this worker goes back
+ * to the pool. Past OUTBOUND_CAP the worker first writes down to the cap
+ * itself, blocking as it always did, and it writes the whole of it when
+ * the server is stopping or the reactors already hold OUTBOUND_TOTAL.
+ * Where only O_NONBLOCK keeps a send from waiting, a response under
+ * SEND_TRY_MIN is written blocking, as before.
+ */
+internal function sendBuffered(Conn& $conn, string $bytes, const Visit& $visit, bool $close, array<Home>& $homes, Shared $shared) : Sent
+{
+    int32 $fd = $conn->fd();
+    usize $n = $bytes->size();
+    bool $toggle = !$shared->dontwait;
+
+    if ($toggle && $n < SEND_TRY_MIN) {
+        if (sendAll($fd, $bytes)) {
+            return .done;
+        }
+
+        return .failed;
+    }
+
+    usize $at = 0;
+    int64 $charge = 0;
+
+    while (true) {
+        if ($toggle && http_set_blocking($fd, 0) != 0) {
+            return .failed;
+        }
+
+        while (true) {
+            isize $got = sendNow($fd, $bytes, $at);
+
+            if ($got < 0) {
+                return .failed;
+            }
+
+            $at = $got as usize;
+
+            if ($at >= $n) {
+                if ($toggle && http_set_blocking($fd, 1) != 0) {
+                    return .failed;
+                }
+
+                return .done;
+            }
+
+            // full. a client reading at speed has room again within the grace
+            if (http_wait($fd, 2, SEND_GRACE_MS) != 1) {
+                break;
+            }
+        }
+
+        $charge = ($n - $at) as int64;
+
+        bool $stopping = $shared->stopping->load();
+
+        if ($n - $at <= OUTBOUND_CAP && !$stopping) {
+            // add answers the total before this charge
+            if ($shared->outbound->add($charge) + $charge <= OUTBOUND_TOTAL) {
+                break;
+            }
+
+            $shared->outbound->sub($charge);
+        }
+
+        // the worker writes it, or the part over the cap, blocking as before
+        usize $to = $n;
+
+        if ($n - $at > OUTBOUND_CAP && !$stopping) {
+            $to = $n - OUTBOUND_CAP;
+        }
+
+        if ($toggle && http_set_blocking($fd, 1) != 0) {
+            return .failed;
+        }
+
+        if (!sendRange($fd, $bytes, $at, $to)) {
+            return .failed;
+        }
+
+        if ($to == $n) {
+            return .done;
+        }
+
+        // down to the cap: the rest may go to the reactor after all
+        $at = $to;
+    }
+
+    Outbound $o = Outbound($conn->release(), mv $bytes, $at, $charge, $close, $toggle, $visit->slot->peer, $visit->slot->framer->buffer, $visit->slot->served + 1, time::instant::now(), -1, 0, 0);
+
+    return handWrite(mv $o, $homes, $visit->home, $shared);
+}
+
+/**
+ * A file body, its head already written. Small files go blocking with
+ * sendfile, as any write on a worker. From SEND_TRY_MIN up the socket is
+ * made non-blocking: what it takes now goes now, and a client that frees
+ * no room within SEND_GRACE_MS is handed to the reactor with a dup of the
+ * file and the offset, while this worker goes back to the pool. The
+ * reactor waits for room, and a worker sends each time there is some.
+ */
+internal function sendFileBody(Conn& $conn, const io::file& $f, uint64 $size, const Visit& $visit, bool $close, array<Home>& $homes, Shared $shared) : Sent
+{
+    int32 $fd = $conn->fd();
+
+    if ($size < (SEND_TRY_MIN as uint64)) {
+        return sendFileTo($fd, $f, $size, $shared);
+    }
+
+    if (http_set_blocking($fd, 0) != 0) {
+        return .failed;
+    }
+
+    uint64 $at = 0;
+
+    while (true) {
+        FileRun $run = sendFileRun($fd, $f->fd(), $at, $size, $shared);
+
+        match ($run) {
+            FileRun::done => {
+                return blockingAgain($fd, .done);
+            },
+            FileRun::unsupported => {
+                return blockingAgain($fd, .unsupported);
+            },
+            FileRun::failed => {
+                return .failed;
+            },
+            FileRun::full => {
+            },
+        }
+
+        // full. a client reading at speed has room again within the grace
+        if (http_wait($fd, 2, SEND_GRACE_MS) == 1) {
+            continue;
+        }
+
+        int32 $src = http_dup($f->fd());
+
+        if ($src < 0) {
+            // no fd to spare for the reactor: finish it here, blocking, as a small file
+            if (http_set_blocking($fd, 1) != 0) {
+                return .failed;
+            }
+
+            return match (sendFileRun($fd, $f->fd(), $at, $size, $shared)) {
+                FileRun::done => .done,
+                else => .failed,
+            };
+        }
+
+        Outbound $o = Outbound($conn->release(), '', 0, 0, $close, true, $visit->slot->peer, $visit->slot->framer->buffer, $visit->slot->served + 1, time::instant::now(), $src, $at, $size);
+
+        return handWrite(mv $o, $homes, $visit->home, $shared);
+    }
+}
+
+/**
+ * `$sent`, once the socket is blocking again for the next worker to have
+ * it; failed when it cannot be made so.
+ */
+internal function blockingAgain(int32 $fd, Sent $sent) : Sent
+{
+    if (http_set_blocking($fd, 1) != 0) {
+        return .failed;
+    }
+
+    return $sent;
+}
+
+/**
+ * A slow client's file, which its reactor saw room for: sendfile what the
+ * socket takes now, then back to the reactor, which waits for room again
+ * or finishes the connection once the file is out. Here and not on the
+ * reactor because a page-cache miss waits on the disk, and a reactor
+ * waiting stalls every connection it has.
+ */
+internal function writeFile(Outbound $o, int32 $home, array<Home>& $homes, Shared $shared) : void
+{
+    uint64 $from = $o->fileAt;
+    FileRun $run = sendFileRun($o->fd, $o->src, $o->fileAt, $o->fileEnd, $shared);
+
+    if ($o->fileAt > $from) {
+        $o->since = time::instant::now();
+    }
+
+    match ($run) {
+        FileRun::failed => {
+            abandon($o, $shared);
+            return;
+        },
+        FileRun::unsupported => {
+            // a file the worker started with sendfile does not turn
+            // unsupported later: here it is a failure as any other
+            abandon($o, $shared);
+            return;
+        },
+        else => {
+        },
+    }
+
+    handWrite(mv $o, $homes, $home, $shared);
+}
+
+/**
+ * Finish a half-written response here, blocking, then close it the way a
+ * stopping server does. For a reactor that is stopping, and for what is
+ * handed back after the reactors are gone.
+ */
+internal function flushOutbound(const Outbound& $o, Shared $shared) : void
+{
+    $shared->outbound->sub($o->charged);
+
+    // a stopping server cuts a file short, as Writer::open() tells the read loop
+    if ($o->src >= 0) {
+        closeSource($o->src);
+        http_close($o->fd);
+        $shared->live->sub(1);
         return;
     }
 
-    if (!$homes[$visit->home]->hand(Back::kept($parked))) {
-        http_close($fd);
-        $shared->live->sub(1);
+    if ($o->toggled) {
+        http_set_blocking($o->fd, 1);
     }
+
+    if (sendRange($o->fd, $o->bytes, $o->at, $o->bytes->size())) {
+        http_finish($o->fd);
+    } else {
+        http_close($o->fd);
+    }
+
+    $shared->live->sub(1);
 }
 
 internal function workerLoop(JobQueue $jobs, array<Home> $homes, function<Response(Request)> $app, Limits $limits, Shared $shared) : void
@@ -437,6 +860,12 @@ internal function workerLoop(JobQueue $jobs, array<Home> $homes, function<Respon
             },
             Job::ws($ws, $event) => {
                 serveSocket($ws, $event, $homes, $shared);
+            },
+            Job::flush($o) => {
+                flushOutbound($o, $shared);
+            },
+            Job::write($o, $home) => {
+                writeFile($o, $home, $homes, $shared);
             },
         }
     }

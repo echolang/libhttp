@@ -58,6 +58,14 @@ internal class Conn
         }
     }
 
+    /**
+     * The fd, still owned by this Conn. -1 once released.
+     */
+    internal const function fd() : int32
+    {
+        return $this->fd;
+    }
+
     internal function recv(ptr<uint8> $buf, usize $n) : isize
     {
         if ($this->fd < 0) {
@@ -108,23 +116,57 @@ internal function cstrOf(const string& $s) : string
 }
 
 /**
- * Blocking sends until `$bytes` are all out, or one fails.
+ * Non-blocking sends of `$bytes` from `$from` until they are all out or the
+ * socket is full. How far they got, or -1 once a send failed.
  */
-internal function sendAll(int32 $fd, const string& $bytes) : bool
+internal function sendNow(int32 $fd, const string& $bytes, usize $from) : isize
 {
-    usize $off = 0;
+    usize $at = $from;
     usize $n = $bytes->size();
     $p = $bytes->data();
 
-    while ($off < $n) {
-        isize $put = http_send($fd, $p:$ + $off, $n - $off);
+    while ($at < $n) {
+        isize $put = http_send_now($fd, $p:$ + $at, $n - $at);
+
+        if ($put == RECV_AGAIN) {
+            break;
+        }
+
+        if ($put <= 0) {
+            return -1;
+        }
+
+        $at = $at + ($put as usize);
+    }
+
+    return $at as isize;
+}
+
+/**
+ * Blocking sends of `$bytes` from `$from` up to `$to`, or until one fails.
+ */
+internal function sendRange(int32 $fd, const string& $bytes, usize $from, usize $to) : bool
+{
+    usize $at = $from;
+    $p = $bytes->data();
+
+    while ($at < $to) {
+        isize $put = http_send($fd, $p:$ + $at, $to - $at);
 
         if ($put <= 0) {
             return false;
         }
 
-        $off = $off + ($put as usize);
+        $at = $at + ($put as usize);
     }
 
     return true;
+}
+
+/**
+ * Blocking sends until `$bytes` are all out, or one fails.
+ */
+internal function sendAll(int32 $fd, const string& $bytes) : bool
+{
+    return sendRange($fd, $bytes, 0, $bytes->size());
 }

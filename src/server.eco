@@ -129,6 +129,9 @@ public class Server
     // changing a setter afterwards does not touch a running server
     private Limits $limits;
     private int32 $connCap;
+
+    // how many accepted connections the kernel may hold before a reactor takes them
+    private int32 $backlogSize;
     private int32 $listenFd;
 
     // one event set and one wake pipe per reactor
@@ -163,6 +166,7 @@ public class Server
         $this->reactorCount = 0;
         $this->limits = Limits();
         $this->connCap = DEFAULT_MAX_CONNECTIONS;
+        $this->backlogSize = DEFAULT_BACKLOG;
         $this->listenFd = -1;
         $this->evFds = array<int32>();
         $this->wakeReads = array<int32>();
@@ -276,6 +280,26 @@ public class Server
     }
 
     /**
+     * Connections the kernel may queue on the listen socket before a
+     * reactor accepts them. Past it, a client's connect waits or is
+     * refused by the kernel, never by libhttp. The kernel caps it at its
+     * own limit (`somaxconn`) without saying so.
+     */
+    public function backlog(int32 $n) : void
+    {
+        if ($n < 1) {
+            $n = 1;
+        }
+
+        $this->backlogSize = $n;
+    }
+
+    public const function backlog() : int32
+    {
+        return $this->backlogSize;
+    }
+
+    /**
      * How long the oldest queued request may wait before new connections
      * get 503.
      */
@@ -379,8 +403,8 @@ public class Server
 
     /**
      * Unblock `listen`, from any thread. Idle conns and open tunnels close
-     * now; in-flight requests finish. A stop before listen is kept for the
-     * next one.
+     * now; in-flight requests finish. Connections a handoff took are not
+     * waited for. A stop before listen is kept for the next one.
      */
     public function stop() : void
     {
@@ -410,7 +434,7 @@ public class Server
         }
 
         $name = cstrOf($host);
-        int32 $listenFd = http_listen($name->cstr(), $port);
+        int32 $listenFd = http_listen($name->cstr(), $port, $this->backlogSize);
 
         if ($listenFd < 0) {
             return .error(.bind(lastError()));
@@ -553,6 +577,11 @@ public class Server
         $jobs->close();
         joinAll($workers);
 
+        // a handoff resumed from another thread is parked by now (shut waits
+        // for it), or sees shut and closes on its own. nothing reaches these
+        // reactors after
+        $shared->shut();
+
         // a tunnel opened while stopping was shut as it registered, the rest by stop
         $shared->tunnels->shutAll();
         $shared->tunnels->drain();
@@ -579,6 +608,14 @@ public class Server
         }
 
         return .error($e);
+    }
+
+    /**
+     * Connections the running listen counts toward `maxConnections`.
+     */
+    internal const function live() : int32
+    {
+        return $this->shared->live->load();
     }
 
     private function release() : void

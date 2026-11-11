@@ -13,6 +13,9 @@ namespace http;
 
 internal const usize FILE_READ = 65536;
 
+// most of a file one sendfile call sends; the server's stopping is looked at between them
+internal const uint64 FILE_CHUNK = 1048576;
+
 public struct Response
 {
     public int32 $status;
@@ -32,6 +35,13 @@ public struct Response
 
     // a tunnel's callback, which takes the connection over raw
     internal function<void(RawConn)>? $tunnel = null;
+
+    // a handoff's callback, which runs on the worker and may take the fd
+    internal function<void(Handoff)>? $handoff = null;
+
+    // the open file of `Response(file:)`, which goes out with sendfile(2)
+    // where there is one. `$stream` reads and writes it where there is not
+    internal io::file? $file = null;
 
     public constructor(int32 $status, const string& $body)
     {
@@ -108,12 +118,32 @@ public struct Response
      * proxy can pass an upstream's 101 through. Nothing of this response
      * is sent, its status and headers included. See "Tunnels" in the
      * README.
+     *
+     * Superseded by `Response(handoff:)`, which spawns no thread and can
+     * give the connection back for keep-alive. Kept as it was for callers
+     * that want a blocking thread per connection.
      */
     public constructor(tunnel: function<void(RawConn)> $fn)
     {
         $this->status = 101;
         $this->body = '';
         $this->tunnel = $fn;
+    }
+
+    /**
+     * Hand the connection to `$fn` on the worker, inline, with nothing
+     * written. `$fn` calls `take()` to own the fd from then on, and later
+     * `resume` to give it back for the next request. One that returns
+     * without taking leaves the connection to libhttp, which closes it.
+     * The status and body here are never sent; the headers, as the
+     * middleware left them, reach `$fn` as `Handoff::headers`. See
+     * "Handoff" in the README.
+     */
+    public constructor(handoff: function<void(Handoff)> $fn)
+    {
+        $this->status = 101;
+        $this->body = '';
+        $this->handoff = $fn;
     }
 
     /**
@@ -128,6 +158,7 @@ public struct Response
         string $type = mimeOf($path);
         int64 $size = -1;
         function<void(Writer)>? $fn = null;
+        io::file? $handle = null;
 
         if ($opened->failed()) {
             $code = $opened->failure();
@@ -138,6 +169,7 @@ public struct Response
             io::file $f = $found->file;
 
             $size = $found->size;
+            $handle = $f;
             $fn = function(Writer $w) : void {
                 sendFile($f, $w);
             };
@@ -148,6 +180,7 @@ public struct Response
         $this->streaming = $size >= 0;
         $this->length = $size;
         $this->stream = $fn;
+        $this->file = $handle;
         $this->headers->set('Content-Type', $type);
     }
 
@@ -204,6 +237,14 @@ public struct Response
     public const function tunnels() : bool
     {
         return $this->tunnel != null;
+    }
+
+    /**
+     * Whether this response hands the connection to a `Handoff` callback.
+     */
+    public const function hands() : bool
+    {
+        return $this->handoff != null;
     }
 
     /**
@@ -282,6 +323,93 @@ internal function fileStatus(const io::ioerror& $e) : int32
     }
 
     return 500;
+}
+
+/**
+ * The first `$size` bytes of `$f` onto the blocking `$sock` in the
+ * kernel, in FILE_CHUNK steps, under the socket's send timeout as any
+ * blocking write.
+ */
+internal function sendFileTo(int32 $sock, const io::file& $f, uint64 $size, const Shared& $shared) : Sent
+{
+    uint64 $at = 0;
+
+    // full on a blocking socket is its send timeout
+    return match (sendFileRun($sock, $f->fd(), $at, $size, $shared)) {
+        FileRun::done => .done,
+        FileRun::unsupported => .unsupported,
+        else => .failed,
+    };
+}
+
+/**
+ * How a run of sendfile steps ended.
+ */
+internal enum FileRun
+{
+    // every byte up to the end went
+    case done;
+
+    // the socket took nothing more: non-blocking and full, or blocking and
+    // past its send timeout
+    case full;
+
+    // the client is gone, the file ended before its length, or the server
+    // is stopping, as Writer::open() tells the read loop
+    case failed;
+
+    // sendfile cannot serve this file, and nothing went yet: copy instead
+    case unsupported;
+}
+
+/**
+ * sendfile `$src` onto `$sock` from `$at` up to `$end`, in FILE_CHUNK
+ * steps, until it is all out or the socket takes no more. `$at` moves
+ * with what went. The one loop the blocking worker, the worker trying
+ * without blocking, and the worker a reactor hands a file back to share.
+ */
+internal function sendFileRun(int32 $sock, int32 $src, uint64& $at, uint64 $end, const Shared& $shared) : FileRun
+{
+    while ($at < $end) {
+        if ($shared->stopping->load()) {
+            return .failed;
+        }
+
+        isize $put = sendFileStep($sock, $src, $at, $end);
+
+        if ($put == RECV_AGAIN) {
+            return .full;
+        }
+
+        // mid-file it is a failure: the head promised every byte
+        if ($put == SENDFILE_NONE && $at == 0) {
+            return .unsupported;
+        }
+
+        // 0 is a file that ended before its length: the body falls short
+        if ($put <= 0) {
+            return .failed;
+        }
+
+        $at = $at + ($put as uint64);
+    }
+
+    return .done;
+}
+
+/**
+ * One sendfile of `$src` from `$at` toward `$end`, at most FILE_CHUNK:
+ * what it sent, RECV_AGAIN, SENDFILE_NONE, or below 0 on failure.
+ */
+internal function sendFileStep(int32 $sock, int32 $src, uint64 $at, uint64 $end) : isize
+{
+    uint64 $want = $end - $at;
+
+    if ($want > FILE_CHUNK) {
+        $want = FILE_CHUNK;
+    }
+
+    return http_sendfile($sock, $src, $at as int64, $want as usize);
 }
 
 internal function sendFile(io::file $f, Writer $w) : void

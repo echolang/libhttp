@@ -6,17 +6,26 @@
  * blocks on a client.
  *
  * Last-response connections linger here: write side shut, leftover
- * bytes drained, so the answer is never a reset. Open websockets sit
+ * bytes drained, so the answer is never a reset. A buffered response a
+ * client is slow to take is finished here too, on write interest, so the
+ * worker that rendered it is free again. Open websockets sit
  * in their own map; a whole message, ping, close, or bad frame goes to
  * a worker. A pong only resets the quiet clock.
  */
 
+use std::io;
 use std::thread;
 use std::time;
 
 namespace http;
 
 internal const int32 SWEEP_MS = 100;
+
+// the slowest an idle connection or an open websocket is looked at, and
+// the share of its own deadline its tick may be (a fifth: idle 5 s, a
+// look a second)
+internal const int32 IDLE_SWEEP_MS = 1000;
+internal const int64 IDLE_SWEEP_SHARE = 5;
 internal const int32 PAUSE_MS = 50;
 internal const int32 ACCEPT_BATCH = 64;
 internal const usize EVENT_BATCH = 256;
@@ -68,7 +77,20 @@ internal class Reactor
     private map<int32, Slot> $slots;
     private map<int32, WsConn> $sockets;
     private map<int32, Linger> $lingering;
+
+    // responses a worker handed over half written, armed for writing
+    private map<int32, Outbound> $outbound;
+
+    // slots part of the way through a request, which have head and body
+    // deadlines to keep every SWEEP_MS. may name an fd that has since gone
+    // idle or away; the sweep checks the slot itself and forgets those
+    private map<int32, bool> $active;
+
+    // last look at the active slots and the lingering closes, and last
+    // look at everything else, which happens every `$idleTick`
     private time::instant $swept;
+    private time::instant $sweptIdle;
+    private time::duration $idleTick;
 
     // out of descriptors: listen is disarmed until PAUSE_MS passes
     private bool $paused;
@@ -103,7 +125,11 @@ internal class Reactor
         $this->slots = map<int32, Slot>();
         $this->sockets = map<int32, WsConn>();
         $this->lingering = map<int32, Linger>();
+        $this->outbound = map<int32, Outbound>();
+        $this->active = map<int32, bool>();
         $this->swept = time::instant::now();
+        $this->sweptIdle = time::instant::now();
+        $this->idleTick = idleTickFor($limits);
         $this->paused = false;
         $this->pausedAt = time::instant::now();
     }
@@ -113,7 +139,7 @@ internal class Reactor
      */
     internal function run() : status<Error>
     {
-        if (http_ev_arm($this->ev, $this->listenFd, 0) != 0 || http_ev_arm($this->ev, $this->wakeRd, 0) != 0) {
+        if (http_ev_listen($this->ev, $this->listenFd) != 0 || http_ev_arm($this->ev, $this->wakeRd, 0) != 0) {
             return .error(.accept(lastError()));
         }
 
@@ -125,9 +151,12 @@ internal class Reactor
             // deadlines need a sweep even when nothing is readable. a
             // connection on a worker or in the inbox is in none of the maps
             // yet, and may come back here to idle out, so any live one keeps
-            // the sweep going
-            if (!$this->slots->empty() || !$this->sockets->empty() || !$this->lingering->empty() || $this->paused || $this->shared->live->load() > 0) {
+            // the sweep going. only requests in progress, lingering closes
+            // and a paused listen need it every SWEEP_MS
+            if (!$this->active->empty() || !$this->lingering->empty() || $this->paused) {
                 $wait = SWEEP_MS;
+            } else if (!$this->slots->empty() || !$this->sockets->empty() || !$this->outbound->empty() || $this->shared->live->load() > 0) {
+                $wait = $this->idleTick->as_millis() as int32;
             }
 
             ptr<int32> $fds = $ready->spare();
@@ -208,6 +237,20 @@ internal class Reactor
 
         while ($i < $n) {
             $this->unlinger($closing[$i]);
+            $i = $i + 1;
+        }
+
+        // half-written responses finish on a worker, the way in-flight
+        // requests do when the server stops
+        array<int32> $writing = $this->outbound->keys();
+
+        $n = $writing->count();
+        $i = 0;
+
+        while ($i < $n) {
+            Outbound $o = $this->outbound->take($writing[$i]);
+
+            $this->jobs->send(Job::flush(mv $o));
             $i = $i + 1;
         }
 
@@ -294,6 +337,11 @@ internal class Reactor
                 return;
             }
 
+            if ($this->outbound->has($fd)) {
+                $this->writable($fd);
+                return;
+            }
+
             // parked and armed before this wait returned. still unknown
             // after one look: stale
             if ($this->checked) {
@@ -338,6 +386,10 @@ internal class Reactor
 
             match ($step) {
                 Step::needMore => {
+                    if ($this->slots->at($fd)->framer->midRequest()) {
+                        $this->active[$fd] = true;
+                    }
+
                     $this->arm($fd);
                 },
                 Step::sendContinue => {
@@ -381,16 +433,15 @@ internal class Reactor
                             $this->adoptSocket($ws);
                         },
                         Back::linger($fd) => {
-                            $this->lingering[$fd] = Linger(time::instant::now(), 0);
-
-                            if (http_ev_arm($this->ev, $fd, 1) != 0) {
-                                $this->unlinger($fd);
-                            }
+                            $this->lingerHere($fd);
                         },
                         Back::rearm($fd) => {
                             if ($this->slots->has($fd)) {
                                 $this->arm($fd);
                             }
+                        },
+                        Back::write($o) => {
+                            $this->adoptOutbound($o);
                         },
                     }
                 },
@@ -399,6 +450,121 @@ internal class Reactor
                 },
             }
         }
+    }
+
+    /**
+     * Take over a half-written response: armed for writing, and nothing else
+     * until it is out.
+     */
+    private function adoptOutbound(Outbound $o) : void
+    {
+        int32 $fd = $o->fd;
+
+        $this->outbound[$fd] = mv $o;
+
+        if (http_ev_arm_write($this->ev, $fd) != 0) {
+            $this->unsend($fd);
+        }
+    }
+
+    /**
+     * The client has room: write until it has none or the response is out.
+     * Then the connection waits for its next request, or lingers, as it
+     * would have after a worker wrote it whole.
+     */
+    private function writable(int32 $fd) : void
+    {
+        isize $got = 0;
+        bool $out = false;
+        bool $file = false;
+
+        {
+            Outbound& $o = $this->outbound->at($fd);
+
+            if ($o->at < $o->bytes->size()) {
+                $got = sendNow($fd, $o->bytes, $o->at);
+
+                if ($got > ($o->at as isize)) {
+                    $o->at = $got as usize;
+                    $o->since = time::instant::now();
+                }
+            }
+
+            $out = $o->at >= $o->bytes->size() && $o->fileAt >= $o->fileEnd;
+            $file = $got >= 0 && $o->at >= $o->bytes->size() && !$out;
+        }
+
+        if ($got < 0) {
+            $this->unsend($fd);
+            return;
+        }
+
+        // the file part goes from a worker: sendfile reads the disk, and a
+        // page-cache miss here would stall every connection this reactor
+        // has. the write interest fired once, so nothing reports here
+        // while the worker holds it
+        if ($file) {
+            Outbound $o = $this->outbound->take($fd);
+
+            $this->jobs->send(Job::write(mv $o, $this->home));
+            return;
+        }
+
+        if (!$out) {
+            if (http_ev_arm_write($this->ev, $fd) != 0) {
+                $this->unsend($fd);
+            }
+
+            return;
+        }
+
+        Outbound $done = $this->outbound->take($fd);
+
+        $this->shared->outbound->sub($done->charged);
+        closeSource($done->src);
+
+        // a worker may have it next, and workers write blocking
+        if ($done->toggled && http_set_blocking($fd, 1) != 0) {
+            http_close($fd);
+            $this->shared->live->sub(1);
+            return;
+        }
+
+        if ($done->close || $this->shared->stopping->load()) {
+            // the client is gone already. nothing to drain
+            if (http_shut_write($fd) != 0) {
+                http_close($fd);
+                $this->shared->live->sub(1);
+                return;
+            }
+
+            $this->lingerHere($fd);
+            return;
+        }
+
+        $this->slots[$fd] = Slot($done->peer, Framer($done->rest), $done->served);
+
+        // pipelined bytes came with it: the next request may be whole already
+        if ($done->rest->empty()) {
+            $this->arm($fd);
+        } else {
+            $this->process($fd);
+        }
+    }
+
+    /**
+     * Give up on a response: the client went away, or took nothing for
+     * SEND_TIMEOUT_SECS.
+     */
+    private function unsend(int32 $fd) : void
+    {
+        if (!$this->outbound->has($fd)) {
+            return;
+        }
+
+        Outbound $gone = $this->outbound->take($fd);
+
+        abandon($gone, $this->shared);
     }
 
     /**
@@ -419,6 +585,18 @@ internal class Reactor
         $l->drained = $l->drained + $got;
 
         if ($l->drained > LINGER_CAP || http_ev_arm($this->ev, $fd, 1) != 0) {
+            $this->unlinger($fd);
+        }
+    }
+
+    /**
+     * Drain a connection whose write side is shut until the client is done.
+     */
+    private function lingerHere(int32 $fd) : void
+    {
+        $this->lingering[$fd] = Linger(time::instant::now(), 0);
+
+        if (http_ev_arm($this->ev, $fd, 1) != 0) {
             $this->unlinger($fd);
         }
     }
@@ -560,69 +738,173 @@ internal class Reactor
 
     /**
      * Drop idle connections, 408 slow requests, ping quiet websockets.
+     * Requests in progress and lingering closes every SWEEP_MS; idle
+     * connections and websockets every `$idleTick`, since their deadlines
+     * are seconds long.
      */
     private function sweep() : void
     {
         if ($this->paused && $this->pausedAt->elapsed() >= time::duration::millis(PAUSE_MS)) {
             $this->paused = false;
-            http_ev_arm($this->ev, $this->listenFd, 0);
+            http_ev_listen($this->ev, $this->listenFd);
         }
 
-        if ($this->swept->elapsed() < time::duration::millis(SWEEP_MS)) {
+        time::instant $now = time::instant::now();
+
+        if ($now - $this->swept < time::duration::millis(SWEEP_MS)) {
             return;
         }
 
-        $this->swept = time::instant::now();
+        $this->swept = $now;
 
-        // parked connections still have to idle out; they sit in the inbox
-        $this->adoptInbox();
+        if ($now - $this->sweptIdle >= $this->idleTick) {
+            $this->sweptIdle = $now;
 
-        array<int32> $fds = $this->slots->keys();
+            // parked connections still have to idle out; they sit in the inbox
+            $this->adoptInbox();
+            $this->sweepSlots($now);
+            $this->sweepSockets();
+
+            if (!$this->outbound->empty()) {
+                $this->sweepOutbound($now);
+            }
+        } else if (!$this->active->empty()) {
+            $this->sweepActive($now);
+        }
+
+        if (!$this->lingering->empty()) {
+            $this->sweepLingering($now);
+        }
+    }
+
+    /**
+     * Every slot against its deadline. Also forgets active entries for
+     * slots that are idle or gone.
+     */
+    private function sweepSlots(time::instant $now) : void
+    {
+        array<int32> $late = array<int32>();
+
+        foreach ($this->slots as $fd => const &$slot) {
+            match ($slot->framer->expiredAt($this->limits, $now)) {
+                Expiry::none => {
+                },
+                else => {
+                    $late[] = $fd;
+                },
+            }
+        }
+
+        usize $n = $late->count();
+        usize $i = 0;
+
+        while ($i < $n) {
+            $this->expire($late[$i], $now);
+            $i = $i + 1;
+        }
+
+        if (!$this->active->empty()) {
+            $this->sweepActive($now);
+        }
+    }
+
+    /**
+     * Only the slots part of the way through a request.
+     */
+    private function sweepActive(time::instant $now) : void
+    {
+        array<int32> $fds = $this->active->keys();
         usize $n = $fds->count();
         usize $i = 0;
 
         while ($i < $n) {
             int32 $fd = $fds[$i];
-            Expiry $late = $this->slots->at($fd)->framer->expired($this->limits);
 
             $i = $i + 1;
 
-            match ($late) {
-                Expiry::none => {
-                },
-                Expiry::idle => {
-                    $this->drop($fd);
-                },
-                Expiry::timeout => {
-                    Slot $gone = $this->slots->take($fd);
+            if (!$this->slots->has($fd) || !$this->slots->at($fd)->framer->midRequest()) {
+                $this->active->remove($fd);
+                continue;
+            }
 
-                    // armed while it was waiting: it must not report to the
-                    // reactor once a worker owns it
-                    http_ev_drop($this->ev, $fd);
-                    $this->jobs->send(Job::fail($fd, $this->home, .timeout));
-                },
+            $this->expire($fd, $now);
+        }
+    }
+
+    /**
+     * Close or 408 the slot at `$fd` if its deadline passed.
+     */
+    private function expire(int32 $fd, time::instant $now) : void
+    {
+        Expiry $late = $this->slots->at($fd)->framer->expiredAt($this->limits, $now);
+
+        match ($late) {
+            Expiry::none => {
+            },
+            Expiry::idle => {
+                $this->active->remove($fd);
+                $this->drop($fd);
+            },
+            Expiry::timeout => {
+                Slot $gone = $this->slots->take($fd);
+
+                $this->active->remove($fd);
+
+                // armed while it was waiting: it must not report to the
+                // reactor once a worker owns it
+                http_ev_drop($this->ev, $fd);
+                $this->jobs->send(Job::fail($fd, $this->home, .timeout));
+            },
+        }
+    }
+
+    private function sweepLingering(time::instant $now) : void
+    {
+        array<int32> $done = array<int32>();
+
+        foreach ($this->lingering as $fd => const &$l) {
+            if ($now - $l->since >= time::duration::millis(LINGER_MS)) {
+                $done[] = $fd;
             }
         }
 
-        array<int32> $closing = $this->lingering->keys();
-
-        $n = $closing->count();
-        $i = 0;
+        usize $n = $done->count();
+        usize $i = 0;
 
         while ($i < $n) {
-            int32 $fd = $closing[$i];
-
+            $this->unlinger($done[$i]);
             $i = $i + 1;
+        }
+    }
 
-            if ($this->lingering->at($fd)->since->elapsed() >= time::duration::millis(LINGER_MS)) {
-                $this->unlinger($fd);
+    private function sweepOutbound(time::instant $now) : void
+    {
+        array<int32> $stuck = array<int32>();
+
+        foreach ($this->outbound as $fd => const &$o) {
+            if ($now - $o->since >= time::duration::secs(SEND_TIMEOUT_SECS)) {
+                $stuck[] = $fd;
             }
+        }
+
+        usize $n = $stuck->count();
+        usize $i = 0;
+
+        while ($i < $n) {
+            $this->unsend($stuck[$i]);
+            $i = $i + 1;
+        }
+    }
+
+    private function sweepSockets() : void
+    {
+        if ($this->sockets->empty()) {
+            return;
         }
 
         array<int32> $open = $this->sockets->keys();
-
-        $n = $open->count();
-        $i = 0;
+        usize $n = $open->count();
+        usize $i = 0;
 
         while ($i < $n) {
             int32 $fd = $open[$i];
@@ -662,6 +944,35 @@ internal class Reactor
 }
 
 /**
+ * How often idle connections and websockets are looked at: a fifth of the
+ * shorter of the idle timeout and the ping interval, between SWEEP_MS and
+ * IDLE_SWEEP_MS.
+ */
+internal function idleTickFor(const Limits& $limits) : time::duration
+{
+    time::duration $tick = time::duration::millis(IDLE_SWEEP_MS);
+    time::duration $idle = $limits->idleTimeout / IDLE_SWEEP_SHARE;
+
+    if ($idle < $tick) {
+        $tick = $idle;
+    }
+
+    if ($limits->pingInterval > time::duration::zero()) {
+        time::duration $ping = $limits->pingInterval / IDLE_SWEEP_SHARE;
+
+        if ($ping < $tick) {
+            $tick = $ping;
+        }
+    }
+
+    if ($tick < time::duration::millis(SWEEP_MS)) {
+        $tick = time::duration::millis(SWEEP_MS);
+    }
+
+    return $tick;
+}
+
+/**
  * After workers join: close anything handed back on the way out.
  */
 internal function drainReturned(thread::receiver<Back> $back, Inbox $inbox, Shared $shared) : void
@@ -689,6 +1000,10 @@ internal function drainReturned(thread::receiver<Back> $back, Inbox $inbox, Shar
                     },
                     Back::rearm($fd) => {
                         // the slot it names was closed with the rest. nothing to rearm
+                    },
+                    Back::write($o) => {
+                        // no reactor left to finish it: here, as a worker would
+                        flushOutbound($o, $shared);
                     },
                 }
             },

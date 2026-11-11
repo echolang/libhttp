@@ -1,0 +1,367 @@
+/**
+ * The event set's listen and write interest, and buffered responses a
+ * slow client takes: finished by the reactor, not the worker that
+ * rendered them.
+ */
+
+use std::thread;
+use std::time;
+
+// tests/load.c. declared here, outside the bench gate, once for the module
+internal extern {
+    function http_bench_cpu_us() : int64;
+    function http_bench_rss_kb() : int64;
+    function http_bench_dial(int32 $port, int32 $bytes) : int32;
+}
+
+/**
+ * A client with a small receive buffer, so the kernel cannot take a big
+ * response off the server for it.
+ */
+internal function narrowClient(int32 $port) : http::Conn
+{
+    int32 $fd = http_bench_dial($port, 8192);
+
+    assert($fd >= 0, 'dialed');
+    return http::Conn($fd);
+}
+
+/**
+ * `$n` bytes of a pattern that shows a byte out of place.
+ */
+internal function patterned(usize $n) : string
+{
+    string $out = '';
+
+    $out->reserve($n + 16);
+
+    while ($out->size() < $n) {
+        $out->append('0123456789abcdef');
+    }
+
+    return $out->sub(0, $n);
+}
+
+/**
+ * A server with one worker: `/` is small, `/big` is `$big` buffered.
+ */
+internal function bigServer(const string& $big) : http::Server
+{
+    string $body = $big;
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->get('/', function(http::Request $req) : http::Response {
+        return http::Response(text: 'hi');
+    });
+    $app->get('/big', function(http::Request $req) : http::Response {
+        return http::Response(ok: $body);
+    });
+
+    return $app;
+}
+
+/**
+ * Wait up to `$ms` for a fresh connection's `GET /` to be answered.
+ */
+internal function answeredWithin(int32 $port, int32 $ms) : bool
+{
+    time::instant $start = time::instant::now();
+    string $got = exchange($port, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+
+    return $got->ends('hi') && $start->elapsed() < time::duration::millis($ms as int64);
+}
+
+#[group: "outbound"]
+test listen_interest_arms_twice_and_reports_a_connection {
+    string $host = '127.0.0.1';
+    int32 $ev = http::http_ev_open();
+    int32 $fd = http::http_listen($host->cstr(), 0, 16);
+    int32 $port = http::http_port($fd);
+    int32 $first = http::http_ev_listen($ev, $fd);
+    int32 $again = http::http_ev_listen($ev, $fd);
+    http::Conn $c = dialOrDie($port);
+    array<int32> $ready = arr::room<int32>(4);
+    ptr<int32> $fds = $ready->spare();
+    int32 $n = http::http_ev_wait($ev, $fds, 4, 1000);
+    bool $listenReady = $n == 1 && $fds:$[0] == $fd;
+
+    // dropped while out of descriptors, then armed again
+    int32 $dropped = http::http_ev_drop($ev, $fd);
+    int32 $rearmed = http::http_ev_listen($ev, $fd);
+    int32 $still = http::http_ev_wait($ev, $fds, 4, 1000);
+
+    http::http_close($fd);
+    http::http_close($ev);
+
+    assert($first == 0 && $again == 0, 'arming the listen socket twice is fine');
+    assert($listenReady, 'a waiting connection makes it ready');
+    assert($dropped == 0 && $rearmed == 0 && $still == 1, 'level-triggered again after a drop');
+}
+
+#[group: "outbound"]
+test write_interest_reports_room_once {
+    string $host = '127.0.0.1';
+    int32 $ev = http::http_ev_open();
+    int32 $lfd = http::http_listen($host->cstr(), 0, 16);
+    int32 $port = http::http_port($lfd);
+    http::Conn $c = dialOrDie($port);
+    string $peer = '';
+
+    $peer->reserve(64);
+
+    ptr<uint8> $dst = $peer->spare();
+
+    // the connect returned; the server side may still be on its way to the queue
+    int32 $waiting = http::http_wait($lfd, 1, 1000);
+    int32 $fd = http::http_accept_one($lfd, $dst, 64);
+    int32 $armed = http::http_ev_arm_write($ev, $fd);
+    array<int32> $ready = arr::room<int32>(4);
+    ptr<int32> $fds = $ready->spare();
+    int32 $n = http::http_ev_wait($ev, $fds, 4, 1000);
+    bool $writable = $n == 1 && $fds:$[0] == $fd;
+
+    // oneshot: nothing more until armed again
+    int32 $after = http::http_ev_wait($ev, $fds, 4, 50);
+    int32 $rearmed = http::http_ev_arm_write($ev, $fd);
+    int32 $again = http::http_ev_wait($ev, $fds, 4, 1000);
+
+    http::http_close($fd);
+    http::http_close($lfd);
+    http::http_close($ev);
+
+    assert($waiting == 1 && $fd >= 0 && $armed == 0, 'accepted and armed for writing');
+    assert($writable, 'an empty send buffer has room');
+    assert($after == 0, 'reported once');
+    assert($rearmed == 0 && $again == 1, 'and again once armed again');
+}
+
+#[group: "outbound"]
+test a_slow_reader_does_not_hold_the_worker {
+    string $big = patterned(3000000);
+    http::Server $app = bigServer($big);
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    http::Conn $slow = narrowClient($port);
+    bool $sent = $slow->writeAll("GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    // the one worker wrote what fit and went back to the pool
+    thread::sleep(100);
+
+    bool $free = answeredWithin($port, 1000);
+
+    // now take it all, then ask again on the same connection
+    string $pending = '';
+    string $got = readResponse($slow, $pending);
+    bool $sentAgain = $slow->writeAll("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    string $next = readResponse($slow, $pending);
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent, 'sent');
+    assert($free, 'another client was served while the slow one read nothing');
+    assert($got->starts('HTTP/1.1 200 OK') && $got->contains('Content-Length: 3000000\r\n'), 'the big head');
+    assert($got->ends($big), 'every byte, in order');
+    assert($sentAgain && $next->starts('HTTP/1.1 200 OK') && $next->ends('hi'), 'kept alive after the reactor finished');
+}
+
+#[group: "outbound"]
+test a_pipelined_request_waits_for_the_slow_response_before_it {
+    string $big = patterned(2000000);
+    http::Server $app = bigServer($big);
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    http::Conn $slow = narrowClient($port);
+    bool $sent = $slow->writeAll("GET /big HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\nGET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+
+    thread::sleep(100);
+
+    bool $free = answeredWithin($port, 1000);
+    string $pending = '';
+    string $first = readResponse($slow, $pending);
+    string $second = readResponse($slow, $pending);
+    string $third = readResponse($slow, $pending);
+    bool $closed = !fill($slow, $pending);
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $free, 'the worker was free meanwhile');
+    assert($first->starts('HTTP/1.1 200 OK') && $first->ends($big), 'the first big answer whole');
+    assert($second->starts('HTTP/1.1 200 OK') && $second->ends('hi'), 'then the small one, in order');
+    assert($third->contains('Connection: close\r\n') && $third->ends($big), 'then the last, which closes');
+    assert($closed, 'and the connection ends after it');
+}
+
+#[group: "outbound"]
+test stop_finishes_a_half_written_response {
+    string $big = patterned(3000000);
+    http::Server $app = bigServer($big);
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    http::Conn $slow = narrowClient($port);
+    bool $sent = $slow->writeAll("GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    thread::sleep(100);
+
+    // the reactor holds the rest; stop hands it to a worker to finish
+    thread::handle $stopper = guard thread::spawn(function() : void {
+        $app->stop();
+    }) else ($e) {
+        die($e->message());
+    }
+
+    thread::sleep(100);
+
+    string $pending = '';
+    string $got = readResponse($slow, $pending);
+    bool $closed = !fill($slow, $pending);
+
+    $stopper->join();
+    $srv->join();
+
+    assert($sent, 'sent');
+    assert($got->ends($big), 'every byte, after the stop');
+    assert($closed, 'then the close');
+    assert($app->live() == 0, 'nothing left counted');
+}
+
+#[group: "outbound"]
+test a_client_that_takes_nothing_is_closed_after_the_send_timeout {
+    // more than the kernel takes off the server for a client that reads
+    // nothing (darwin grows the send buffer to 4 MiB), and little enough
+    // that what the worker cannot send at once is under OUTBOUND_CAP
+    string $big = patterned(4600000);
+    http::Server $app = bigServer($big);
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    http::Conn $slow = narrowClient($port);
+    bool $sent = $slow->writeAll("GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    thread::sleep(100);
+
+    bool $free = answeredWithin($port, 3000);
+    bool $heldAt9 = false;
+    bool $gone = false;
+    int32 $waited = 0;
+
+    // ten seconds without a byte taken, then a sweep of at most a second.
+    // later on a loaded machine: the clock starts once the reactor has it
+    while ($waited < 25000) {
+        thread::sleep(100);
+        $waited = $waited + 100;
+
+        if ($waited == 9000) {
+            $heldAt9 = $app->live() == 1;
+        }
+
+        if ($waited > 9000 && $app->live() == 0) {
+            $gone = true;
+            break;
+        }
+    }
+
+    // what the kernel already had is still readable, then the end
+    string $pending = '';
+    string $got = readResponse($slow, $pending);
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $free, 'the worker was free meanwhile');
+    assert($heldAt9, 'still open before the timeout');
+    assert($gone, 'closed after it');
+    assert($got->size() < $big->size(), 'cut short');
+}
+
+/**
+ * A server with one worker: `/` is small, `/file` is the file at `$path`.
+ */
+internal function fileServer(const string& $path) : http::Server
+{
+    string $at = $path;
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->get('/', function(http::Request $req) : http::Response {
+        return http::Response(text: 'hi');
+    });
+    $app->get('/file', function(http::Request $req) : http::Response {
+        return http::Response(file: $at);
+    });
+
+    return $app;
+}
+
+internal function fixtureFile(const string& $name, const string& $content) : string
+{
+    string $dir = str::from(std::env::tmp());
+    int64 $pid = std::env::pid() as int64;
+    string $path = "{$dir}/libhttp-{$name}-{$pid}.bin";
+    result<usize, std::io::ioerror> $wrote = std::fs::writefile($path, $content);
+
+    assert($wrote->has_value(), 'wrote the fixture');
+    return $path;
+}
+
+#[group: "outbound"]
+test a_slow_reader_of_a_file_does_not_hold_the_worker {
+    string $content = patterned(3000000);
+    string $path = fixtureFile('slowfile', $content);
+    http::Server $app = fileServer($path);
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    http::Conn $slow = narrowClient($port);
+    bool $sent = $slow->writeAll("GET /file HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    thread::sleep(100);
+
+    bool $free = answeredWithin($port, 1000);
+    string $pending = '';
+    string $got = readResponse($slow, $pending);
+    string $next = readResponse($slow, $pending);
+    bool $sentAgain = $slow->writeAll("HEAD /file HTTP/1.1\r\nHost: x\r\n\r\n");
+    string $head = readResponse($slow, $pending, true);
+
+    $app->stop();
+    $srv->join();
+
+    result<bool, std::io::ioerror> $removed = std::fs::remove($path);
+
+    assert($sent, 'sent');
+    assert($free, 'another client was served while the slow one read nothing');
+    assert($got->starts('HTTP/1.1 200 OK') && $got->contains('Content-Length: 3000000\r\n'), 'the file head');
+    assert($got->ends($content), 'every byte of the file, in order');
+    assert($next->starts('HTTP/1.1 200 OK') && $next->ends('hi'), 'then the pipelined request, on the same connection');
+    assert($sentAgain && $head->contains('Content-Length: 3000000\r\n') && $head->ends('\r\n\r\n'), 'a HEAD of it has the length and no body');
+}
+
+#[group: "outbound"]
+test stop_cuts_a_slow_file_short {
+    string $content = patterned(3000000);
+    string $path = fixtureFile('stopfile', $content);
+    http::Server $app = fileServer($path);
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    http::Conn $slow = narrowClient($port);
+    bool $sent = $slow->writeAll("GET /file HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    thread::sleep(100);
+
+    time::instant $start = time::instant::now();
+
+    $app->stop();
+    $srv->join();
+
+    time::duration $took = $start->elapsed();
+    string $pending = '';
+    string $got = readResponse($slow, $pending);
+
+    result<bool, std::io::ioerror> $removed = std::fs::remove($path);
+
+    assert($sent, 'sent');
+    assert($took < time::duration::secs(3), 'stop does not wait on the slow reader');
+    assert($got->size() < $content->size(), 'the body was cut short, as a stopping stream is');
+    assert($app->live() == 0, 'nothing left counted');
+}

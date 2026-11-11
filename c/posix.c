@@ -4,7 +4,11 @@
  *
  * Every fd is CLOEXEC. Accepted sockets stay blocking (workers write
  * under SO_SNDTIMEO). The reactor reads with MSG_DONTWAIT. Listen and
- * the wake pipe are non-blocking.
+ * the wake pipe are non-blocking. A response the reactor finishes for a
+ * slow client is written with MSG_DONTWAIT on linux and the BSDs; darwin
+ * ignores that flag for sends, so there the socket is O_NONBLOCK while the
+ * reactor has it, and blocking again after. A file it finishes always goes
+ * O_NONBLOCK: sendfile takes no flags.
  *
  * The lingering close: shut write, drain, then close. A plain close with
  * unread bytes is a RST. The reactor does it without blocking, with
@@ -25,10 +29,13 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -47,10 +54,16 @@
 /* before macOS 14.4 the same wait has only its private spelling */
 extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout);
 extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+/* <sys/socket.h> hides it under _POSIX_C_SOURCE, which the rest of this file wants.
+   the struct is declared first so the prototype does not depend on _DARWIN_C_SOURCE */
+struct sf_hdtr;
+extern int sendfile(int, int, off_t, off_t *, struct sf_hdtr *, int);
+
 #define UL_COMPARE_AND_WAIT 1
 #define ULF_WAKE_ALL 0x00000100
 #elif defined(__linux__)
 #include <linux/futex.h>
+#include <sys/sendfile.h>
 #include <sys/syscall.h>
 #endif
 
@@ -144,7 +157,12 @@ static int would_block(void)
     return errno == EAGAIN || errno == EWOULDBLOCK;
 }
 
-int http_listen(const char *host, int port)
+/*
+ * Binds and listens with room for `backlog` connections the kernel has
+ * accepted and nobody has taken yet. The kernel caps it at its own limit
+ * (somaxconn) without saying so.
+ */
+int http_listen(const char *host, int port, int backlog)
 {
     struct addrinfo hints;
     struct addrinfo *res = NULL;
@@ -156,6 +174,10 @@ int http_listen(const char *host, int port)
     if (port < 0 || port > 65535) {
         errno = EINVAL;
         return -1;
+    }
+
+    if (backlog < 1) {
+        backlog = 1;
     }
 
     memset(&hints, 0, sizeof hints);
@@ -193,7 +215,7 @@ int http_listen(const char *host, int port)
             continue;
         }
 
-        if (listen(fd, 128) != 0) {
+        if (listen(fd, backlog) != 0) {
             close(fd);
             fd = -1;
             continue;
@@ -419,6 +441,153 @@ ssize_t http_send(int fd, const void *buf, size_t n)
     return put;
 }
 
+/*
+ * An errno that says sendfile cannot serve this file or socket at all: a
+ * filesystem without it (ENOTSUP on an SMB or NFS mount on macOS, EINVAL
+ * on some FUSE and special filesystems on linux), or a kernel without it.
+ */
+static int sendfile_unsupported(int err)
+{
+    return err == EINVAL || err == ENOSYS || err == ENOTSUP || err == EOPNOTSUPP;
+}
+
+/*
+ * Up to `count` bytes of the file `file` from `offset` onto the socket
+ * `sock`, in the kernel: no copy through user space. The file's own offset
+ * does not move. Answers how many went (a blocking socket under its send
+ * timeout may take only part), 0 when the file ended first, RECV_AGAIN when
+ * the socket took nothing before its timeout, -1 on an error, and -2 where
+ * sendfile cannot serve this file (no sendfile here, or a filesystem
+ * without it), so the caller copies instead.
+ *
+ * linux raises SIGPIPE for a socket the peer has closed, and sendfile has no
+ * MSG_NOSIGNAL: the signal is blocked around the call, and one it raised is
+ * taken off the thread before it is unblocked. One already pending before
+ * the call is someone else's and is left alone, raised one or not: taking
+ * it would hide it from the application. linux takes a thread's own signal
+ * before a process-wide one, so the one taken is the one this call raised.
+ * macOS honours SO_NOSIGPIPE.
+ */
+ssize_t http_sendfile(int sock, int file, long long offset, size_t count)
+{
+#if defined(__linux__)
+    sigset_t pipe_set;
+    sigset_t old;
+    sigset_t pending;
+    off_t off = (off_t)offset;
+    ssize_t put;
+    int err;
+    int had;
+
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe_set, &old);
+
+    had = sigpending(&pending) != 0 || sigismember(&pending, SIGPIPE);
+
+    do {
+        put = sendfile(sock, file, &off, count);
+    } while (put < 0 && errno == EINTR);
+
+    err = errno;
+
+    if (put < 0 && err == EPIPE && !had && !sigismember(&old, SIGPIPE)) {
+        struct timespec zero = {0, 0};
+
+        while (sigtimedwait(&pipe_set, NULL, &zero) < 0 && errno == EINTR) {
+        }
+    }
+
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    errno = err;
+
+    if (put < 0 && would_block()) {
+        return RECV_AGAIN;
+    }
+
+    if (put < 0 && sendfile_unsupported(err)) {
+        return -2;
+    }
+
+    return put;
+#elif defined(__APPLE__)
+    off_t len = (off_t)count;
+    int rc;
+
+    for (;;) {
+        len = (off_t)count;
+        rc = sendfile(file, sock, (off_t)offset, &len, NULL, 0);
+
+        // a timeout or a signal still says how much went
+        if (rc == 0 || len > 0) {
+            return (ssize_t)len;
+        }
+
+        if (errno != EINTR) {
+            break;
+        }
+    }
+
+    if (would_block()) {
+        return RECV_AGAIN;
+    }
+
+    if (sendfile_unsupported(errno)) {
+        return -2;
+    }
+
+    return -1;
+#else
+    (void)sock;
+    (void)file;
+    (void)offset;
+    (void)count;
+    errno = ENOSYS;
+    return -2;
+#endif
+}
+
+/*
+ * Whether MSG_DONTWAIT makes a send on a blocking socket non-blocking.
+ * linux and the BSDs: yes. darwin honours it for receives only; a send
+ * waits for room anyway, so a send that must not wait needs O_NONBLOCK on
+ * the socket.
+ */
+int http_dontwait_sends(void)
+{
+#if defined(__APPLE__)
+    return 0;
+#else
+    return 1;
+#endif
+}
+
+/*
+ * A second fd for the same open file, CLOEXEC, or -1. A half-sent file goes
+ * to the reactor as this copy: the worker's own handle stays the worker's,
+ * so no reference count is shared between threads.
+ */
+int http_dup(int fd)
+{
+    return fcntl(fd, F_DUPFD_CLOEXEC, 0);
+}
+
+/*
+ * O_NONBLOCK on (`on` 0) or off (`on` 1), the way http_accept_one leaves it
+ * off. One FIONBIO ioctl rather than fcntl's read and write of the flags:
+ * a worker does this twice for every big response, and a handed-over
+ * connection coming back is made blocking again this way. The send and
+ * receive timeouts and SO_NOSIGPIPE are left as accept set them: a taker
+ * must not change them (setting them again on every resume cost three
+ * syscalls a request on a proxy's path).
+ */
+int http_set_blocking(int fd, int on)
+{
+    int nb = on ? 0 : 1;
+
+    return ioctl(fd, FIONBIO, &nb);
+}
+
 ssize_t http_recv_now(int fd, void *buf, size_t n)
 {
     ssize_t got;
@@ -507,14 +676,101 @@ int http_ev_arm(int ev, int fd, int oneshot)
 #endif
 }
 
-int http_ev_drop(int ev, int fd)
+/*
+ * Arms `fd` for writing, once: reported when the socket can take more, then
+ * left disabled until armed again. On epoll this replaces the read interest
+ * (one registration per fd); on kqueue it is a filter of its own beside a
+ * read filter that stays as it was. Either way, a connection the reactor is
+ * writing to is armed for nothing else.
+ */
+int http_ev_arm_write(int ev, int fd)
 {
 #ifdef HTTP_KQUEUE
     struct kevent change;
 
-    EV_SET(&change, (uintptr_t)fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-    if (kevent(ev, &change, 1, NULL, 0, NULL) < 0 && errno != ENOENT) {
+    EV_SET(&change, (uintptr_t)fd, EVFILT_WRITE, EV_ADD | EV_ENABLE | EV_DISPATCH, 0, 0, NULL);
+    return kevent(ev, &change, 1, NULL, 0, NULL) < 0 ? -1 : 0;
+#else
+    struct epoll_event event;
+
+    memset(&event, 0, sizeof event);
+    event.events = EPOLLOUT | EPOLLONESHOT;
+    event.data.fd = fd;
+
+    if (epoll_ctl(ev, EPOLL_CTL_MOD, fd, &event) == 0) {
+        return 0;
+    }
+
+    if (errno != ENOENT) {
         return -1;
+    }
+
+    return epoll_ctl(ev, EPOLL_CTL_ADD, fd, &event);
+#endif
+}
+
+/*
+ * Adds the listen socket, shared by every reactor, level-triggered. On
+ * linux with EPOLLEXCLUSIVE, so a new connection wakes one waiting reactor
+ * instead of all of them; a kernel older than 4.5 refuses the flag and gets
+ * the plain arm. kqueue has no such flag: each kqueue that holds the socket
+ * hears of every connection, and the reactors that lose the race to accept
+ * it see EAGAIN. Arming one already armed is not an error.
+ */
+int http_ev_listen(int ev, int fd)
+{
+#ifdef HTTP_KQUEUE
+    return http_ev_arm(ev, fd, 0);
+#else
+    struct epoll_event event;
+
+    memset(&event, 0, sizeof event);
+#ifdef EPOLLEXCLUSIVE
+    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    event.data.fd = fd;
+
+    if (epoll_ctl(ev, EPOLL_CTL_ADD, fd, &event) == 0 || errno == EEXIST) {
+        return 0;
+    }
+
+    if (errno != EINVAL) {
+        return -1;
+    }
+#endif
+    event.events = EPOLLIN;
+    event.data.fd = fd;
+
+    if (epoll_ctl(ev, EPOLL_CTL_ADD, fd, &event) == 0 || errno == EEXIST) {
+        return 0;
+    }
+
+    return -1;
+#endif
+}
+
+int http_ev_drop(int ev, int fd)
+{
+#ifdef HTTP_KQUEUE
+    struct kevent changes[2];
+    struct kevent results[2];
+    int n;
+    int i;
+
+    // both filters: http_ev_arm_write leaves a write one behind, disabled,
+    // that must not stay with an fd leaving this reactor. EV_RECEIPT answers
+    // each one, so a filter that was never added (ENOENT) stops neither
+    EV_SET(&changes[0], (uintptr_t)fd, EVFILT_READ, EV_DELETE | EV_RECEIPT, 0, 0, NULL);
+    EV_SET(&changes[1], (uintptr_t)fd, EVFILT_WRITE, EV_DELETE | EV_RECEIPT, 0, 0, NULL);
+
+    n = kevent(ev, changes, 2, results, 2, NULL);
+    if (n < 0) {
+        return -1;
+    }
+
+    for (i = 0; i < n; i++) {
+        if ((results[i].flags & EV_ERROR) && results[i].data != 0 && results[i].data != ENOENT) {
+            return -1;
+        }
     }
 
     return 0;

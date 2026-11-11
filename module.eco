@@ -18,4 +18,5 @@
 
 #[target: test] {
     #[sources: "tests/*.eco"]
+    #[cc: sources "tests/load.c"]
 }

@@ -590,11 +590,33 @@ internal struct Framer
     }
 
     /**
+     * Whether a request has started and not finished: its head or body is
+     * on a deadline shorter than the idle one, as a rule.
+     */
+    public const function midRequest() : bool
+    {
+        Phase $at = $this->phase;
+
+        return match ($at) {
+            Phase::idle => false,
+            else => true,
+        };
+    }
+
+    /**
      * Deadline for the phase this connection is in, if it blew it.
      */
     public const function expired(const Limits& $limits) : Expiry
     {
-        time::duration $age = $this->since->elapsed();
+        return $this->expiredAt($limits, time::instant::now());
+    }
+
+    /**
+     * `expired` against a clock read once for a whole sweep.
+     */
+    public const function expiredAt(const Limits& $limits, time::instant $now) : Expiry
+    {
+        time::duration $age = $now - $this->since;
         Phase $at = $this->phase;
         time::duration $cap = match ($at) {
             Phase::idle => $limits->idleTimeout,

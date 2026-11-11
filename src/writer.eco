@@ -139,7 +139,7 @@ public class Writer
         }
 
         return match ($this->mode) {
-            Mode::chunked => $this->sendRaw('0\r\n\r\n'),
+            Mode::chunked => $this->sendRaw(lastChunk()),
             Mode::sized => $this->written == $this->length,
             Mode::raw => true,
         };
@@ -156,14 +156,7 @@ public class Writer
             return $this->sendRaw($bytes);
         }
 
-        usize $n = $bytes->size();
-        string $frame = '';
-
-        $frame->reserve($n + 24);
-        $frame->append("{$n:x}\r\n");
-        $frame->append($bytes);
-        $frame->append('\r\n');
-        return $this->sendRaw($frame);
+        return $this->sendRaw(chunk($bytes));
     }
 
     private function sendRaw(const string& $bytes) : bool

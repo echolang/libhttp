@@ -1,0 +1,256 @@
+/**
+ * A connection handed over without a thread, after a handler said
+ * `Response(handoff:)`: an event loop of the caller's own takes the fd,
+ * speaks whatever it likes on it, and may give it back for the next
+ * request.
+ *
+ * The callback runs inline on the worker, before it goes back to the
+ * pool. Nothing of the response is written. A taken fd is the taker's
+ * alone: it left the reactor's event set and stopped counting toward
+ * `maxConnections`. `resume` counts it again and parks it on the reactor
+ * it came from, as if the worker had just written a kept response.
+ */
+
+use std::thread;
+
+namespace http;
+
+// on the worker, not taken (yet)
+internal const int32 HANDOFF_OPEN = 0;
+
+// the callback took the fd: the taker owns it
+internal const int32 HANDOFF_TAKEN = 1;
+
+// the callback returned without taking it: libhttp closed it
+internal const int32 HANDOFF_DROPPED = 2;
+
+// the taker gave it back, or tried to after the server stopped
+internal const int32 HANDOFF_RESUMED = 3;
+
+#[atomic]
+public class Handoff
+{
+    private int32 $fd;
+    private atomic<int32> $state;
+
+    // the reactor the connection came from, and what the server shares
+    private Home $home;
+    private Shared $shared;
+
+    /**
+     * Bytes already read past this request's head and body: the client's
+     * first bytes of the new protocol after an upgrade request, or the
+     * next pipelined request. Read them before anything off the fd.
+     */
+    public const string $early;
+
+    /**
+     * The client's address, as `Request::peer` has it.
+     */
+    public const string $peer;
+
+    /**
+     * Requests already answered on this connection before this one.
+     */
+    public const int32 $served;
+
+    /**
+     * Whether the connection may stay open after this response: the
+     * client asked (HTTP/1.1 unless `Connection: close`, HTTP/1.0 only
+     * with `Connection: keep-alive`), `maxRequests` is not reached, and
+     * the server is not stopping. The decision libhttp makes for its own
+     * responses.
+     */
+    public const bool $keep;
+
+    /**
+     * The request's verb, as sent: `GET`, `HEAD`, `COPY`.
+     */
+    public const string $method;
+
+    /**
+     * The request's version: `HTTP/1.1` or `HTTP/1.0`.
+     */
+    public const string $version;
+
+    /**
+     * The response's headers after every middleware ran, so what a layer
+     * added reaches the taker.
+     */
+    public const Headers $headers;
+
+    /**
+     * `idleTimeout` in whole seconds: what a kept HTTP/1.0 connection is
+     * told in `Keep-Alive: timeout=`.
+     */
+    public const int64 $idle;
+
+    internal constructor(
+        int32 $fd,
+        Home $home,
+        Shared $shared,
+        const Limits& $limits,
+        const Slot& $slot,
+        const Request& $req,
+        const Headers& $headers,
+        bool $keep
+    )
+    {
+        $this->fd = $fd;
+        $this->state = atomic<int32>(HANDOFF_OPEN);
+        $this->home = $home;
+        $this->shared = $shared;
+        $this->early = $slot->framer->buffer;
+        $this->peer = $slot->peer;
+        $this->served = $slot->served;
+        $this->keep = $keep;
+        $this->method = methodName($req->method);
+        $this->version = $req->version;
+        $this->headers = $headers;
+        $this->idle = $limits->idleTimeout->as_secs() as int64;
+    }
+
+    /**
+     * The connection's fd, once; -1 after that, or once the callback has
+     * returned. It leaves the reactor and stops counting toward
+     * `maxConnections`. It comes as libhttp keeps it: blocking, with 10
+     * second send and receive timeouts. Make it non-blocking for a loop
+     * of your own, but leave the timeouts and other socket options as
+     * they are: `resume` only turns it blocking again. Closing it, or giving it back with `resume`, is yours
+     * from now on. Call it inside the callback.
+     */
+    public function take() : int32
+    {
+        if (!$this->state->compare_exchange(HANDOFF_OPEN, HANDOFF_TAKEN)) {
+            return -1;
+        }
+
+        http_ev_drop($this->home->ev, $this->fd);
+        $this->shared->live->sub(1);
+        return $this->fd;
+    }
+
+    /**
+     * Give the taken connection back for its next request, from any
+     * thread, once its response is written whole. `$rest` is what was read
+     * off it past the end of this exchange (`early` that was never used
+     * included), which is read before the socket: a complete request in it
+     * is served. The fd `take` handed out turns blocking again (its
+     * timeouts are the ones it was taken with, which a taker must not
+     * change), counts toward `maxConnections` again, and goes back to the
+     * reactor it came from, `served` one higher. No lock is taken, so
+     * resumes from many threads never wait on each other.
+     *
+     * A connection that may not be kept (`keep` false: the client asked
+     * for a close, or it has had `maxRequests`) gets the lingering close
+     * instead, as does every one once the server is stopping. Either way
+     * the fd is libhttp's again. A second call, or one without `take`,
+     * does nothing.
+     */
+    public function resume(const string& $rest) : void
+    {
+        if (!$this->state->compare_exchange(HANDOFF_TAKEN, HANDOFF_RESUMED)) {
+            return;
+        }
+
+        // counted before it looks: listen's shut waits for this park to end
+        // before it closes the reactor's event set and pipe, and a stop that
+        // got there first closes it. no lock, so resumes never queue
+        $this->shared->resuming->add(1);
+        $this->park($rest);
+        $this->shared->resuming->sub(1);
+    }
+
+    /**
+     * The body of `resume`, between counting it and uncounting it.
+     */
+    private function park(const string& $rest) : void
+    {
+        int32 $fd = $this->fd;
+
+        if ($this->shared->stopping->load()) {
+            closeNow($fd);
+            return;
+        }
+
+        $this->shared->live->add(1);
+
+        // the head this connection was answered with said whether it stays
+        if (!$this->keep || http_set_blocking($fd, 1) != 0) {
+            // linger on the reactor, as any last response does
+            if (http_shut_write($fd) != 0 || !$this->home->hand(Back::linger($fd))) {
+                http_close($fd);
+                $this->shared->live->sub(1);
+            }
+
+            return;
+        }
+
+        $this->home->keep(Parked($fd, $this->peer, $rest, $this->served + 1), $this->shared);
+    }
+
+    /**
+     * A head for this response, byte for byte what libhttp writes: `head`
+     * with this connection's `keep`, `version` and `idle`, and for HEAD no
+     * chunked framing and no forced close.
+     */
+    public const function head(int32 $status, const Headers& $headers, int64 $length) : string
+    {
+        return headFor($status, $headers, $length, $this->keep, $this->version, $this->idle, $this->method == 'HEAD');
+    }
+
+    /**
+     * Whether `take` has handed the fd out.
+     */
+    public const function taken() : bool
+    {
+        int32 $at = $this->state->load();
+
+        return $at == HANDOFF_TAKEN || $at == HANDOFF_RESUMED;
+    }
+
+    /**
+     * After the callback: true when nothing took the fd, which is libhttp's
+     * to close then. Later `take` calls get -1.
+     */
+    internal function settle() : bool
+    {
+        return $this->state->compare_exchange(HANDOFF_OPEN, HANDOFF_DROPPED);
+    }
+
+    internal const function fd() : int32
+    {
+        return $this->fd;
+    }
+}
+
+/**
+ * Close a connection no reactor will take any more, without waiting on
+ * the client: the write side first, so the response already sent is not
+ * lost to a reset when nothing is left unread.
+ */
+internal function closeNow(int32 $fd) : void
+{
+    http_shut_write($fd);
+    http_close($fd);
+}
+
+/**
+ * A handoff response: run the callback here on the worker, with nothing
+ * written. Untaken, the connection gets the lingering close any last
+ * response gets.
+ */
+internal function handOver(Conn $conn, const Visit& $visit, const Request& $req, const Response& $res, array<Home>& $homes, const Limits& $limits, Shared $shared) : void
+{
+    // serveVisit only calls this for a response that hands over
+    function<void(Handoff)> $fn = guard $res->handoff;
+
+    bool $keep = !closes(persistFor($req, $visit->slot->served, $limits, $shared));
+    Handoff $h = Handoff($conn->release(), $homes[$visit->home], $shared, $limits, $visit->slot, $req, $res->headers, $keep);
+
+    $fn($h);
+
+    if ($h->settle()) {
+        lingerOn($h->fd(), $homes, $visit->home, $shared);
+    }
+}

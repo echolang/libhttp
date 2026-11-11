@@ -6,7 +6,7 @@
 namespace http;
 
 internal extern {
-    function http_listen(ptr<const uint8> $host, int32 $port) : int32;
+    function http_listen(ptr<const uint8> $host, int32 $port, int32 $backlog) : int32;
     function http_port(int32 $fd) : int32;
     function http_pipe_open(ptr<int32> $rd, ptr<int32> $wr) : int32;
     function http_wake(int32 $wr) : int32;
@@ -17,8 +17,14 @@ internal extern {
     function http_send(int32 $fd, ptr<const uint8> $buf, usize $n) : isize;
     function http_recv_now(int32 $fd, ptr<uint8> $buf, usize $n) : isize;
     function http_send_now(int32 $fd, ptr<const uint8> $buf, usize $n) : isize;
+    function http_sendfile(int32 $sock, int32 $file, int64 $offset, usize $count) : isize;
+    function http_dontwait_sends() : int32;
+    function http_dup(int32 $fd) : int32;
+    function http_set_blocking(int32 $fd, int32 $on) : int32;
     function http_ev_open() : int32;
     function http_ev_arm(int32 $ev, int32 $fd, int32 $oneshot) : int32;
+    function http_ev_listen(int32 $ev, int32 $fd) : int32;
+    function http_ev_arm_write(int32 $ev, int32 $fd) : int32;
     function http_ev_drop(int32 $ev, int32 $fd) : int32;
     function http_ev_wait(int32 $ev, ptr<int32> $fds, int32 $max, int32 $ms) : int32;
     function http_close(int32 $fd) : int32;
@@ -37,6 +43,10 @@ internal extern {
 
 internal const isize RECV_AGAIN = -3;
 internal const int32 ACCEPT_AGAIN = -3;
+
+// http_sendfile that cannot serve this file or socket: no sendfile(2) here, or
+// a filesystem without it. the caller copies instead
+internal const isize SENDFILE_NONE = -2;
 
 internal function lastError() : string
 {

@@ -3,7 +3,8 @@
  *
  * The serializer owns framing. Handler Content-Length / Connection /
  * Keep-Alive / Transfer-Encoding is dropped. 1xx, 204, 304 have no body.
- * HEAD keeps the length, drops the body.
+ * HEAD keeps the length, drops the body. `head`, `chunk` and `lastChunk`
+ * are the same code, public, for a handoff's taker to write with.
  */
 
 use std::thread;
@@ -314,6 +315,19 @@ internal enum Persist
 }
 
 /**
+ * How a connection that stays open is told so: nothing to add over
+ * HTTP/1.1, `Keep-Alive` with its timeout over HTTP/1.0.
+ */
+internal function keptPersist(bool $http11, int64 $idleSecs) : Persist
+{
+    if ($http11) {
+        return .keep;
+    }
+
+    return .keepAlive($idleSecs);
+}
+
+/**
  * The header names only the serializer writes.
  */
 internal function framingHeader(const string& $name) : bool
@@ -358,7 +372,7 @@ internal function render(const Response& $res, bool $sendBody, const Persist& $p
     string $out = '';
 
     $out->reserve($room);
-    writeHead($out, $res, Length::exact($res->body->size()), $persist);
+    writeHead($out, $res->status, $res->headers, Length::exact($res->body->size()), $persist);
 
     if ($withBody) {
         $out->append($res->body);
@@ -375,21 +389,118 @@ internal function renderHead(const Response& $res, const Length& $length, const 
     string $out = '';
 
     $out->reserve(HEAD_ROOM);
-    writeHead($out, $res, $length, $persist);
+    writeHead($out, $res->status, $res->headers, $length, $persist);
     return $out;
+}
+
+/**
+ * How a body of `$length` bytes is framed; -1 is a length not known up
+ * front. Unknown is chunked over HTTP/1.1, and ends at the close over
+ * HTTP/1.0 or when no body is sent.
+ */
+internal function framing(int64 $length, bool $sendBody, bool $http11) : Length
+{
+    if ($length >= 0) {
+        return .exact($length as usize);
+    }
+
+    if ($sendBody && $http11) {
+        return .chunked;
+    }
+
+    return .none;
+}
+
+/**
+ * Whether the body can only end with the connection: an unsized one
+ * going to an HTTP/1.0 client. Such a response always closes.
+ */
+internal function closeDelimited(int32 $status, int64 $length, bool $head, bool $http11) : bool
+{
+    return !$http11 && !$head && $length < 0 && !bodyless($status);
+}
+
+/**
+ * A head the way `serveVisit` frames a streamed response: the length,
+ * the keep-alive decision, the HTTP/1.0 close for an unsized body, HEAD.
+ */
+internal function headFor(int32 $status, const Headers& $headers, int64 $length, bool $keep, const string& $version, int64 $idleSecs, bool $head) : string
+{
+    bool $http11 = $version == 'HTTP/1.1';
+    Persist $persist = Persist::close;
+
+    if ($keep && !closeDelimited($status, $length, $head, $http11)) {
+        $persist = keptPersist($http11, $idleSecs);
+    }
+
+    string $out = '';
+
+    $out->reserve(HEAD_ROOM);
+    writeHead($out, $status, $headers, framing($length, !$head && !bodyless($status), $http11), $persist);
+    return $out;
+}
+
+/**
+ * A response head, byte for byte what libhttp itself writes: the status
+ * line with its reason phrase, `$headers` minus the framing ones
+ * (`Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`) and
+ * any a CR, LF or NUL would break, a `Date` unless `$headers` has one,
+ * then the framing and `Connection`, then the blank line.
+ *
+ * `$length` of 0 or more is `Content-Length`. -1 is a body whose length
+ * is not known: chunked over HTTP/1.1 (write it with `chunk` and end it
+ * with `lastChunk`), and over HTTP/1.0 a body that ends at the close, so
+ * the head says `Connection: close` whatever `$keep` says. 1xx, 204 and
+ * 304 never get a length. `$keep` is whether the connection stays open
+ * after this response (`Handoff::keep`); `$version` is the request's.
+ * HTTP/1.0 that is kept is told so, with `$idleSecs` as its timeout.
+ * For an answer to HEAD use `Handoff::head`, which knows the method.
+ */
+public function head(int32 $status, const Headers& $headers, int64 $length, bool $keep, const string& $version, int64 $idleSecs) : string
+{
+    return headFor($status, $headers, $length, $keep, $version, $idleSecs, false);
+}
+
+/**
+ * `$bytes` as one chunk of a chunked body: hex size, CRLF, the bytes,
+ * CRLF. Empty is empty, since a zero-size chunk would end the body.
+ */
+public function chunk(const string& $bytes) : string
+{
+    usize $n = $bytes->size();
+
+    if ($n == 0) {
+        return '';
+    }
+
+    string $frame = '';
+
+    $frame->reserve($n + 24);
+    $frame->append("{$n:x}\r\n");
+    $frame->append($bytes);
+    $frame->append('\r\n');
+    return $frame;
+}
+
+/**
+ * The end of a chunked body: the zero-size chunk, no trailers.
+ */
+public function lastChunk() : string
+{
+    return '0\r\n\r\n';
 }
 
 /**
  * Append the head to `$out` piece by piece. An interpolated line would
  * be its own string first, and most lines are too long to stay inline.
  */
-internal function writeHead(string& $out, const Response& $res, const Length& $length, const Persist& $persist) : void
+internal function writeHead(string& $out, int32 $status, const Headers& $headers, const Length& $length, const Persist& $persist) : void
 {
-    if ($res->status == 200) {
+    if ($status == 200) {
         $out->append('HTTP/1.1 200 OK\r\n');
     } else {
-        string $code = str::from($res->status);
-        string $phrase = reason($res->status);
+        string $code = str::from($status);
+        string $phrase = reason($status);
 
         $out->append('HTTP/1.1 ');
         $out->append($code);
@@ -400,11 +511,11 @@ internal function writeHead(string& $out, const Response& $res, const Length& $l
 
     string $dateName = 'Date';
     bool $hasDate = false;
-    usize $count = $res->headers->items->count();
+    usize $count = $headers->items->count();
     usize $i = 0;
 
     while ($i < $count) {
-        const Header& $h = $res->headers->items[$i];
+        const Header& $h = $headers->items[$i];
 
         $i = $i + 1;
 
@@ -431,7 +542,7 @@ internal function writeHead(string& $out, const Response& $res, const Length& $l
         appendDate($out);
     }
 
-    if (!bodyless($res->status)) {
+    if (!bodyless($status)) {
         match ($length) {
             Length::exact($n) => {
                 usize $size = $n;

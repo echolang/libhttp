@@ -1,0 +1,625 @@
+/**
+ * Handoffs over loopback: the callback takes the fd on the worker, the
+ * test thread plays the event loop that owns it, and `resume` gives it
+ * back. Also the public renderers and the listen backlog.
+ */
+
+use std::thread;
+use std::time;
+
+internal const string HANDOFF_ASK = "GET /hand HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n";
+
+/**
+ * What the handoff callbacks saw, set on the worker.
+ */
+#[atomic]
+internal class Handed
+{
+    public thread::mutex<array<http::Handoff>> $got;
+    public thread::mutex<array<int32>> $fds;
+    public atomic<int32> $ran;
+
+    // whether a take after the first one answered -1
+    public atomic<int32> $again;
+
+    public constructor()
+    {
+        $this->got = thread::mutex<array<http::Handoff>>(array<http::Handoff>());
+        $this->fds = thread::mutex<array<int32>>(array<int32>());
+        $this->ran = atomic<int32>(0);
+        $this->again = atomic<int32>(0);
+    }
+
+    public function put(http::Handoff $h, int32 $fd) : void
+    {
+        {
+            thread::locked<array<http::Handoff>> $held = $this->got->lock();
+
+            $held->value[] = $h;
+        }
+
+        {
+            thread::locked<array<int32>> $held = $this->fds->lock();
+
+            $held->value[] = $fd;
+        }
+
+        $this->ran->add(1);
+    }
+
+    public function handoff(usize $at) : http::Handoff
+    {
+        thread::locked<array<http::Handoff>> $held = $this->got->lock();
+
+        return $held->value[$at];
+    }
+
+    public function fd(usize $at) : int32
+    {
+        thread::locked<array<int32>> $held = $this->fds->lock();
+
+        return $held->value[$at];
+    }
+}
+
+/**
+ * `/hand` takes the connection (HEAD too, through GET), `/leave` does
+ * not, `/hello` is plain.
+ * Every response gets `X-Layer` from a middleware.
+ */
+internal function handoffServer(Handed $seen) : http::Server
+{
+    http::Server $app = http::Server();
+
+    $app->workers(2);
+    $app->wrap(function(http::Request $req, http::Next $next) : http::Response {
+        http::Response $res = $next->run($req);
+
+        $res->header('X-Layer', 'on');
+        return $res;
+    });
+    $app->get('/hand', function(http::Request $req) : http::Response {
+        return http::Response(handoff: function(http::Handoff $h) : void {
+            int32 $fd = $h->take();
+
+            if ($h->take() == -1) {
+                $seen->again->add(1);
+            }
+
+            $seen->put($h, $fd);
+        });
+    });
+    $app->get('/leave', function(http::Request $req) : http::Response {
+        return http::Response(handoff: function(http::Handoff $h) : void {
+            $seen->ran->add(1);
+        });
+    });
+    $app->get('/hello', function(http::Request $req) : http::Response {
+        return http::Response(text: 'hello');
+    });
+
+    return $app;
+}
+
+/**
+ * Wait until `$app` counts `$n` connections, up to `$ms`.
+ */
+internal function liveReaches(http::Server $app, int32 $n, int32 $ms) : bool
+{
+    int32 $waited = 0;
+
+    while ($waited < $ms) {
+        if ($app->live() == $n) {
+            return true;
+        }
+
+        thread::sleep(5);
+        $waited = $waited + 5;
+    }
+
+    return $app->live() == $n;
+}
+
+/**
+ * A 200 with `$body`, framed by the handoff's own head.
+ */
+internal function answerOn(int32 $fd, http::Handoff $h, const string& $body) : bool
+{
+    http::Headers $headers = http::Headers();
+
+    $headers->set('Content-Type', 'text/plain');
+
+    string $out = $h->head(200, $headers, $body->size() as int64);
+
+    $out->append($body);
+    return http::sendAll($fd, $out);
+}
+
+/**
+ * Read off a taken fd until `$n` bytes are in, or it ends.
+ */
+internal function readFd(int32 $fd, usize $n) : string
+{
+    string $out = '';
+
+    $out->reserve($n + 64);
+
+    while ($out->size() < $n) {
+        isize $got = http::http_recv($fd, $out->spare(), $out->room());
+
+        if ($got <= 0) {
+            return $out;
+        }
+
+        $out->commit($got as usize);
+    }
+
+    return $out;
+}
+
+#[group: "net"]
+test handoff_takes_the_connection_without_a_thread {
+    Handed $seen = Handed();
+    http::Server $app = handoffServer($seen);
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+    string $ask = HANDOFF_ASK;
+
+    // the first bytes of the new protocol travel with the request head
+    $ask->append('early');
+
+    bool $sent = $c->send($ask);
+    bool $handed = waitFor($seen->ran, 1, 2000);
+    http::Handoff $h = $seen->handoff(0);
+    int32 $fd = $seen->fd(0);
+    int32 $countedWhileTaken = $app->live();
+    bool $switched = http::sendAll($fd, TUNNEL_HEAD);
+    string $head = readN($c->conn, $c->pending, TUNNEL_HEAD->size());
+    bool $more = $c->send('ping');
+    string $heard = readFd($fd, 4);
+
+    http::http_close($fd);
+
+    bool $closed = $c->closed();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $handed, 'the callback ran');
+    assert($fd >= 0 && $seen->again->load() == 1, 'take hands the fd out once');
+    assert($h->taken(), 'and says so');
+    assert($h->early == 'early', 'bytes behind the head are the taker\'s');
+    assert($h->method == 'GET' && $h->version == 'HTTP/1.1', 'the request line');
+    assert($h->served == 0 && $h->keep, 'a first request that may be kept');
+    assert($h->peer->starts('127.0.0.1:'), 'the peer');
+    assert(($h->headers->get('X-Layer') ?? '') == 'on', 'a middleware\'s header reaches the taker');
+    assert($countedWhileTaken == 0, 'a taken connection is not counted');
+    assert($switched && $head == TUNNEL_HEAD, 'nothing of libhttp\'s went out before the taker\'s head');
+    assert($more && $heard == 'ping', 'bytes both ways on the taken fd');
+    assert($closed, 'the taker\'s close reaches the client');
+}
+
+#[group: "net"]
+test an_untaken_handoff_is_closed_and_uncounted {
+    Handed $seen = Handed();
+    http::Server $app = handoffServer($seen);
+    thread::handle $srv = serve($app);
+    bool $sent = false;
+    bool $closed = false;
+    string $nothing = '';
+
+    {
+        Client $c = Client($app->port());
+
+        $sent = $c->send("GET /leave HTTP/1.1\r\nHost: x\r\n\r\n");
+        $closed = $c->closed();
+        $nothing = $c->pending;
+    }
+
+    bool $zero = liveReaches($app, 0, 3000);
+    string $after = exchange($app->port(), "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $seen->ran->load() == 1, 'the callback ran');
+    assert($closed && $nothing->empty(), 'the connection closed with nothing written');
+    assert($zero, 'and stopped counting');
+    assert($after->ends('hello'), 'the server still serves');
+}
+
+#[group: "net"]
+test resume_serves_the_next_request_on_the_connection {
+    Handed $seen = Handed();
+    http::Server $app = handoffServer($seen);
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+
+    bool $sent = $c->send("GET /hand HTTP/1.1\r\nHost: x\r\n\r\n");
+    bool $handed = waitFor($seen->ran, 1, 2000);
+    http::Handoff $h = $seen->handoff(0);
+    int32 $fd = $seen->fd(0);
+
+    // the test thread is the taker's loop: answer, then give it back
+    bool $answered = answerOn($fd, $h, 'taken');
+    string $first = $c->response();
+
+    $h->resume('');
+
+    bool $counted = liveReaches($app, 1, 2000);
+    bool $sentNext = $c->send("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    string $second = $c->response();
+
+    // and a second handoff on the same connection knows it is the third request
+    bool $sentThird = $c->send("GET /hand HTTP/1.1\r\nHost: x\r\n\r\n");
+    bool $handedAgain = waitFor($seen->ran, 2, 2000);
+    http::Handoff $again = $seen->handoff(1);
+
+    http::http_close($seen->fd(1));
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $handed && $answered, 'taken and answered');
+    assert($first->starts('HTTP/1.1 200 OK\r\n') && $first->ends('taken'), 'the taker\'s answer');
+    assert($first->contains('Content-Length: 5\r\n') && !$first->contains('X-Layer'), 'framed by its own head and headers');
+    assert(!$first->contains('Connection:'), 'kept, which HTTP/1.1 does not say');
+    assert($counted, 'counted again once resumed');
+    assert($sentNext && $second->starts('HTTP/1.1 200 ') && $second->ends('hello'), 'the next request served on the same connection');
+    assert($sentThird && $handedAgain && $again->served == 2, 'served counts the handed-off request');
+}
+
+#[group: "net"]
+test resume_serves_a_pipelined_request_it_is_given {
+    Handed $seen = Handed();
+    http::Server $app = handoffServer($seen);
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+
+    // two requests in one write: the second is read with the first
+    bool $sent = $c->send("GET /hand HTTP/1.1\r\nHost: x\r\n\r\nGET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    bool $handed = waitFor($seen->ran, 1, 2000);
+    http::Handoff $h = $seen->handoff(0);
+    int32 $fd = $seen->fd(0);
+    bool $answered = answerOn($fd, $h, 'first');
+
+    // a field of the handoff cannot be passed to its own resume: copy it out
+    string $rest = $h->early;
+
+    $h->resume($rest);
+
+    string $first = $c->response();
+    string $second = $c->response();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $handed && $answered, 'taken and answered');
+    assert($h->early == "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n", 'the pipelined request is early bytes');
+    assert($first->ends('first'), 'the taker\'s answer first');
+    assert($second->starts('HTTP/1.1 200 ') && $second->ends('hello'), 'then the request it gave back');
+}
+
+#[group: "net"]
+test resume_past_max_requests_closes {
+    Handed $seen = Handed();
+    http::Server $app = handoffServer($seen);
+
+    $app->maxRequests(1);
+
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+
+    bool $sent = $c->send("GET /hand HTTP/1.1\r\nHost: x\r\n\r\n");
+    bool $handed = waitFor($seen->ran, 1, 2000);
+    http::Handoff $h = $seen->handoff(0);
+    int32 $fd = $seen->fd(0);
+    bool $answered = answerOn($fd, $h, 'last');
+    string $first = $c->response();
+
+    $h->resume('');
+
+    bool $closed = $c->closed();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $handed && $answered, 'taken and answered');
+    assert(!$h->keep, 'the only request allowed may not be kept');
+    assert($first->contains('Connection: close\r\n'), 'and its head says so');
+    assert($closed, 'a resume past maxRequests closes');
+}
+
+#[group: "net"]
+test resume_of_a_closing_connection_closes {
+    Handed $seen = Handed();
+    http::Server $app = handoffServer($seen);
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+
+    bool $sent = $c->send("GET /hand HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    bool $handed = waitFor($seen->ran, 1, 2000);
+    http::Handoff $h = $seen->handoff(0);
+    int32 $fd = $seen->fd(0);
+    bool $answered = answerOn($fd, $h, 'bye');
+    string $first = $c->response();
+
+    // given back anyway: the head said close, so it is not parked
+    $h->resume('');
+
+    bool $closed = $c->closed();
+    bool $zero = liveReaches($app, 0, 3000);
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $handed && $answered, 'taken and answered');
+    assert(!$h->keep, 'a client asking for a close may not be kept');
+    assert($first->contains('Connection: close\r\n'), 'and its head says so');
+    assert($closed, 'a resume of a closing connection closes');
+    assert($zero, 'and stops counting it');
+}
+
+#[group: "net"]
+test stop_does_not_wait_for_handed_off_connections {
+    Handed $seen = Handed();
+    http::Server $app = handoffServer($seen);
+    Done $done = Done();
+    thread::handle $srv = listenInBackground($app, $done);
+    int32 $port = waitPort($app);
+    Client $c = Client($port);
+
+    bool $sent = $c->send("GET /hand HTTP/1.1\r\nHost: x\r\n\r\n");
+    bool $handed = waitFor($seen->ran, 1, 2000);
+    http::Handoff $h = $seen->handoff(0);
+    int32 $fd = $seen->fd(0);
+    time::instant $start = time::instant::now();
+
+    $app->stop();
+
+    bool $returned = waitReturned($done, 3000);
+    time::duration $took = $start->elapsed();
+
+    $srv->join();
+
+    // the taker still has a working connection after the stop
+    bool $answered = answerOn($fd, $h, 'late');
+    string $got = $c->response();
+
+    // giving it back to a stopped server closes it
+    $h->resume('');
+
+    bool $closed = $c->closed();
+
+    assert($sent && $handed, 'taken');
+    assert($returned && $took < time::duration::millis(1000), 'listen returned without waiting on it');
+    assert($answered && $got->ends('late'), 'the taken fd outlives the server');
+    assert($closed, 'and a resume after the stop closes it');
+}
+
+#[group: "net"]
+test handoff_head_for_head_and_http10 {
+    Handed $seen = Handed();
+    http::Server $app = handoffServer($seen);
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+    http::Headers $none = http::Headers();
+
+    $none->set('Date', 'Thu, 01 Jan 1970 00:00:00 GMT');
+
+    bool $sent = $c->send("HEAD /hand HTTP/1.1\r\nHost: x\r\n\r\n");
+    bool $handed = waitFor($seen->ran, 1, 2000);
+    http::Handoff $h = $seen->handoff(0);
+    string $headHead = $h->head(200, $none, -1);
+
+    http::http_close($seen->fd(0));
+
+    Client $old = Client($app->port());
+    bool $sentOld = $old->send("GET /hand HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+    bool $handedOld = waitFor($seen->ran, 2, 2000);
+    http::Handoff $ten = $seen->handoff(1);
+    string $sized = $ten->head(200, $none, 2);
+    string $unsized = $ten->head(200, $none, -1);
+
+    http::http_close($seen->fd(1));
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $handed && $h->method == 'HEAD', 'a HEAD handed over');
+    assert($headHead == 'HTTP/1.1 200 OK\r\nDate: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n', 'HEAD with no length: no chunking, kept');
+    assert($sentOld && $handedOld && $ten->keep && $ten->version == 'HTTP/1.0', 'HTTP/1.0 that asked to be kept');
+    assert($sized->ends('Content-Length: 2\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n\r\n'), 'told yes, and for how long');
+    assert($unsized->ends('GMT\r\nConnection: close\r\n\r\n'), 'an unsized body ends at the close');
+}
+
+test head_matches_what_libhttp_writes {
+    http::Response $res = http::Response(text: 'hello');
+
+    $res->header('Date', 'Thu, 01 Jan 1970 00:00:00 GMT');
+    $res->header('Content-Length', '999');
+    $res->header('X-Bad', "a\r\nb");
+
+    string $ours = http::render($res, false, http::Persist::keep);
+    string $theirs = http::head(200, $res->headers, 5, true, 'HTTP/1.1', 5);
+    string $closing = http::render($res, false, http::Persist::close);
+    string $closed = http::head(200, $res->headers, 5, false, 'HTTP/1.1', 5);
+    string $alive = http::render($res, false, http::Persist::keepAlive(7));
+    string $told = http::head(200, $res->headers, 5, true, 'HTTP/1.0', 7);
+    string $streamed = http::renderHead($res, http::Length::chunked, http::Persist::keep);
+    string $chunkedHead = http::head(200, $res->headers, -1, true, 'HTTP/1.1', 5);
+
+    http::Response $gone = http::Response(410, '');
+
+    $gone->header('Date', 'Thu, 01 Jan 1970 00:00:00 GMT');
+
+    string $goneOurs = http::render($gone, true, http::Persist::close);
+    string $goneTheirs = http::head(410, $gone->headers, 0, false, 'HTTP/1.1', 5);
+    string $unsized10 = http::head(200, $res->headers, -1, true, 'HTTP/1.0', 5);
+    string $noBody = http::head(204, $res->headers, -1, true, 'HTTP/1.0', 5);
+
+    assert($ours == $theirs, 'kept HTTP/1.1, byte for byte');
+    assert($closing == $closed, 'closing, byte for byte');
+    assert($alive == $told, 'kept HTTP/1.0, byte for byte');
+    assert($streamed == $chunkedHead, 'unsized over HTTP/1.1 is chunked');
+    assert($goneOurs == $goneTheirs && $goneTheirs->starts('HTTP/1.1 410 Gone\r\n'), 'the reason phrase');
+    assert(!$theirs->contains('999') && !$theirs->contains('X-Bad'), 'framing and broken headers dropped');
+    assert($unsized10->contains('Connection: close\r\n') && !$unsized10->contains('chunked'), 'unsized over HTTP/1.0 closes');
+    assert(!$noBody->contains('Connection: close') && !$noBody->contains('Content-Length'), 'a 204 has no body to delimit');
+}
+
+test chunks_match_what_libhttp_writes {
+    assert(http::chunk('hello') == '5\r\nhello\r\n', 'size in hex, then the bytes');
+    assert(http::chunk('0123456789abcdef') == '10\r\n0123456789abcdef\r\n', 'hex');
+    assert(http::chunk('') == '', 'an empty chunk would end the body');
+    assert(http::lastChunk() == '0\r\n\r\n', 'the end');
+}
+
+test backlog_is_clamped_and_kept {
+    http::Server $app = http::Server();
+    int32 $default = $app->backlog();
+
+    $app->backlog(0);
+
+    int32 $clamped = $app->backlog();
+
+    $app->backlog(64);
+
+    assert($default == 4096, 'default 4096');
+    assert($clamped == 1, 'at least one');
+    assert($app->backlog() == 64, 'kept');
+}
+
+#[group: "net"]
+test a_small_backlog_still_serves {
+    http::Server $app = plainServer();
+
+    $app->backlog(1);
+
+    thread::handle $srv = serve($app);
+    string $got = exchange($app->port(), PLAIN_GET);
+
+    $app->stop();
+    $srv->join();
+
+    assert($got->starts('HTTP/1.1 200 '), 'served');
+}
+
+#[group: "net"]
+test resumes_racing_a_stop_all_close {
+    Handed $seen = Handed();
+    http::Server $app = handoffServer($seen);
+    Done $done = Done();
+    thread::handle $srv = listenInBackground($app, $done);
+    int32 $port = waitPort($app);
+    array<Client> $clients = array<Client>();
+    int32 $n = 20;
+    int32 $i = 0;
+
+    while ($i < $n) {
+        Client $c = Client($port);
+
+        $c->send("GET /hand HTTP/1.1\r\nHost: x\r\n\r\n");
+        $clients[] = $c;
+        $i = $i + 1;
+    }
+
+    bool $handed = waitFor($seen->ran, $n, 3000);
+
+    // give every connection back from another thread while the server stops
+    thread::handle $giver = guard thread::spawn(function() : void {
+        int32 $k = 0;
+
+        while ($k < $n) {
+            $seen->handoff($k as usize)->resume('');
+            $k = $k + 1;
+        }
+    }) else ($e) {
+        die($e->message());
+    }
+
+    $app->stop();
+    $giver->join();
+
+    bool $returned = waitReturned($done, 3000);
+    int32 $closed = 0;
+
+    $srv->join();
+    $i = 0;
+
+    while ($i < $n) {
+        if ($clients[$i as usize]->closed()) {
+            $closed = $closed + 1;
+        }
+
+        $i = $i + 1;
+    }
+
+    assert($handed, 'every connection taken');
+    assert($returned, 'listen returned');
+    assert($closed == $n, 'each one closed, parked before the stop or after');
+}
+
+#[group: "handoff"]
+test shut_waits_for_a_resume_in_progress {
+    http::Shared $shared = http::Shared();
+    Done $done = Done();
+
+    // a resume counted itself and is parking
+    $shared->resuming->add(1);
+
+    thread::handle $t = guard thread::spawn(function() : void {
+        $shared->shut();
+        $done->returned->store(true);
+    }) else ($e) {
+        die($e->message());
+    }
+
+    thread::sleep(50);
+
+    bool $waited = !$done->returned->load();
+    bool $stoppingAlready = $shared->stopping->load();
+
+    $shared->resuming->sub(1);
+    $t->join();
+
+    assert($waited, 'shut did not return while a resume was parking');
+    assert($stoppingAlready, 'yet later resumes already see it');
+    assert($done->returned->load(), 'and returned once the resume was done');
+}
+
+#[group: "handoff"]
+test set_blocking_clears_only_the_nonblocking_flag {
+    string $host = '127.0.0.1';
+    int32 $lfd = http::http_listen($host->cstr(), 0, 16);
+    http::Conn $c = dialOrDie(http::http_port($lfd));
+    int32 $waiting = http::http_wait($lfd, 1, 1000);
+    string $peer = '';
+
+    $peer->reserve(64);
+
+    ptr<uint8> $dst = $peer->spare();
+    int32 $fd = http::http_accept_one($lfd, $dst, 64);
+    int32 $already = http::http_set_blocking($fd, 1);
+
+    http::http_set_blocking($fd, 0);
+
+    // non-blocking: a read with nothing there answers at once
+    string $buf = '';
+
+    $buf->reserve(16);
+
+    ptr<uint8> $into = $buf->spare();
+    isize $nothing = http::http_recv($fd, $into, 16);
+    int32 $restored = http::http_set_blocking($fd, 1);
+
+    // blocking again: the client's byte is what wakes this read
+    bool $sent = $c->writeAll('x');
+    isize $got = http::http_recv($fd, $into, 16);
+
+    http::http_close($fd);
+    http::http_close($lfd);
+
+    assert($waiting == 1 && $fd >= 0, 'accepted');
+    assert($already == 0, 'a blocking fd stays as it is');
+    assert($nothing < 0, 'non-blocking in between');
+    assert($restored == 0 && $sent && $got == 1, 'blocking again after set_blocking');
+}
