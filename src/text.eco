@@ -48,6 +48,7 @@ internal const int32 DEFAULT_MAX_CONNECTIONS = 1024;
 internal const int32 DEFAULT_BACKLOG = 4096;
 internal const usize DEFAULT_MESSAGE_CAP = 1048576;
 internal const int64 PING_INTERVAL_SECS = 30;
+internal const int64 BEAT_INTERVAL_SECS = 15;
 internal const int64 CLOSE_WAIT_SECS = 5;
 
 // lingering close: how long, and how much, before the reactor gives up

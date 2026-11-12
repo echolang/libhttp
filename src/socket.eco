@@ -124,13 +124,7 @@ public class Socket
     public const Request $request;
     public const string $protocol;
     private int64 $serial;
-    private thread::mutex<int32> $fd;
-
-    // a close frame has gone out. no more data frames may follow it
-    private atomic<bool> $closing;
-
-    // a send failed. the client is gone or stopped reading
-    private atomic<bool> $broken;
+    private Wire $wire;
     private Shared $shared;
 
     internal constructor(int32 $fd, const Request& $request, const string& $protocol, Shared $shared)
@@ -138,9 +132,7 @@ public class Socket
         $this->request = $request;
         $this->protocol = $protocol;
         $this->serial = $shared->sockets->add(1) + 1;
-        $this->fd = thread::mutex<int32>($fd);
-        $this->closing = atomic<bool>(false);
-        $this->broken = atomic<bool>(false);
+        $this->wire = Wire($fd);
         $this->shared = $shared;
     }
 
@@ -198,7 +190,7 @@ public class Socket
      */
     public const function open() : bool
     {
-        return !$this->closing->load() && !$this->broken->load() && !$this->shared->stopping->load();
+        return !$this->wire->closing() && !$this->wire->broken() && !$this->shared->stopping->load();
     }
 
     /**
@@ -207,7 +199,7 @@ public class Socket
      */
     internal function shut(int32 $code, const string& $reason) : void
     {
-        if ($this->closing->exchange(true)) {
+        if (!$this->wire->shut()) {
             return;
         }
 
@@ -221,12 +213,12 @@ public class Socket
 
     internal const function closing() : bool
     {
-        return $this->closing->load();
+        return $this->wire->closing();
     }
 
     internal const function broken() : bool
     {
-        return $this->broken->load();
+        return $this->wire->broken();
     }
 
     /**
@@ -235,7 +227,7 @@ public class Socket
      */
     internal function frame(uint8 $op, const string& $payload) : bool
     {
-        return $this->write(encode($op, $payload));
+        return $this->wire->write(encode($op, $payload));
     }
 
     /**
@@ -243,56 +235,17 @@ public class Socket
      */
     internal function deliver(const string& $bytes) : bool
     {
-        return !$this->closing->load() && $this->write($bytes);
+        return $this->wire->deliver($bytes);
     }
 
-    /**
-     * Encoded frames onto the wire, under the lock so frames from two threads
-     * never interleave.
-     */
-    private function write(const string& $bytes) : bool
-    {
-        thread::locked<int32> $held = $this->fd->lock();
-
-        if ($held->value < 0) {
-            return false;
-        }
-
-        if (!sendAll($held->value, $bytes)) {
-            $this->broken->store(true);
-            return false;
-        }
-
-        return true;
-    }
-
-    /**
-     * Closes the connection with a lingering close. Only the connection's
-     * owner calls this, once; every send after it answers false.
-     */
     internal function release() : void
     {
-        // the lingering close can wait seconds: it happens outside the lock,
-        // so a broadcast never waits on it
-        int32 $fd = $this->take();
-
-        if ($fd >= 0) {
-            http_finish($fd);
-        }
+        $this->wire->release();
     }
 
-    /**
-     * Takes the descriptor for the caller to close. Only the connection's
-     * owner calls this, once; every send after it answers false. -1 when
-     * it was already taken.
-     */
     internal function take() : int32
     {
-        thread::locked<int32> $held = $this->fd->lock();
-        int32 $fd = $held->value;
-
-        $held->value = -1;
-        return $fd;
+        return $this->wire->take();
     }
 }
 

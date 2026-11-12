@@ -10,7 +10,9 @@
  * client is slow to take is finished here too, on write interest, so the
  * worker that rendered it is free again. Open websockets sit
  * in their own map; a whole message, ping, close, or bad frame goes to
- * a worker. A pong only resets the quiet clock.
+ * a worker. A pong only resets the quiet clock. Open event streams sit
+ * in a map of their own too; the client leaving, a heartbeat due, or the
+ * server closing one goes to a worker.
  */
 
 use std::io;
@@ -76,6 +78,7 @@ internal class Reactor
 
     private map<int32, Slot> $slots;
     private map<int32, WsConn> $sockets;
+    private map<int32, OutletConn> $outlets;
     private map<int32, Linger> $lingering;
 
     // responses a worker handed over half written, armed for writing
@@ -124,6 +127,7 @@ internal class Reactor
         $this->checked = false;
         $this->slots = map<int32, Slot>();
         $this->sockets = map<int32, WsConn>();
+        $this->outlets = map<int32, OutletConn>();
         $this->lingering = map<int32, Linger>();
         $this->outbound = map<int32, Outbound>();
         $this->active = map<int32, bool>();
@@ -155,7 +159,7 @@ internal class Reactor
             // and a paused listen need it every SWEEP_MS
             if (!$this->active->empty() || !$this->lingering->empty() || $this->paused) {
                 $wait = SWEEP_MS;
-            } else if (!$this->slots->empty() || !$this->sockets->empty() || !$this->outbound->empty() || $this->shared->live->load() > 0) {
+            } else if (!$this->slots->empty() || !$this->sockets->empty() || !$this->outlets->empty() || !$this->outbound->empty() || $this->shared->live->load() > 0) {
                 $wait = $this->idleTick->as_millis() as int32;
             }
 
@@ -227,6 +231,16 @@ internal class Reactor
 
         while ($i < $n) {
             $this->hand($open[$i], WsEvent::goingAway);
+            $i = $i + 1;
+        }
+
+        array<int32> $streams = $this->outlets->keys();
+
+        $n = $streams->count();
+        $i = 0;
+
+        while ($i < $n) {
+            $this->handOutlet($streams[$i], OutletEvent::goingAway);
             $i = $i + 1;
         }
 
@@ -332,6 +346,11 @@ internal class Reactor
                 return;
             }
 
+            if ($this->outlets->has($fd)) {
+                $this->outletReadable($fd);
+                return;
+            }
+
             if ($this->lingering->has($fd)) {
                 $this->lingerReadable($fd);
                 return;
@@ -431,6 +450,9 @@ internal class Reactor
                         },
                         Back::socket($ws) => {
                             $this->adoptSocket($ws);
+                        },
+                        Back::outlet($oc) => {
+                            $this->adoptOutlet($oc);
                         },
                         Back::linger($fd) => {
                             $this->lingerHere($fd);
@@ -736,6 +758,45 @@ internal class Reactor
         }
     }
 
+    private function adoptOutlet(OutletConn $oc) : void
+    {
+        int32 $fd = $oc->fd;
+
+        $this->outlets[$fd] = $oc;
+        $this->armOutlet($fd);
+    }
+
+    /**
+     * A client of an event stream sends nothing. Whatever it does send is
+     * read and dropped; its end of the connection closing ends the stream.
+     */
+    private function outletReadable(int32 $fd) : void
+    {
+        if (http_drain_now($fd) < 0) {
+            $this->handOutlet($fd, OutletEvent::gone);
+            return;
+        }
+
+        $this->armOutlet($fd);
+    }
+
+    /**
+     * Take the outlet off this reactor and give a worker `$event`.
+     */
+    private function handOutlet(int32 $fd, OutletEvent $event) : void
+    {
+        OutletConn $oc = $this->outlets->take($fd);
+
+        $this->jobs->send(Job::outlet(mv $oc, $event));
+    }
+
+    private function armOutlet(int32 $fd) : void
+    {
+        if (http_ev_arm($this->ev, $fd, 1) != 0) {
+            $this->handOutlet($fd, OutletEvent::gone);
+        }
+    }
+
     /**
      * Drop idle connections, 408 slow requests, ping quiet websockets.
      * Requests in progress and lingering closes every SWEEP_MS; idle
@@ -764,6 +825,7 @@ internal class Reactor
             $this->adoptInbox();
             $this->sweepSlots($now);
             $this->sweepSockets();
+            $this->sweepOutlets();
 
             if (!$this->outbound->empty()) {
                 $this->sweepOutbound($now);
@@ -922,6 +984,36 @@ internal class Reactor
         }
     }
 
+    /**
+     * Heartbeats that are due, outlets the server closed, and ones a send
+     * found broken.
+     */
+    private function sweepOutlets() : void
+    {
+        if ($this->outlets->empty()) {
+            return;
+        }
+
+        array<int32> $open = $this->outlets->keys();
+        usize $n = $open->count();
+        usize $i = 0;
+
+        while ($i < $n) {
+            int32 $fd = $open[$i];
+
+            $i = $i + 1;
+
+            OutletEvent $due = guard $this->outlets->at($fd)->due($this->limits->beatInterval) else {
+                continue;
+            }
+
+            // armed while it was waiting: it must not report to the reactor
+            // once a worker owns it
+            http_ev_drop($this->ev, $fd);
+            $this->handOutlet($fd, $due);
+        }
+    }
+
     private function arm(int32 $fd) : void
     {
         if (http_ev_arm($this->ev, $fd, 1) != 0) {
@@ -944,9 +1036,9 @@ internal class Reactor
 }
 
 /**
- * How often idle connections and websockets are looked at: a fifth of the
- * shorter of the idle timeout and the ping interval, between SWEEP_MS and
- * IDLE_SWEEP_MS.
+ * How often idle connections, websockets and event streams are looked at:
+ * a fifth of the shortest of the idle timeout, the ping interval and the
+ * beat interval, between SWEEP_MS and IDLE_SWEEP_MS.
  */
 internal function idleTickFor(const Limits& $limits) : time::duration
 {
@@ -957,16 +1049,30 @@ internal function idleTickFor(const Limits& $limits) : time::duration
         $tick = $idle;
     }
 
-    if ($limits->pingInterval > time::duration::zero()) {
-        time::duration $ping = $limits->pingInterval / IDLE_SWEEP_SHARE;
-
-        if ($ping < $tick) {
-            $tick = $ping;
-        }
-    }
+    $tick = shorterTick($tick, $limits->pingInterval);
+    $tick = shorterTick($tick, $limits->beatInterval);
 
     if ($tick < time::duration::millis(SWEEP_MS)) {
         $tick = time::duration::millis(SWEEP_MS);
+    }
+
+    return $tick;
+}
+
+/**
+ * `$tick`, or a fifth of `$interval` if that is shorter. A zero interval
+ * is off and never shortens it.
+ */
+internal function shorterTick(time::duration $tick, time::duration $interval) : time::duration
+{
+    if ($interval <= time::duration::zero()) {
+        return $tick;
+    }
+
+    time::duration $share = $interval / IDLE_SWEEP_SHARE;
+
+    if ($share < $tick) {
+        return $share;
     }
 
     return $tick;
@@ -997,6 +1103,9 @@ internal function drainReturned(thread::receiver<Back> $back, Inbox $inbox, Shar
                     Back::socket($ws) => {
                         // no worker left; onClose still has to run once
                         goAway($ws, $shared);
+                    },
+                    Back::outlet($oc) => {
+                        outletAway($oc, $shared);
                     },
                     Back::rearm($fd) => {
                         // the slot it names was closed with the rest. nothing to rearm

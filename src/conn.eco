@@ -4,6 +4,8 @@
  * A class so `result<Conn, Error>` can hand one back without a move.
  */
 
+use std::thread;
+
 namespace http;
 
 internal class Conn
@@ -169,4 +171,114 @@ internal function sendRange(int32 $fd, const string& $bytes, usize $from, usize 
 internal function sendAll(int32 $fd, const string& $bytes) : bool
 {
     return sendRange($fd, $bytes, 0, $bytes->size());
+}
+
+/**
+ * The sending side of a connection any thread may write to: an open
+ * websocket, an event stream. The fd is locked, so writes from two threads
+ * never interleave, and only the connection's owner takes it, so a
+ * broadcast never writes a recycled descriptor.
+ */
+#[atomic]
+internal class Wire
+{
+    private thread::mutex<int32> $fd;
+
+    // the protocol's last word went out. nothing but control may follow it
+    private atomic<bool> $closing;
+
+    // a send failed. the client is gone or stopped reading
+    private atomic<bool> $broken;
+
+    // taken: the connection is closed or about to be
+    private atomic<bool> $ended;
+
+    public constructor(int32 $fd)
+    {
+        $this->fd = thread::mutex<int32>($fd);
+        $this->closing = atomic<bool>(false);
+        $this->broken = atomic<bool>(false);
+        $this->ended = atomic<bool>(false);
+    }
+
+    /**
+     * Marks it closing. True only the first time, for the one caller that
+     * sends the last word.
+     */
+    public function shut() : bool
+    {
+        return !$this->closing->exchange(true);
+    }
+
+    public const function closing() : bool
+    {
+        return $this->closing->load();
+    }
+
+    public const function broken() : bool
+    {
+        return $this->broken->load();
+    }
+
+    public const function ended() : bool
+    {
+        return $this->ended->load();
+    }
+
+    /**
+     * Bytes onto the wire, unless it is closing.
+     */
+    public function deliver(const string& $bytes) : bool
+    {
+        return !$this->closing->load() && $this->write($bytes);
+    }
+
+    /**
+     * Bytes onto the wire, closing or not, under the lock.
+     */
+    public function write(const string& $bytes) : bool
+    {
+        thread::locked<int32> $held = $this->fd->lock();
+
+        if ($held->value < 0) {
+            return false;
+        }
+
+        if (!sendAll($held->value, $bytes)) {
+            $this->broken->store(true);
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Closes the connection with a lingering close. Only the connection's
+     * owner calls this, once; every send after it answers false.
+     */
+    public function release() : void
+    {
+        // the lingering close can wait seconds: it happens outside the lock,
+        // so a broadcast never waits on it
+        int32 $fd = $this->take();
+
+        if ($fd >= 0) {
+            http_finish($fd);
+        }
+    }
+
+    /**
+     * Takes the descriptor for the caller to close. Only the connection's
+     * owner calls this, once; every send after it answers false. -1 when
+     * it was already taken.
+     */
+    public function take() : int32
+    {
+        thread::locked<int32> $held = $this->fd->lock();
+        int32 $fd = $held->value;
+
+        $held->value = -1;
+        $this->ended->store(true);
+        return $fd;
+    }
 }

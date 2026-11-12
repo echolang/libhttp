@@ -1,0 +1,312 @@
+/**
+ * Server-sent events over loopback: outlets parked on the reactor, sent
+ * to from the test thread, heartbeats, the client leaving, the server
+ * stopping.
+ */
+
+use std::thread;
+use std::time;
+
+/**
+ * Where a feed's hooks leave what they saw, for the test thread to read.
+ */
+#[atomic]
+internal class Taps
+{
+    public atomic<int32> $opened;
+    public atomic<int32> $closes;
+    private thread::mutex<array<http::Outlet>> $outlets;
+
+    public constructor()
+    {
+        $this->opened = atomic<int32>(0);
+        $this->closes = atomic<int32>(0);
+        $this->outlets = thread::mutex<array<http::Outlet>>(array<http::Outlet>());
+    }
+
+    public function add(http::Outlet $o) : void
+    {
+        thread::locked<array<http::Outlet>> $held = $this->outlets->lock();
+
+        $held->value->push($o);
+    }
+
+    public function all() : array<http::Outlet>
+    {
+        thread::locked<array<http::Outlet>> $held = $this->outlets->lock();
+
+        return $held->value->clone();
+    }
+
+    /**
+     * Sends `$e` to every outlet; how many it reached.
+     */
+    public function send(const http::Event& $e) : int32
+    {
+        int32 $n = 0;
+
+        foreach ($this->all() as $o) {
+            if ($o->send($e)) {
+                $n = $n + 1;
+            }
+        }
+
+        return $n;
+    }
+}
+
+internal function tapFeed(Taps $taps) : http::Feed
+{
+    http::Feed $f = http::Feed();
+
+    $f->onOpen(function(http::Outlet $o) : void {
+        $taps->add($o);
+        $taps->opened->add(1);
+        $o->send(http::Event('hello', $event: 'welcome', $id: $o->request->query->get('who') ?? 'nobody'));
+    });
+    $f->onClose(function(http::Outlet $o) : void {
+        $taps->closes->add(1);
+    });
+
+    return $f;
+}
+
+internal function sseServer(Taps $taps, int32 $workers) : http::Server
+{
+    http::Server $app = http::Server();
+
+    http::Feed $feed = tapFeed($taps);
+
+    $app->workers($workers);
+    $app->get('/events', function(http::Request $req) : http::Response {
+        return http::Response(events: $feed);
+    });
+    $app->get('/hello', function(http::Request $req) : http::Response {
+        return http::Response(text: 'hello');
+    });
+
+    return $app;
+}
+
+/**
+ * A test's side of one event stream: the request sent, nothing read yet.
+ */
+internal function subscribe(int32 $port, const string& $target, const string& $version = 'HTTP/1.1') : Client
+{
+    Client $c = Client($port);
+    bool $sent = $c->send("GET {$target} {$version}\r\nHost: x\r\n\r\n");
+
+    assert($sent, 'sent the request');
+    return $c;
+}
+
+/**
+ * Reads until `$text` has arrived, up to two seconds. Whether it did.
+ */
+internal function until(Client $c, const string& $text) : bool
+{
+    time::instant $start = time::instant::now();
+
+    while (!$c->pending->contains($text)) {
+        if ($start->elapsed() > time::duration::secs(2) || !fill($c->conn, $c->pending)) {
+            return $c->pending->contains($text);
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Reads to the end of the connection, up to the socket's timeout.
+ */
+internal function drain(Client $c) : void
+{
+    while (fill($c->conn, $c->pending)) {
+    }
+}
+
+test event_encodes_its_fields_and_lines {
+    http::Event $e = http::Event('one\ntwo\r\nthree', $event: 'ti\nck', $id: '7', $retry: time::duration::millis(2500));
+    string $wire = $e->encode();
+
+    assert($wire == 'id: 7\nevent: tick\nretry: 2500\ndata: one\ndata: two\ndata: three\n\n', 'fields, then a data line per line');
+    assert(http::Event('')->encode() == '\n', 'no data, no data line');
+
+    http::Event $retry = http::Event('', $retry: time::duration::secs(2));
+
+    assert($retry->encode() == 'retry: 2000\n\n', 'a retry alone');
+}
+
+#[group: "net"]
+test sse_head_then_events_from_another_thread {
+    Taps $taps = Taps();
+    http::Server $app = sseServer($taps, 2);
+    thread::handle $srv = serve($app);
+    Client $l = subscribe($app->port(), '/events?who=ann');
+    bool $welcome = until($l, 'data: hello\n\n');
+    bool $opened = waitFor($taps->opened, 1, 2000);
+    int32 $reached = $taps->send(http::Event('{"n":1}', $event: 'tick'));
+    bool $tick = until($l, 'event: tick\ndata: {"n":1}\n\n');
+
+    $app->stop();
+    $srv->join();
+
+    assert($l->pending->starts('HTTP/1.1 200 OK\r\n'), '200');
+    assert($l->pending->contains('Content-Type: text/event-stream\r\n'), 'the type');
+    assert($l->pending->contains('Cache-Control: no-store\r\n'), 'never cached');
+    assert($l->pending->contains('Transfer-Encoding: chunked\r\n'), 'chunked');
+    assert($welcome && $l->pending->contains('id: ann\nevent: welcome\n'), 'onOpen sent, with the request it was opened by');
+    assert($opened && $reached == 1 && $tick, 'a send from the test thread arrived');
+}
+
+#[group: "net"]
+test sse_outlets_hold_no_worker {
+    Taps $taps = Taps();
+    http::Server $app = sseServer($taps, 2);
+    thread::handle $srv = serve($app);
+    int32 $port = $app->port();
+    array<Client> $open = array<Client>();
+    int32 $i = 0;
+
+    while ($i < 64) {
+        $open->push(subscribe($port, '/events'));
+        $i = $i + 1;
+    }
+
+    bool $all = waitFor($taps->opened, 64, 2000);
+    time::instant $start = time::instant::now();
+    string $got = exchange($port, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    time::duration $took = $start->elapsed();
+    int32 $reached = $taps->send(http::Event('all'));
+    bool $last = until($open[63], 'data: all\n\n');
+
+    $app->stop();
+    $srv->join();
+
+    assert($all, '64 streams open on 2 workers');
+    assert($got->ends('hello') && $took < time::duration::millis(500), 'a worker was free for a request');
+    assert($reached == 64 && $last, 'every stream still takes events');
+}
+
+#[group: "net"]
+test sse_client_leaving_is_noticed_without_a_send {
+    Taps $taps = Taps();
+    http::Server $app = sseServer($taps, 1);
+    thread::handle $srv = serve($app);
+
+    {
+        Client $l = subscribe($app->port(), '/events');
+        bool $welcome = until($l, 'data: hello');
+
+        assert($welcome, 'open first');
+    }
+
+    // the listener is dropped: its socket closed, nothing sent since
+    bool $closed = waitFor($taps->closes, 1, 2000);
+    bool $dead = !$taps->all()[0]->open();
+
+    $app->stop();
+    $srv->join();
+
+    assert($closed, 'onClose ran once the client left');
+    assert($dead, 'and the outlet says so');
+    assert($taps->closes->load() == 1, 'once');
+}
+
+#[group: "net"]
+test sse_beats_keep_a_quiet_stream_alive {
+    Taps $taps = Taps();
+    http::Server $app = sseServer($taps, 1);
+
+    $app->beatInterval(time::duration::millis(300));
+
+    thread::handle $srv = serve($app);
+    Client $l = subscribe($app->port(), '/events');
+    bool $beat = until($l, ': beat\n\n');
+
+    $app->stop();
+    $srv->join();
+
+    assert($beat, 'a heartbeat comment within a beat interval or two');
+}
+
+#[group: "net"]
+test sse_server_close_ends_the_stream {
+    Taps $taps = Taps();
+    http::Server $app = sseServer($taps, 1);
+    thread::handle $srv = serve($app);
+    Client $l = subscribe($app->port(), '/events');
+    bool $welcome = until($l, 'data: hello');
+    bool $opened = waitFor($taps->opened, 1, 2000);
+    http::Outlet $o = $taps->all()[0];
+
+    $o->close();
+
+    bool $sent = $o->send(http::Event('late'));
+
+    drain($l);
+
+    bool $closed = waitFor($taps->closes, 1, 2000);
+
+    $app->stop();
+    $srv->join();
+
+    assert($welcome && $opened, 'open first');
+    assert(!$sent && !$o->open(), 'nothing goes out after the close');
+    assert($l->pending->ends('\r\n0\r\n\r\n'), 'the last chunk, then the connection ended');
+    assert($closed, 'onClose ran');
+}
+
+#[group: "net"]
+test sse_stop_closes_every_outlet {
+    Taps $taps = Taps();
+    http::Server $app = sseServer($taps, 1);
+    thread::handle $srv = serve($app);
+    Client $a = subscribe($app->port(), '/events');
+    Client $b = subscribe($app->port(), '/events');
+    bool $opened = waitFor($taps->opened, 2, 2000);
+
+    $app->stop();
+    $srv->join();
+    drain($a);
+
+    assert($opened, 'two open');
+    assert($taps->closes->load() == 2, 'onClose ran for both before listen returned');
+    assert($a->pending->ends('\r\n0\r\n\r\n'), 'ended with the last chunk');
+}
+
+#[group: "net"]
+test sse_to_http10_is_raw_and_ends_at_the_close {
+    Taps $taps = Taps();
+    http::Server $app = sseServer($taps, 1);
+    thread::handle $srv = serve($app);
+    Client $l = subscribe($app->port(), '/events?who=old', 'HTTP/1.0');
+    bool $welcome = until($l, 'id: old\nevent: welcome\ndata: hello\n\n');
+
+    $app->stop();
+    $srv->join();
+    drain($l);
+
+    assert($welcome, 'the event, unframed');
+    assert(!$l->pending->contains('Transfer-Encoding'), 'not chunked');
+    assert($l->pending->contains('Connection: close\r\n'), 'the close ends it');
+}
+
+#[group: "net"]
+test sse_head_gets_the_head_alone {
+    Taps $taps = Taps();
+    http::Server $app = sseServer($taps, 1);
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+    bool $sent = $c->send("HEAD /events HTTP/1.1\r\nHost: x\r\n\r\n");
+    string $got = $c->headResponse();
+    bool $closed = $c->closed();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent && $got->starts('HTTP/1.1 200 OK\r\n'), '200');
+    assert($got->contains('Content-Type: text/event-stream\r\n'), 'the type');
+    assert($closed, 'closed after the head');
+    assert($taps->opened->load() == 0, 'no outlet opened');
+}

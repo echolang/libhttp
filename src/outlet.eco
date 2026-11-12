@@ -1,0 +1,434 @@
+/**
+ * Server-sent events without a worker per stream.
+ *
+ * `Response(events: $feed)` writes the head, runs `onOpen` with an
+ * `Outlet`, and parks the connection on the reactor like an open
+ * websocket. Anything holding the outlet sends from any thread. The
+ * reactor notices a client that left as soon as its side closes, writes
+ * a `: beat` comment every `beatInterval`, and hands the connection to a
+ * worker only for that, for the end, and for `onClose`.
+ */
+
+use std::time;
+
+namespace http;
+
+/**
+ * One server-sent event. `$data` may span lines; each goes out as its own
+ * `data:` line. Empty data writes none, for an event that only sets the
+ * `retry` or the `id`. A line break inside `$id` or `$event` is dropped.
+ */
+public struct Event
+{
+    public string $data;
+    public string? $event = null;
+    public string? $id = null;
+
+    // how long the client waits before it reconnects, or null to leave it
+    public time::duration? $retry = null;
+
+    /**
+     * The event as the stream carries it, through the blank line that ends it.
+     */
+    public const function encode() : string
+    {
+        string $out = '';
+
+        appendField($out, 'id', $this->id);
+        appendField($out, 'event', $this->event);
+
+        if ($this->retry != null) {
+            time::duration $wait = guard $this->retry;
+            int64 $ms = $wait->as_millis() as int64;
+
+            $out->append("retry: {$ms}\n");
+        }
+
+        // no data, no data line: a field only event (a retry, an id) that
+        // clients do not dispatch
+        if (!$this->data->empty()) {
+            str::parts $lines = str::split($this->data, "\n");
+            usize $n = $lines->count();
+            usize $i = 0;
+
+            $out->reserve($out->size() + $this->data->size() + 7 * $n + 1);
+
+            while ($i < $n) {
+                string::view $line = $lines->at($i);
+                usize $size = $line->size;
+
+                $i = $i + 1;
+
+                if ($size > 0 && $line->sub($size - 1, 1) == "\r") {
+                    $size = $size - 1;
+                }
+
+                $out->append('data: ');
+                $out->append($line->data(), $size);
+                $out->append('\n');
+            }
+        }
+
+        $out->append("\n");
+        return $out;
+    }
+}
+
+/**
+ * `$name: $value` on a line of its own, unless `$value` is null.
+ */
+internal function appendField(string& $out, const string& $name, string? $value) : void
+{
+    string $v = guard $value else {
+        return;
+    }
+
+    $out->append($name);
+    $out->append(': ');
+    $out->append(oneLine($v));
+    $out->append('\n');
+}
+
+/**
+ * `$s` with CR, LF and NUL taken out, for a field that must stay on one line.
+ */
+internal function oneLine(const string& $s) : string
+{
+    if (headerSafe($s)) {
+        return $s;
+    }
+
+    return str::replace(str::replace(str::replace($s, "\r", ''), "\n", ''), "\u{0}", '');
+}
+
+/**
+ * What a server-sent event response opens: the hooks for each outlet.
+ * Register them before the server answers.
+ */
+#[atomic]
+public class Feed
+{
+    private function<void(Outlet)>? $openHook;
+    private function<void(Outlet)>? $closeHook;
+
+    public constructor()
+    {
+        $this->openHook = null;
+        $this->closeHook = null;
+    }
+
+    /**
+     * Runs on a worker once the head is out. Keep the outlet to send on it
+     * later; do not loop here, it holds the worker.
+     */
+    public function onOpen(function<void(Outlet)> $fn) : void
+    {
+        $this->openHook = $fn;
+    }
+
+    /**
+     * Runs once per opened outlet when it ends: the client left, it was
+     * closed, or the server is stopping.
+     */
+    public function onClose(function<void(Outlet)> $fn) : void
+    {
+        $this->closeHook = $fn;
+    }
+
+    internal function runOpen(Outlet $o) : void
+    {
+        function<void(Outlet)> $fn = guard $this->openHook else {
+            return;
+        }
+
+        $fn($o);
+    }
+
+    internal function runClose(Outlet $o) : void
+    {
+        function<void(Outlet)> $fn = guard $this->closeHook else {
+            return;
+        }
+
+        $fn($o);
+    }
+}
+
+/**
+ * One open server-sent event stream. `$request` is the one that opened it.
+ * Safe from any thread; sends from two threads never interleave.
+ */
+#[atomic]
+public class Outlet
+{
+    public const Request $request;
+    private int64 $serial;
+    private Wire $wire;
+
+    // HTTP/1.1 frames each send as a chunk; HTTP/1.0 sends raw and ends at the close
+    private bool $chunked;
+    private Shared $shared;
+
+    internal constructor(int32 $fd, const Request& $request, bool $chunked, Shared $shared)
+    {
+        $this->request = $request;
+        $this->serial = $shared->sockets->add(1) + 1;
+        $this->wire = Wire($fd);
+        $this->chunked = $chunked;
+        $this->shared = $shared;
+    }
+
+    /**
+     * Number no other outlet or websocket of this `listen` has.
+     */
+    public const function id() : int64
+    {
+        return $this->serial;
+    }
+
+    /**
+     * Send one event. False if closed, the client is gone, or the send failed.
+     */
+    public function send(const Event& $e) : bool
+    {
+        return $this->deliver($e->encode());
+    }
+
+    /**
+     * Send a comment line, which clients ignore. False the same way as `send`.
+     */
+    public function comment(const string& $text) : bool
+    {
+        string $clean = oneLine($text);
+
+        return $this->deliver(": {$clean}\n\n");
+    }
+
+    /**
+     * End the stream: the last chunk goes out and the connection closes.
+     * `onClose` runs shortly after, on a worker.
+     */
+    public function close() : void
+    {
+        if ($this->wire->shut() && $this->chunked) {
+            $this->wire->write(lastChunk());
+        }
+    }
+
+    /**
+     * True if a send still reaches anyone.
+     */
+    public const function open() : bool
+    {
+        return !$this->wire->closing() && !$this->wire->broken() && !$this->wire->ended() && !$this->shared->stopping->load();
+    }
+
+    internal const function closing() : bool
+    {
+        return $this->wire->closing();
+    }
+
+    internal const function broken() : bool
+    {
+        return $this->wire->broken();
+    }
+
+    /**
+     * The heartbeat comment, already framed.
+     */
+    internal function beat() : bool
+    {
+        if ($this->chunked) {
+            return $this->wire->deliver('8\r\n: beat\n\n\r\n');
+        }
+
+        return $this->wire->deliver(': beat\n\n');
+    }
+
+    /**
+     * An event's bytes onto the wire, framed, unless the stream was closed.
+     */
+    internal function deliver(const string& $bytes) : bool
+    {
+        if ($this->chunked) {
+            return $this->wire->deliver(chunk($bytes));
+        }
+
+        return $this->wire->deliver($bytes);
+    }
+
+    internal function release() : void
+    {
+        $this->wire->release();
+    }
+
+    internal function take() : int32
+    {
+        return $this->wire->take();
+    }
+}
+
+/**
+ * An open outlet as the reactor and workers pass it between them.
+ */
+internal struct OutletConn
+{
+    public int32 $fd;
+
+    // which reactor holds it between beats
+    public int32 $home;
+    public Outlet $outlet;
+    public Feed $feed;
+
+    // the last heartbeat, or the open
+    public time::instant $beat;
+
+    /**
+     * What is due, if anything, with a heartbeat every `$every`. Counts the
+     * heartbeat as sent when it answers `beat`.
+     */
+    public function due(time::duration $every) : OutletEvent?
+    {
+        if ($this->outlet->broken()) {
+            return OutletEvent::gone;
+        }
+
+        if ($this->outlet->closing()) {
+            return OutletEvent::closed;
+        }
+
+        if ($every <= time::duration::zero()) {
+            return null;
+        }
+
+        if ($this->beat->elapsed() >= $every) {
+            $this->beat = time::instant::now();
+            return OutletEvent::beat;
+        }
+
+        return null;
+    }
+}
+
+/**
+ * What a worker is asked to do with an outlet.
+ */
+internal enum OutletEvent
+{
+    // quiet for a beat interval: a comment keeps proxies and the client from timing out
+    case beat;
+
+    // the client closed its side, or a send failed
+    case gone;
+
+    // the server closed it: linger, then `onClose`
+    case closed;
+
+    // the server is stopping
+    case goingAway;
+}
+
+/**
+ * Event stream response: head, `onOpen`, outlet to the reactor. HEAD gets
+ * the head alone.
+ */
+internal function feedOut(Conn $conn, const Visit& $visit, const Request& $asked, Response $res, array<Home>& $homes, Shared $shared) : void
+{
+    Request $req = $res->origin ?? $asked;
+    bool $head = methodEq($req->method, Method::head);
+    bool $http11 = $req->version == 'HTTP/1.1';
+    Length $length = framing(-1, !$head, $http11);
+
+    if (!$res->headers->has('Content-Type')) {
+        $res->headers->set('Content-Type', 'text/event-stream');
+    }
+
+    if (!$res->headers->has('Cache-Control')) {
+        $res->headers->set('Cache-Control', 'no-store');
+    }
+
+    $res->headers->set('X-Accel-Buffering', 'no');
+
+    bool $sent = $conn->writeAll(renderHead($res, $length, Persist::close));
+
+    if ($head) {
+        linger($conn, $homes, $visit->home, $shared);
+        return;
+    }
+
+    if (!$sent) {
+        $shared->live->sub(1);
+        return;
+    }
+
+    // serveVisit only calls this for a response that feeds
+    Feed $feed = guard $res->feed;
+    int32 $fd = $conn->release();
+    Outlet $outlet = Outlet($fd, $req, $http11, $shared);
+    OutletConn $oc = OutletConn($fd, $visit->home, $outlet, $feed, time::instant::now());
+
+    $feed->runOpen($outlet);
+    parkOutlet($oc, $homes, $shared);
+}
+
+/**
+ * One event for an open outlet. After a beat the outlet goes back.
+ */
+internal function serveOutlet(OutletConn $oc, OutletEvent $event, array<Home>& $homes, Shared $shared) : void
+{
+    match ($event) {
+        OutletEvent::beat => {
+            // a beat that found the client gone ends it now, not a sweep later
+            if (!$oc->outlet->beat() && $oc->outlet->broken()) {
+                endOutlet($oc, $shared);
+                return;
+            }
+
+            parkOutlet($oc, $homes, $shared);
+        },
+        OutletEvent::gone => {
+            endOutlet($oc, $shared);
+        },
+        OutletEvent::closed => {
+            lingerOn($oc->outlet->take(), $homes, $oc->home, $shared);
+            $oc->feed->runClose($oc->outlet);
+        },
+        OutletEvent::goingAway => {
+            outletAway($oc, $shared);
+        },
+    }
+}
+
+/**
+ * Hand an open outlet back to the reactor. Stopping: closed instead.
+ */
+internal function parkOutlet(OutletConn $oc, array<Home>& $homes, Shared $shared) : void
+{
+    if ($shared->stopping->load()) {
+        outletAway($oc, $shared);
+        return;
+    }
+
+    if (!$homes[$oc->home]->hand(Back::outlet($oc))) {
+        endOutlet($oc, $shared);
+    }
+}
+
+/**
+ * Close because the server is stopping: the last chunk, then `onClose`.
+ */
+internal function outletAway(OutletConn $oc, Shared $shared) : void
+{
+    $oc->outlet->close();
+    endOutlet($oc, $shared);
+}
+
+/**
+ * Connection closed here, then `onClose`, once.
+ */
+internal function endOutlet(OutletConn $oc, Shared $shared) : void
+{
+    $oc->outlet->release();
+    $shared->live->sub(1);
+    $oc->feed->runClose($oc->outlet);
+}

@@ -331,6 +331,15 @@ public class Server
     }
 
     /**
+     * Time between `: beat` comments on an open event stream, which keep
+     * proxies from timing it out. Zero sends none.
+     */
+    public function beatInterval(time::duration $d) : void
+    {
+        $this->limits->beatInterval = $d;
+    }
+
+    /**
      * Bound port of the running `listen`, or 0.
      */
     public const function port() : int32

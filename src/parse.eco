@@ -29,6 +29,9 @@ internal struct Limits
     public usize $maxMessage = DEFAULT_MESSAGE_CAP;
     public time::duration $pingInterval = time::duration::secs(PING_INTERVAL_SECS);
 
+    // server-sent events: the time between heartbeat comments. zero sends none
+    public time::duration $beatInterval = time::duration::secs(BEAT_INTERVAL_SECS);
+
     // per-request body cap from the parsed head. null means maxBody for every request
     public function<usize(const Request&)>? $bodyLimit = null;
 

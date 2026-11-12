@@ -75,12 +75,14 @@ internal struct Outbound
 }
 
 /**
- * Connection going home: kept HTTP, open websocket, or linger-drain.
+ * Connection going home: kept HTTP, open websocket, open event stream,
+ * or linger-drain.
  */
 internal enum Back
 {
     case kept(Parked $p);
     case socket(WsConn $ws);
+    case outlet(OutletConn $oc);
     case linger(int32 $fd);
 
     // a response for the reactor to finish writing, then park or linger
@@ -162,6 +164,9 @@ internal enum Job
     // something for an open websocket's worker to do: a message, a ping, a close
     case ws(WsConn $ws, WsEvent $event);
 
+    // something for an open event stream's worker to do: a beat, its end
+    case outlet(OutletConn $oc, OutletEvent $event);
+
     // a reactor stopping with a response half written: finish it here, as
     // the worker that started it would have
     case flush(Outbound $o);
@@ -181,7 +186,8 @@ internal class Shared
     public atomic<int32> $live;
     public atomic<bool> $stopping;
 
-    // websockets opened so far, which is where a Socket's id comes from
+    // websockets and event streams opened so far, which is where a Socket's
+    // or an Outlet's id comes from
     public atomic<int64> $sockets;
 
     // bytes of slow clients' responses the reactors hold, against OUTBOUND_TOTAL
@@ -381,8 +387,8 @@ internal function dispatch(const Router& $router, Request $req) : Response
 
     Response $res = $router->routes[$at]->handler($req);
 
-    // Socket keeps the request as the handler saw it, params and all
-    if ($res->upgrades()) {
+    // Socket and Outlet keep the request as the handler saw it, params and all
+    if ($res->upgrades() || $res->feeds()) {
         $res->origin = $req;
     }
 
@@ -509,6 +515,11 @@ internal function serveVisit(const Visit& $visit, array<Home>& $homes, function<
 
     if ($res->upgrades()) {
         upgrade($conn, $visit, $req, $res, $homes, $shared);
+        return;
+    }
+
+    if ($res->feeds()) {
+        feedOut($conn, $visit, $req, $res, $homes, $shared);
         return;
     }
 
@@ -875,6 +886,9 @@ internal function workerLoop(JobQueue $jobs, array<Home> $homes, function<Respon
             },
             Job::ws($ws, $event) => {
                 serveSocket($ws, $event, $homes, $shared);
+            },
+            Job::outlet($oc, $event) => {
+                serveOutlet($oc, $event, $homes, $shared);
             },
             Job::flush($o) => {
                 flushOutbound($o, $shared);

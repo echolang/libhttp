@@ -33,6 +33,18 @@ test idle_tick_follows_a_short_ping_interval {
 }
 
 #[group: "sweep"]
+test idle_tick_follows_a_short_beat_interval {
+    http::Limits $limits = http::Limits();
+
+    $limits->idleTimeout = time::duration::secs(60);
+    $limits->beatInterval = time::duration::secs(3);
+    assert(http::idleTickFor($limits) == time::duration::millis(600), 'a fifth of the beat interval');
+
+    $limits->beatInterval = time::duration::zero();
+    assert(http::idleTickFor($limits) == time::duration::secs(1), 'no beats: the idle timeout decides');
+}
+
+#[group: "sweep"]
 test idle_tick_is_never_faster_than_the_sweep {
     http::Limits $limits = http::Limits();
 

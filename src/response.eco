@@ -33,6 +33,9 @@ public struct Response
     internal Upgrade? $upgrade = null;
     internal Request? $origin = null;
 
+    // a server-sent event stream's hooks
+    internal Feed? $feed = null;
+
     // a tunnel's callback, which takes the connection over raw
     internal function<void(RawConn)>? $tunnel = null;
 
@@ -109,6 +112,20 @@ public struct Response
     {
         $this->upgrade = Upgrade($channel, $name);
         $this->status = 101;
+        $this->body = '';
+    }
+
+    /**
+     * A server-sent event stream on `$feed`: the head goes out, `onOpen`
+     * gets the `Outlet`, and the connection waits on the reactor, holding
+     * no worker. `text/event-stream` and `Cache-Control: no-store` unless
+     * set here; extra headers go out with the head. HTTP/1.1 is chunked,
+     * HTTP/1.0 ends at the close. HEAD gets the head alone.
+     */
+    public constructor(events: Feed $feed)
+    {
+        $this->feed = $feed;
+        $this->status = 200;
         $this->body = '';
     }
 
@@ -245,6 +262,14 @@ public struct Response
     public const function hands() : bool
     {
         return $this->handoff != null;
+    }
+
+    /**
+     * Whether this response opens a server-sent event stream.
+     */
+    public const function feeds() : bool
+    {
+        return $this->feed != null;
     }
 
     /**
