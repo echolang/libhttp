@@ -121,6 +121,10 @@ internal function reason(int32 $status) : string
         return 'Unsupported Media Type';
     }
 
+    if ($status == 416) {
+        return 'Range Not Satisfiable';
+    }
+
     if ($status == 417) {
         return 'Expectation Failed';
     }

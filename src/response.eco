@@ -46,6 +46,9 @@ public struct Response
     // where there is one. `$stream` reads and writes it where there is not
     internal io::file? $file = null;
 
+    // where in `$file` the body starts: 0 but for `Response(file:, offset:, length:)`
+    internal uint64 $fileFrom = 0;
+
     public constructor(int32 $status, const string& $body)
     {
         $this->status = $status;
@@ -169,36 +172,24 @@ public struct Response
      */
     public constructor(file: const string& $path)
     {
-        result<FileBody, int32> $opened = openFile($path);
-        int32 $code = 200;
-        string $text = '';
-        string $type = mimeOf($path);
-        int64 $size = -1;
-        function<void(Writer)>? $fn = null;
-        io::file? $handle = null;
+        $this->status = 200;
+        $this->body = '';
+        applyFile($this, $path, .all);
+    }
 
-        if ($opened->failed()) {
-            $code = $opened->failure();
-            $text = reason($code);
-            $type = 'text/plain; charset=utf-8';
-        } else {
-            FileBody $found = $opened->unwrap();
-            io::file $f = $found->file;
-
-            $size = $found->size;
-            $handle = $f;
-            $fn = function(Writer $w) : void {
-                sendFile($f, $w);
-            };
-        }
-
-        $this->status = $code;
-        $this->body = $text;
-        $this->streaming = $size >= 0;
-        $this->length = $size;
-        $this->stream = $fn;
-        $this->file = $handle;
-        $this->headers->set('Content-Type', $type);
+    /**
+     * The `$length` bytes of the file at `$path` from `$offset` on, streamed.
+     * The status is 200 until the handler sets it, so a 206 is one assignment.
+     * `Content-Range` is set from the slice (`bytes 100-199/4000`), and a slice
+     * past the end is 416 whose Content-Range names the file size. Missing is
+     * 404, unreadable 403. Path is used as given: keeping `..` out is the
+     * handler's job.
+     */
+    public constructor(file: const string& $path, offset: uint64 $offset, length: uint64 $length)
+    {
+        $this->status = 200;
+        $this->body = '';
+        applyFile($this, $path, .slice($offset, $length));
     }
 
     public static function notFound() : Response
@@ -308,6 +299,18 @@ internal struct FileBody
 }
 
 /**
+ * How much of an open file the response body is.
+ */
+internal enum FileSpan
+{
+    // the whole file
+    case all;
+
+    // `$length` bytes from `$offset`
+    case slice(uint64 $offset, uint64 $length);
+}
+
+/**
  * Open a file to serve, or the status to send instead. Directories and
  * paths with a NUL are refused here, before the head promises a length.
  */
@@ -335,6 +338,83 @@ internal function openFile(const string& $path) : result<FileBody, int32>
 }
 
 /**
+ * Open `$path` onto `$res`: the whole file, or `$span`'s slice. Missing is
+ * 404, unreadable 403, a slice past the end 416. `Content-Range` is set
+ * for a slice, success or 416.
+ */
+internal function applyFile(Response& $res, const string& $path, FileSpan $span) : void
+{
+    result<FileBody, int32> $opened = openFile($path);
+    int32 $code = 200;
+    string $text = '';
+    string $type = mimeOf($path);
+    int64 $sent = -1;
+    uint64 $from = 0;
+    function<void(Writer)>? $fn = null;
+    io::file? $handle = null;
+    string $range = '';
+
+    if ($opened->failed()) {
+        $code = $opened->failure();
+        $text = reason($code);
+        $type = 'text/plain; charset=utf-8';
+    } else {
+        FileBody $found = $opened->unwrap();
+        io::file $f = $found->file;
+        uint64 $size = $found->size as uint64;
+        uint64 $off = 0;
+        uint64 $len = $size;
+
+        match ($span) {
+            FileSpan::all => {
+            },
+            FileSpan::slice($o, $n) => {
+                $off = $o;
+                $len = $n;
+            },
+        }
+
+        if ($off > $size || $len > $size - $off) {
+            $code = 416;
+            $text = reason(416);
+            $type = 'text/plain; charset=utf-8';
+            $range = "bytes */{$size}";
+        } else {
+            $sent = $len as int64;
+            $from = $off;
+            $handle = $f;
+            $fn = function(Writer $w) : void {
+                sendFileSlice($f, $off, $len, $w);
+            };
+
+            match ($span) {
+                FileSpan::slice($o, $n) => {
+                    if ($n > 0) {
+                        uint64 $last = $o + $n - 1;
+                        $range = "bytes {$o}-{$last}/{$size}";
+                    }
+                },
+                else => {
+                },
+            }
+        }
+    }
+
+    $res->status = $code;
+    $res->body = $text;
+    $res->streaming = $sent >= 0;
+    $res->length = $sent;
+    $res->stream = $fn;
+    $res->file = $handle;
+    $res->fileFrom = $from;
+    $res->headers->set('Content-Type', $type);
+
+    if (!$range->empty()) {
+        $res->headers->set('Content-Range', $range);
+    }
+}
+
+/**
  * The status a file that could not be opened answers with.
  */
 internal function fileStatus(const io::ioerror& $e) : int32
@@ -351,16 +431,16 @@ internal function fileStatus(const io::ioerror& $e) : int32
 }
 
 /**
- * The first `$size` bytes of `$f` onto the blocking `$sock` in the
+ * `$size` bytes of `$f` from `$from` onto the blocking `$sock` in the
  * kernel, in FILE_CHUNK steps, under the socket's send timeout as any
  * blocking write.
  */
-internal function sendFileTo(int32 $sock, const io::file& $f, uint64 $size, const Shared& $shared) : Sent
+internal function sendFileTo(int32 $sock, const io::file& $f, uint64 $from, uint64 $size, const Shared& $shared) : Sent
 {
-    uint64 $at = 0;
+    uint64 $at = $from;
 
     // full on a blocking socket is its send timeout
-    return match (sendFileRun($sock, $f->fd(), $at, $size, $shared)) {
+    return match (sendFileRun($sock, $f->fd(), $at, $from + $size, $shared)) {
         FileRun::done => .done,
         FileRun::unsupported => .unsupported,
         else => .failed,
@@ -390,11 +470,15 @@ internal enum FileRun
 /**
  * sendfile `$src` onto `$sock` from `$at` up to `$end`, in FILE_CHUNK
  * steps, until it is all out or the socket takes no more. `$at` moves
- * with what went. The one loop the blocking worker, the worker trying
- * without blocking, and the worker a reactor hands a file back to share.
+ * with what went. SENDFILE_NONE with no progress this call is
+ * unsupported: the caller copies instead. Mid-body it is a failure, the
+ * head promised every byte. The one loop the blocking worker, the worker
+ * trying without blocking, and the worker a reactor hands a file back to.
  */
 internal function sendFileRun(int32 $sock, int32 $src, uint64& $at, uint64 $end, const Shared& $shared) : FileRun
 {
+    uint64 $began = $at;
+
     while ($at < $end) {
         if ($shared->stopping->load()) {
             return .failed;
@@ -406,8 +490,8 @@ internal function sendFileRun(int32 $sock, int32 $src, uint64& $at, uint64 $end,
             return .full;
         }
 
-        // mid-file it is a failure: the head promised every byte
-        if ($put == SENDFILE_NONE && $at == 0) {
+        // this call sent nothing: the caller copies instead
+        if ($put == SENDFILE_NONE && $at == $began) {
             return .unsupported;
         }
 
@@ -437,15 +521,31 @@ internal function sendFileStep(int32 $sock, int32 $src, uint64 $at, uint64 $end)
     return http_sendfile($sock, $src, $at as int64, $want as usize);
 }
 
-internal function sendFile(io::file $f, Writer $w) : void
+/**
+ * `$length` bytes of `$f` from `$offset`, read and written, where there is
+ * no sendfile. A file that ends early leaves the body short, which the
+ * writer reports as a failure.
+ */
+internal function sendFileSlice(io::file $f, uint64 $offset, uint64 $length, Writer $w) : void
 {
+    if (!$f->seek($offset as int64, .start)->has_value()) {
+        return;
+    }
+
     string $chunk = '';
+    uint64 $left = $length;
 
-    while ($w->open()) {
+    while ($left > 0 && $w->open()) {
+        usize $want = FILE_READ;
+
+        if (($want as uint64) > $left) {
+            $want = $left as usize;
+        }
+
         $chunk->clear();
-        $chunk->reserve(FILE_READ);
+        $chunk->reserve($want);
 
-        usize $got = guard $f->read($chunk->spare(), FILE_READ) else {
+        usize $got = guard $f->read($chunk->spare(), $want) else {
             return;
         }
 
@@ -454,6 +554,7 @@ internal function sendFile(io::file $f, Writer $w) : void
         }
 
         $chunk->commit($got);
+        $left = $left - ($got as uint64);
 
         if (!$w->write($chunk)) {
             return;

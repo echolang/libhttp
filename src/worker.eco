@@ -467,7 +467,7 @@ internal function streamTo(Conn $conn, const Response& $res, bool $head, bool $h
 
     if ($file != null) {
         io::file $f = guard $file;
-        Sent $sent = sendFileBody($conn, $f, $size, $visit, closes($persist), $homes, $shared);
+        Sent $sent = sendFileBody($conn, $f, $res->fileFrom, $size, $visit, closes($persist), $homes, $shared);
 
         match ($sent) {
             Sent::unsupported => {
@@ -735,22 +735,23 @@ internal function sendBuffered(Conn& $conn, string $bytes, const Visit& $visit, 
  * file and the offset, while this worker goes back to the pool. The
  * reactor waits for room, and a worker sends each time there is some.
  */
-internal function sendFileBody(Conn& $conn, const io::file& $f, uint64 $size, const Visit& $visit, bool $close, array<Home>& $homes, Shared $shared) : Sent
+internal function sendFileBody(Conn& $conn, const io::file& $f, uint64 $from, uint64 $size, const Visit& $visit, bool $close, array<Home>& $homes, Shared $shared) : Sent
 {
     int32 $fd = $conn->fd();
+    uint64 $end = $from + $size;
 
     if ($size < (SEND_TRY_MIN as uint64)) {
-        return sendFileTo($fd, $f, $size, $shared);
+        return sendFileTo($fd, $f, $from, $size, $shared);
     }
 
     if (http_set_blocking($fd, 0) != 0) {
         return .failed;
     }
 
-    uint64 $at = 0;
+    uint64 $at = $from;
 
     while (true) {
-        FileRun $run = sendFileRun($fd, $f->fd(), $at, $size, $shared);
+        FileRun $run = sendFileRun($fd, $f->fd(), $at, $end, $shared);
 
         match ($run) {
             FileRun::done => {
@@ -779,13 +780,13 @@ internal function sendFileBody(Conn& $conn, const io::file& $f, uint64 $size, co
                 return .failed;
             }
 
-            return match (sendFileRun($fd, $f->fd(), $at, $size, $shared)) {
+            return match (sendFileRun($fd, $f->fd(), $at, $end, $shared)) {
                 FileRun::done => .done,
                 else => .failed,
             };
         }
 
-        Outbound $o = Outbound($conn->release(), '', 0, 0, $close, true, $visit->slot->peer, $visit->slot->framer->buffer, $visit->slot->served + 1, time::instant::now(), $src, $at, $size);
+        Outbound $o = Outbound($conn->release(), '', 0, 0, $close, true, $visit->slot->peer, $visit->slot->framer->buffer, $visit->slot->served + 1, time::instant::now(), $src, $at, $end);
 
         return handWrite(mv $o, $homes, $visit->home, $shared);
     }
@@ -826,8 +827,8 @@ internal function writeFile(Outbound $o, int32 $home, array<Home>& $homes, Share
             return;
         },
         FileRun::unsupported => {
-            // a file the worker started with sendfile does not turn
-            // unsupported later: here it is a failure as any other
+            // sendfile gave up with nothing this call; the body already
+            // started on the worker, so copy is not an option
             abandon($o, $shared);
             return;
         },

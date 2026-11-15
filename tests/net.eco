@@ -26,10 +26,10 @@ internal function waitPort(http::Server $app) : int32
 /**
  * Runs `listen` on its own thread and answers once the port is bound.
  */
-internal function serve(http::Server $app) : thread::handle
+internal function serve(http::Server $app, string $host = '127.0.0.1') : thread::handle
 {
     thread::handle $srv = guard thread::spawn(function() : void {
-        result<int32, http::Error> $r = $app->listen('127.0.0.1', 0);
+        result<int32, http::Error> $r = $app->listen($host, 0);
         int32 $ignored = guard $r else ($e) {
             die("listen: {$e}");
         }
@@ -144,9 +144,9 @@ internal class Client
     public http::Conn $conn;
     public string $pending;
 
-    public constructor(int32 $port)
+    public constructor(int32 $port, string $host = '127.0.0.1')
     {
-        $this->conn = dialOrDie($port);
+        $this->conn = dialOrDie($port, $host);
         $this->pending = '';
     }
 
@@ -191,9 +191,9 @@ internal function exchange(int32 $port, const string& $req) : string
     return $c->response();
 }
 
-internal function dialOrDie(int32 $port) : http::Conn
+internal function dialOrDie(int32 $port, string $host = '127.0.0.1') : http::Conn
 {
-    result<http::Conn, http::Error> $opened = http::Conn::dial('127.0.0.1', $port);
+    result<http::Conn, http::Error> $opened = http::Conn::dial($host, $port);
     http::Conn $c = guard $opened else ($e) {
         die("connect: {$e}");
     }
@@ -239,6 +239,29 @@ test get_hello {
 
     assert($got->starts('HTTP/1.1 200 OK'), 'status');
     assert($got->contains('hello'), 'body');
+}
+
+#[group: "net"]
+test ipv6_loopback_is_served_and_names_its_peer_in_brackets {
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->get('/peer', function(http::Request $req) : http::Response {
+        return http::Response(text: $req->peer);
+    });
+
+    thread::handle $srv = serve($app, '::1');
+    Client $c = Client($app->port(), '::1');
+
+    bool $sent = $c->send("GET /peer HTTP/1.1\r\nHost: [::1]\r\n\r\n");
+    string $got = $c->response();
+
+    $app->stop();
+    $srv->join();
+
+    assert($sent, 'sent the request');
+    assert($got->starts('HTTP/1.1 200 OK'), 'status');
+    assert($got->contains('[::1]:'), 'the peer is bracketed');
 }
 
 #[group: "net"]
@@ -1229,6 +1252,63 @@ test file_is_served_with_its_length {
     assert($got->ends($content), 'every byte');
     assert($missing->starts('HTTP/1.1 404'), 'a missing file is a 404');
     assert($sentDir && $isDir->starts('HTTP/1.1 404'), 'so is a directory');
+}
+
+#[group: "net"]
+test a_file_slice_sends_only_its_bytes {
+    string $dir = str::from(std::env::tmp());
+    int64 $pid = std::env::pid() as int64;
+    string $path = "{$dir}/libhttp-slice-{$pid}.txt";
+    string $content = '';
+
+    // past SEND_TRY_MIN, so the big slice goes the non-blocking way
+    while ($content->size() < 300000) {
+        $content->append('0123456789abcdef');
+    }
+
+    result<usize, std::io::ioerror> $wrote = std::fs::writefile($path, $content);
+
+    http::Server $app = http::Server();
+
+    $app->workers(1);
+    $app->get('/small', function(http::Request $req) : http::Response {
+        http::Response $r = http::Response(file: $path, offset: 3, length: 10);
+        $r->status = 206;
+        return $r;
+    });
+    $app->get('/big', function(http::Request $req) : http::Response {
+        return http::Response(file: $path, offset: 1000, length: 200000);
+    });
+    $app->get('/past', function(http::Request $req) : http::Response {
+        return http::Response(file: $path, offset: 299990, length: 100);
+    });
+
+    thread::handle $srv = serve($app);
+    Client $c = Client($app->port());
+
+    bool $sent = $c->send("GET /small HTTP/1.1\r\nHost: x\r\n\r\n");
+    string $small = $c->response();
+    bool $sentBig = $c->send("GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
+    string $big = $c->response();
+    bool $sentPast = $c->send("GET /past HTTP/1.1\r\nHost: x\r\n\r\n");
+    string $past = $c->response();
+
+    $app->stop();
+    $srv->join();
+
+    result<bool, std::io::ioerror> $removed = std::fs::remove($path);
+
+    assert($wrote->has_value(), 'wrote the fixture');
+    assert($sent && $sentBig && $sentPast, 'sent');
+    assert($small->starts('HTTP/1.1 206'), 'the status the handler set');
+    assert($small->contains('Content-Length: 10\r\n'), 'the slice length');
+    assert($small->contains('Content-Range: bytes 3-12/300000\r\n'), 'the slice range');
+    assert($small->ends("\r\n\r\n3456789abc"), 'the slice bytes');
+    assert($big->contains('Content-Length: 200000\r\n'), 'the big slice length');
+    assert($big->contains('Content-Range: bytes 1000-200999/300000\r\n'), 'the big slice range');
+    assert($big->ends($content->sub(1000, 200000)), 'every byte of the big slice');
+    assert($past->starts('HTTP/1.1 416 Range Not Satisfiable'), 'a slice past the end is a 416');
+    assert($past->contains('Content-Range: bytes */300000\r\n'), 'naming the size');
 }
 
 #[group: "net"]

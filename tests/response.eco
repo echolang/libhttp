@@ -95,6 +95,33 @@ test unreadable_file_is_403 {
 }
 
 #[group: "unit"]
+test a_file_slice_names_its_range {
+    string $dir = str::from(std::env::tmp());
+    int64 $pid = std::env::pid() as int64;
+    string $path = "{$dir}/libhttp-unit-slice-{$pid}.txt";
+    result<usize, io::ioerror> $wrote = std::fs::writefile($path, '0123456789abcdef');
+
+    http::Response $part = http::Response(file: $path, offset: 3, length: 4);
+    http::Response $all = http::Response(file: $path);
+    http::Response $past = http::Response(file: $path, offset: 10, length: 10);
+    http::Response $gone = http::Response(file: "{$path}.nope", offset: 0, length: 1);
+
+    result<bool, io::ioerror> $removed = std::fs::remove($path);
+
+    assert($wrote->has_value(), 'wrote the fixture');
+    assert($part->status == 200 && $part->streamed() && $part->length == 4, 'the slice is a stream of that length');
+    assert($part->fileFrom == 3, 'from the offset');
+    assert(($part->headers->get('Content-Range') ?? '') == 'bytes 3-6/16', 'Content-Range names the slice');
+    assert(($part->headers->get('Content-Type') ?? '') == 'text/plain; charset=utf-8', 'mime from the path');
+    assert($all->status == 200 && $all->length == 16 && $all->fileFrom == 0, 'the whole file is unchanged');
+    assert(($all->headers->get('Content-Range') ?? '') == '', 'a whole file has no Content-Range');
+    assert($past->status == 416 && !$past->streamed(), 'a slice past the end is a 416');
+    assert($past->body == 'Range Not Satisfiable', 'the reason');
+    assert(($past->headers->get('Content-Range') ?? '') == 'bytes */16', '416 names the size');
+    assert($gone->status == 404 && !$gone->streamed(), 'missing is still 404');
+}
+
+#[group: "unit"]
 test file_path_with_a_nul_is_404 {
     string $dir = str::from(std::env::tmp());
     int64 $pid = std::env::pid() as int64;
@@ -136,6 +163,7 @@ test wire_errors_answer_with_a_status_and_a_reason {
 test reason_phrases {
     assert(http::reason(304) == 'Not Modified', '304');
     assert(http::reason(404) == 'Not Found', '404');
+    assert(http::reason(416) == 'Range Not Satisfiable', '416');
     assert(http::reason(418) == 'Unknown', 'a status with no phrase');
     assert(http::render(http::Response(418, 'tea'), true)->starts('HTTP/1.1 418 Unknown\r\n'), 'still a status line');
 }

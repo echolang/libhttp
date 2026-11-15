@@ -157,6 +157,16 @@ static int would_block(void)
     return errno == EAGAIN || errno == EWOULDBLOCK;
 }
 
+/* an IPv6 host binds and dials IPv6; names, IPv4, and the empty wildcard stay IPv4 */
+static int family_of(const char *host)
+{
+    if (host != NULL && strchr(host, ':') != NULL) {
+        return AF_INET6;
+    }
+
+    return AF_INET;
+}
+
 /*
  * Binds and listens with room for `backlog` connections the kernel has
  * accepted and nobody has taken yet. The kernel caps it at its own limit
@@ -181,7 +191,6 @@ int http_listen(const char *host, int port, int backlog)
     }
 
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
 
@@ -190,6 +199,8 @@ int http_listen(const char *host, int port, int backlog)
     if (host != NULL && host[0] == '\0') {
         host = NULL;
     }
+
+    hints.ai_family = family_of(host);
 
     rc = getaddrinfo(host, portstr, &hints, &res);
     if (rc != 0) {
@@ -235,7 +246,7 @@ int http_listen(const char *host, int port, int backlog)
 
 int http_port(int fd)
 {
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
     socklen_t len = sizeof addr;
 
     memset(&addr, 0, sizeof addr);
@@ -243,7 +254,15 @@ int http_port(int fd)
         return -1;
     }
 
-    return (int)ntohs(addr.sin_port);
+    if (addr.ss_family == AF_INET6) {
+        return (int)ntohs(((struct sockaddr_in6 *)&addr)->sin6_port);
+    }
+
+    if (addr.ss_family == AF_INET) {
+        return (int)ntohs(((struct sockaddr_in *)&addr)->sin_port);
+    }
+
+    return -1;
 }
 
 int http_pipe_open(int *rd, int *wr)
@@ -313,9 +332,9 @@ int http_drain(int rd)
 int http_accept_one(int listen_fd, char *peer, int peerlen)
 {
     int fd;
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
     socklen_t len = sizeof addr;
-    char ip[INET_ADDRSTRLEN];
+    char ip[INET6_ADDRSTRLEN];
 
     if (peer != NULL && peerlen > 0) {
         peer[0] = '\0';
@@ -345,10 +364,21 @@ int http_accept_one(int listen_fd, char *peer, int peerlen)
     (void)nodelay(fd);
 
     if (peer != NULL && peerlen > 0) {
-        if (inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof ip) == NULL) {
-            snprintf(peer, (size_t)peerlen, "0.0.0.0:0");
+        if (addr.ss_family == AF_INET6) {
+            struct sockaddr_in6 *six = (struct sockaddr_in6 *)&addr;
+            if (inet_ntop(AF_INET6, &six->sin6_addr, ip, sizeof ip) == NULL) {
+                snprintf(peer, (size_t)peerlen, "[::]:0");
+            } else {
+                /* bracketed, so the port after the last colon stays readable */
+                snprintf(peer, (size_t)peerlen, "[%s]:%u", ip, (unsigned)ntohs(six->sin6_port));
+            }
         } else {
-            snprintf(peer, (size_t)peerlen, "%s:%u", ip, (unsigned)ntohs(addr.sin_port));
+            struct sockaddr_in *four = (struct sockaddr_in *)&addr;
+            if (inet_ntop(AF_INET, &four->sin_addr, ip, sizeof ip) == NULL) {
+                snprintf(peer, (size_t)peerlen, "0.0.0.0:0");
+            } else {
+                snprintf(peer, (size_t)peerlen, "%s:%u", ip, (unsigned)ntohs(four->sin_port));
+            }
         }
     }
 
@@ -370,7 +400,7 @@ int http_connect(const char *host, int port)
     }
 
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;
+    hints.ai_family = family_of(host);
     hints.ai_socktype = SOCK_STREAM;
 
     snprintf(portstr, sizeof portstr, "%d", port);
